@@ -12,8 +12,10 @@ from Gmail; nothing is trashed; no calendar change ever notifies anyone
 this server is the policy layer — which is the reason it exists rather than
 the first-party connectors.
 
-`make` lists the targets; `make dev-backend` and `make dev-frontend` run the
-two halves for development; `make test` needs no database and no network.
+`docs/deploy.md` is the host-side runbook, from the Google Cloud console to
+acceptance. `make` lists the targets; `make dev-backend` and `make
+dev-frontend` run the two halves for development; `make test` needs no
+database and no network.
 
 ## Surfaces
 
