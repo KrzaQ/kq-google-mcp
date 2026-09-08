@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::client::{Client, Result};
+use super::client::{Client, Result, urlencode};
 
 /// Sheets is served from its own host, never from `www.googleapis.com`.
 const SHEETS: &str = "sheets";
@@ -47,7 +47,7 @@ pub struct WriteResult {
 pub async fn get(client: &Client, connection_id: i64, spreadsheet_id: &str) -> Result<Spreadsheet> {
     let request = client
         .service(SHEETS)
-        .get(&format!("v4/spreadsheets/{spreadsheet_id}"))
+        .get(&format!("v4/spreadsheets/{}", urlencode(spreadsheet_id)))?
         .query(&[
             ("includeGridData", "false"),
             (
@@ -72,9 +72,10 @@ pub async fn values_get(
     let request = client
         .service(SHEETS)
         .get(&format!(
-            "v4/spreadsheets/{spreadsheet_id}/values/{}",
+            "v4/spreadsheets/{}/values/{}",
+            urlencode(spreadsheet_id),
             urlencode(range)
-        ))
+        ))?
         .query(&[
             ("valueRenderOption", "FORMATTED_VALUE"),
             ("majorDimension", "ROWS"),
@@ -98,9 +99,10 @@ pub async fn values_append(
     let request = client
         .service(SHEETS)
         .post(&format!(
-            "v4/spreadsheets/{spreadsheet_id}/values/{}:append",
+            "v4/spreadsheets/{}/values/{}:append",
+            urlencode(spreadsheet_id),
             urlencode(range)
-        ))
+        ))?
         .query(&[
             ("valueInputOption", USER_ENTERED),
             ("insertDataOption", "INSERT_ROWS"),
@@ -125,9 +127,10 @@ pub async fn values_update(
     let request = client
         .service(SHEETS)
         .put(&format!(
-            "v4/spreadsheets/{spreadsheet_id}/values/{}",
+            "v4/spreadsheets/{}/values/{}",
+            urlencode(spreadsheet_id),
             urlencode(range)
-        ))
+        ))?
         .query(&[("valueInputOption", USER_ENTERED)])
         .json(&ValueRange {
             range: range.to_string(),
@@ -148,7 +151,10 @@ pub async fn add_tab(
 ) -> Result<Tab> {
     let request = client
         .service(SHEETS)
-        .post(&format!("v4/spreadsheets/{spreadsheet_id}:batchUpdate"))
+        .post(&format!(
+            "v4/spreadsheets/{}:batchUpdate",
+            urlencode(spreadsheet_id)
+        ))?
         .json(&BatchUpdate {
             requests: vec![SheetRequest {
                 add_sheet: AddSheet {
@@ -165,20 +171,6 @@ pub async fn add_tab(
         .find_map(|r| r.add_sheet.map(|a| a.properties))
         .unwrap_or_default();
     Ok(properties.into())
-}
-
-/// A tab title can hold anything, including a slash, and it goes in the path.
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::client::{Client, Download, Error, Result};
+use super::client::{Client, Download, Error, Result, urlencode};
 
 /// What Google calls a Doc, a Sheet and a folder.
 pub const DOCUMENT_MIME: &str = "application/vnd.google-apps.document";
@@ -183,7 +183,7 @@ impl std::str::FromStr for ExportFormat {
 
 /// `files.list`.
 pub async fn list(client: &Client, connection_id: i64, search: &Search) -> Result<Vec<FileMeta>> {
-    let request = client.get("drive/v3/files").query(&[
+    let request = client.get("drive/v3/files")?.query(&[
         ("q", search.to_query()),
         ("fields", format!("files({FILE_FIELDS}),nextPageToken")),
         (
@@ -199,7 +199,7 @@ pub async fn list(client: &Client, connection_id: i64, search: &Search) -> Resul
 /// `files.get`, metadata only.
 pub async fn get(client: &Client, connection_id: i64, file_id: &str) -> Result<FileMeta> {
     let request = client
-        .get(&format!("drive/v3/files/{file_id}"))
+        .get(&format!("drive/v3/files/{}", urlencode(file_id)))?
         .query(&[("fields", FILE_FIELDS)]);
     let wire: WireFile = client.json(connection_id, request).await?;
     Ok(wire.into())
@@ -209,7 +209,7 @@ pub async fn get(client: &Client, connection_id: i64, file_id: &str) -> Result<F
 /// handed back unread so the download route can stream it.
 pub async fn download(client: &Client, connection_id: i64, file_id: &str) -> Result<Download> {
     let request = client
-        .get(&format!("drive/v3/files/{file_id}"))
+        .get(&format!("drive/v3/files/{}", urlencode(file_id)))?
         .query(&[("alt", "media")]);
     client.download(connection_id, request).await
 }
@@ -223,7 +223,7 @@ pub async fn export(
     format: ExportFormat,
 ) -> Result<Download> {
     let request = client
-        .get(&format!("drive/v3/files/{file_id}/export"))
+        .get(&format!("drive/v3/files/{}/export", urlencode(file_id)))?
         .query(&[("mimeType", format.mime_type())]);
     client.download(connection_id, request).await
 }
@@ -290,7 +290,7 @@ async fn create(
     let boundary = boundary();
     let body = multipart_related(&boundary, &metadata.to_string(), source_mime, content);
     let request = client
-        .post("upload/drive/v3/files")
+        .post("upload/drive/v3/files")?
         .query(&[("uploadType", "multipart"), ("fields", FILE_FIELDS)])
         .header(
             reqwest::header::CONTENT_TYPE,

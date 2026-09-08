@@ -117,6 +117,9 @@ impl From<google::Error> for ApiError {
                 e.to_string()
             }),
             G::Unsupported(m) => Self::bad_request(m),
+            // An id that would point the call at another endpoint: the caller
+            // asked for something this server does not do.
+            G::Path(m) => Self::bad_request(m),
             G::TooLarge | G::PdftotextMissing => Self::bad_request(e.to_string()),
             G::Connection(_) | G::Malformed(_) => Self::internal(e),
         }

@@ -246,6 +246,41 @@ async fn labels_are_added_and_removed_but_never_trash_or_spam() {
     assert_eq!(modifies, 1);
 }
 
+/// Ids come from a model. `Url` would read `../` and `?` in one as
+/// structure, so `message_id = "../drafts/send?"` would turn this modify POST
+/// into a call on the drafts endpoint — the one thing this server never makes.
+/// Encoded, the id is one path segment and the call lands where it was aimed;
+/// the send guard every harness mounts sees nothing.
+#[tokio::test]
+async fn a_message_id_that_tries_to_climb_out_of_the_path_stays_in_it() {
+    let h = harness().await;
+    let encoded = "/gmail/v1/users/me/messages/..%2Fdrafts%2Fsend%3F/modify";
+    h.mount_json("POST", encoded, fixture("gmail_message_modified.json"))
+        .await;
+
+    gmail::modify_labels(
+        &h.client,
+        CONNECTION,
+        "../drafts/send?",
+        &["Label_18".to_string()],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let paths: Vec<String> = h
+        .requests()
+        .await
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(paths.iter().any(|p| p == encoded), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.ends_with("/drafts/send")),
+        "{paths:?}"
+    );
+}
+
 /// The RFC 2822 message inside a draft request, decoded.
 fn draft_raw(body: &Value) -> String {
     use base64::Engine;
@@ -435,7 +470,10 @@ fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
             assert!(endpoint.contains("drafts"), "{endpoint}");
         }
     }
-    assert!(source.contains("drafts/{draft_id}"));
+    // The draft endpoints are still there, with the id percent-encoded into
+    // exactly one path segment rather than pasted in raw.
+    assert!(source.contains("/drafts/{}"));
+    assert!(source.contains("urlencode(draft_id)"));
 }
 
 #[test]

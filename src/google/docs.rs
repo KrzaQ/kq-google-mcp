@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::client::{Client, Error, Result};
+use super::client::{Client, Error, Result, urlencode};
 
 /// Docs is served from its own host, never from `www.googleapis.com`.
 const DOCS: &str = "docs";
@@ -49,7 +49,7 @@ pub struct Tab {
 pub async fn get(client: &Client, connection_id: i64, document_id: &str) -> Result<Document> {
     let request = client
         .service(DOCS)
-        .get(&format!("v1/documents/{document_id}"))
+        .get(&format!("v1/documents/{}", urlencode(document_id)))?
         .query(&[("includeTabsContent", "false")]);
     let wire: WireDocument = client.json(connection_id, request).await?;
     let end_index = wire
@@ -98,7 +98,10 @@ pub async fn append_text(
     let index = document.append_index();
     let request = client
         .service(DOCS)
-        .post(&format!("v1/documents/{document_id}:batchUpdate"))
+        .post(&format!(
+            "v1/documents/{}:batchUpdate",
+            urlencode(document_id)
+        ))?
         .json(&BatchUpdate {
             requests: vec![DocRequest {
                 insert_text: Some(InsertText {
@@ -129,7 +132,10 @@ pub async fn replace_all_text(
     }
     let request = client
         .service(DOCS)
-        .post(&format!("v1/documents/{document_id}:batchUpdate"))
+        .post(&format!(
+            "v1/documents/{}:batchUpdate",
+            urlencode(document_id)
+        ))?
         .json(&BatchUpdate {
             requests: vec![DocRequest {
                 replace_all_text: Some(ReplaceAllText {

@@ -71,6 +71,10 @@ pub enum Error {
     PdftotextMissing,
     #[error("the file is larger than the {} MB download cap", DOWNLOAD_MAX_BYTES / (1024 * 1024))]
     TooLarge,
+    /// A path that would not stay inside the endpoint it was built for. Ids
+    /// come from a model, so this is a refusal and not a panic.
+    #[error("{0}")]
+    Path(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -152,7 +156,7 @@ impl TokenSource {
         };
         Ok(Self {
             http,
-            token_url: join(&google.oauth_base, "token"),
+            token_url: join(&google.oauth_base, "token")?,
             client_id,
             client_secret,
             secret,
@@ -295,7 +299,7 @@ impl Client {
     }
 
     /// An absolute URL for an API path, against the configured base.
-    pub fn url(&self, path: &str) -> Url {
+    pub fn url(&self, path: &str) -> Result<Url> {
         join(&self.api_base, path)
     }
 
@@ -322,24 +326,24 @@ impl Client {
         }
     }
 
-    pub fn get(&self, path: &str) -> RequestBuilder {
-        self.http.get(self.url(path))
+    pub fn get(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.get(self.url(path)?))
     }
 
-    pub fn post(&self, path: &str) -> RequestBuilder {
-        self.http.post(self.url(path))
+    pub fn post(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.post(self.url(path)?))
     }
 
-    pub fn patch(&self, path: &str) -> RequestBuilder {
-        self.http.patch(self.url(path))
+    pub fn patch(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.patch(self.url(path)?))
     }
 
-    pub fn put(&self, path: &str) -> RequestBuilder {
-        self.http.put(self.url(path))
+    pub fn put(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.put(self.url(path)?))
     }
 
-    pub fn delete(&self, path: &str) -> RequestBuilder {
-        self.http.delete(self.url(path))
+    pub fn delete(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.delete(self.url(path)?))
     }
 
     /// Attach the connection's access token, send, and on a 401 refresh once
@@ -397,28 +401,28 @@ pub struct ServiceClient<'a> {
 }
 
 impl ServiceClient<'_> {
-    pub fn url(&self, path: &str) -> Url {
+    pub fn url(&self, path: &str) -> Result<Url> {
         join(&self.base, path)
     }
 
-    pub fn get(&self, path: &str) -> RequestBuilder {
-        self.http.get(self.url(path))
+    pub fn get(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.get(self.url(path)?))
     }
 
-    pub fn post(&self, path: &str) -> RequestBuilder {
-        self.http.post(self.url(path))
+    pub fn post(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.post(self.url(path)?))
     }
 
-    pub fn patch(&self, path: &str) -> RequestBuilder {
-        self.http.patch(self.url(path))
+    pub fn patch(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.patch(self.url(path)?))
     }
 
-    pub fn put(&self, path: &str) -> RequestBuilder {
-        self.http.put(self.url(path))
+    pub fn put(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.put(self.url(path)?))
     }
 
-    pub fn delete(&self, path: &str) -> RequestBuilder {
-        self.http.delete(self.url(path))
+    pub fn delete(&self, path: &str) -> Result<RequestBuilder> {
+        Ok(self.http.delete(self.url(path)?))
     }
 }
 
@@ -491,17 +495,50 @@ impl Download {
     }
 }
 
-/// `base` and a path, with exactly one slash between them. The path is a
-/// literal in this crate, so a failure to join it is a bug and not an input
-/// error.
-fn join(base: &Url, path: &str) -> Url {
+/// `base` and a path, with exactly one slash between them — and the path that
+/// comes out is exactly the path that went in.
+///
+/// The literal is written in this crate; the ids inside it come from a model.
+/// `Url` removes dot segments and treats `?` and `#` as delimiters, so an id
+/// like `x/../../drafts/send` or `../trash?` would silently move a call to an
+/// endpoint this server never makes. Every id is [`urlencode`]d before it is
+/// formatted in, which is what keeps that from happening; the check here is
+/// the second lock, and it refuses rather than sends.
+fn join(base: &Url, path: &str) -> Result<Url> {
+    let path = path.trim_start_matches('/');
     let mut base = base.clone();
     if !base.path().ends_with('/') {
         let with_slash = format!("{}/", base.path());
         base.set_path(&with_slash);
     }
-    base.join(path.trim_start_matches('/'))
-        .expect("a Google API path is a valid relative URL")
+    let expected = format!("{}{path}", base.path());
+    let joined = base
+        .join(path)
+        .map_err(|e| Error::Path(format!("{path} is not a path this server builds: {e}")))?;
+    if joined.path() != expected || joined.query().is_some() || joined.fragment().is_some() {
+        return Err(Error::Path(format!(
+            "{path} would leave {expected}, so the call was not made"
+        )));
+    }
+    Ok(joined)
+}
+
+/// Percent-encode everything outside RFC 3986's unreserved set, so an id can
+/// carry any byte at all and still be exactly one path segment. Every id
+/// interpolated into a Google URL goes through this: the ids are what a model
+/// hands over, and a `/`, `..`, `?` or `#` in one of them would otherwise
+/// point the call somewhere else entirely.
+pub fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// A successful response passes through; anything else becomes the
@@ -565,4 +602,59 @@ fn split_oauth_error(value: &serde_json::Value) -> Option<(String, String)> {
         None => code.clone(),
     };
     Some((code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Url {
+        "https://gmail.googleapis.com".parse().unwrap()
+    }
+
+    #[test]
+    fn an_encoded_id_is_one_path_segment_whatever_is_in_it() {
+        for id in [
+            "x/../../drafts/send",
+            "../trash?",
+            "18f#fragment",
+            "a/b",
+            "zażółć",
+        ] {
+            let path = format!("gmail/v1/users/me/messages/{}/modify", urlencode(id));
+            let url = join(&base(), &path).expect("an encoded id joins");
+            let segments: Vec<&str> = url.path_segments().unwrap().collect();
+            assert_eq!(
+                segments,
+                [
+                    "gmail",
+                    "v1",
+                    "users",
+                    "me",
+                    "messages",
+                    &urlencode(id),
+                    "modify"
+                ],
+                "{url}"
+            );
+            assert_eq!(url.query(), None, "{url}");
+            assert_eq!(url.fragment(), None, "{url}");
+        }
+        // Unreserved characters are left alone, so an ordinary id reads as
+        // itself in the log and in a mock's path matcher.
+        assert_eq!(urlencode("18f0a1b2c3d4e5f6-_.~"), "18f0a1b2c3d4e5f6-_.~");
+    }
+
+    #[test]
+    fn a_raw_id_that_would_leave_the_endpoint_is_refused_rather_than_sent() {
+        for path in [
+            "gmail/v1/users/me/messages/x/../../drafts/send/modify",
+            "gmail/v1/users/me/messages/../trash?/modify",
+            "gmail/v1/users/me/messages/18f#x/modify",
+            "gmail/v1/users/me/messages/./modify",
+        ] {
+            let error = join(&base(), path).expect_err(path);
+            assert!(matches!(error, Error::Path(_)), "{path}: {error:?}");
+        }
+    }
 }

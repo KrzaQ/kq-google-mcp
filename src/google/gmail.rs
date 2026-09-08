@@ -20,7 +20,7 @@ use mail_parser::parsers::MessageStream;
 use mail_parser::{Address, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use super::client::{Client, Error, Result};
+use super::client::{Client, Error, Result, urlencode};
 
 /// Everything is done as the connected account.
 const USER: &str = "me";
@@ -226,7 +226,7 @@ pub async fn search(
 ) -> Result<Vec<MessageSummary>> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/messages"))
+        .get(&format!("gmail/v1/users/{USER}/messages"))?
         .query(&[("q", query), ("maxResults", &max.to_string())]);
     let list: WireMessageList = client.json(connection_id, request).await?;
     let mut out = Vec::with_capacity(list.messages.len());
@@ -239,7 +239,7 @@ pub async fn search(
 async fn summary(client: &Client, connection_id: i64, id: &str) -> Result<MessageSummary> {
     let mut request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/messages/{id}"))
+        .get(&format!("gmail/v1/users/{USER}/messages/{}", urlencode(id)))?
         .query(&[("format", "metadata")]);
     for header in SUMMARY_HEADERS {
         request = request.query(&[("metadataHeaders", header)]);
@@ -253,7 +253,7 @@ async fn summary(client: &Client, connection_id: i64, id: &str) -> Result<Messag
 pub async fn get_message(client: &Client, connection_id: i64, id: &str) -> Result<Message> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/messages/{id}"))
+        .get(&format!("gmail/v1/users/{USER}/messages/{}", urlencode(id)))?
         .query(&[("format", "full")]);
     let wire: WireMessage = client.json(connection_id, request).await?;
     Ok(wire.message())
@@ -268,7 +268,10 @@ pub async fn get_thread(
 ) -> Result<Thread> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/threads/{thread_id}"))
+        .get(&format!(
+            "gmail/v1/users/{USER}/threads/{}",
+            urlencode(thread_id)
+        ))?
         .query(&[("format", "full")]);
     let wire: WireThread = client.json(connection_id, request).await?;
     let mut messages: Vec<Message> = wire.messages.into_iter().map(|m| m.message()).collect();
@@ -293,8 +296,10 @@ pub async fn get_attachment(
     attachment_id: &str,
 ) -> Result<Vec<u8>> {
     let request = client.service(GMAIL).get(&format!(
-        "gmail/v1/users/{USER}/messages/{message_id}/attachments/{attachment_id}"
-    ));
+        "gmail/v1/users/{USER}/messages/{}/attachments/{}",
+        urlencode(message_id),
+        urlencode(attachment_id)
+    ))?;
     let wire: WireBody = client.json(connection_id, request).await?;
     decode_body(wire.data.as_deref().unwrap_or_default())
 }
@@ -303,7 +308,7 @@ pub async fn get_attachment(
 pub async fn list_labels(client: &Client, connection_id: i64) -> Result<Vec<Label>> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/labels"));
+        .get(&format!("gmail/v1/users/{USER}/labels"))?;
     let wire: WireLabelList = client.json(connection_id, request).await?;
     Ok(wire
         .labels
@@ -339,8 +344,9 @@ pub async fn modify_labels(
     let request = client
         .service(GMAIL)
         .post(&format!(
-            "gmail/v1/users/{USER}/messages/{message_id}/modify"
-        ))
+            "gmail/v1/users/{USER}/messages/{}/modify",
+            urlencode(message_id)
+        ))?
         .json(&ModifyRequest {
             add_label_ids: add.to_vec(),
             remove_label_ids: remove.to_vec(),
@@ -357,7 +363,7 @@ pub async fn list_drafts(
 ) -> Result<Vec<DraftSummary>> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/drafts"))
+        .get(&format!("gmail/v1/users/{USER}/drafts"))?
         .query(&[("maxResults", max.to_string())]);
     let list: WireDraftList = client.json(connection_id, request).await?;
     let mut out = Vec::with_capacity(list.drafts.len());
@@ -386,7 +392,10 @@ fn draft_message_id(draft: &WireDraft) -> Result<String> {
 pub async fn get_draft(client: &Client, connection_id: i64, draft_id: &str) -> Result<Message> {
     let request = client
         .service(GMAIL)
-        .get(&format!("gmail/v1/users/{USER}/drafts/{draft_id}"))
+        .get(&format!(
+            "gmail/v1/users/{USER}/drafts/{}",
+            urlencode(draft_id)
+        ))?
         .query(&[("format", "full")]);
     let wire: WireDraft = client.json(connection_id, request).await?;
     wire.message
@@ -402,7 +411,7 @@ pub async fn create_draft(
 ) -> Result<DraftRef> {
     let request = client
         .service(GMAIL)
-        .post(&format!("gmail/v1/users/{USER}/drafts"))
+        .post(&format!("gmail/v1/users/{USER}/drafts"))?
         .json(&draft_body(content)?);
     let wire: WireDraft = client.json(connection_id, request).await?;
     draft_ref(wire)
@@ -417,7 +426,10 @@ pub async fn update_draft(
 ) -> Result<DraftRef> {
     let request = client
         .service(GMAIL)
-        .put(&format!("gmail/v1/users/{USER}/drafts/{draft_id}"))
+        .put(&format!(
+            "gmail/v1/users/{USER}/drafts/{}",
+            urlencode(draft_id)
+        ))?
         .json(&draft_body(content)?);
     let wire: WireDraft = client.json(connection_id, request).await?;
     draft_ref(wire)
@@ -426,9 +438,10 @@ pub async fn update_draft(
 /// `users.drafts.delete`, the undo for a draft and the only delete in this
 /// server.
 pub async fn delete_draft(client: &Client, connection_id: i64, draft_id: &str) -> Result<()> {
-    let request = client
-        .service(GMAIL)
-        .delete(&format!("gmail/v1/users/{USER}/drafts/{draft_id}"));
+    let request = client.service(GMAIL).delete(&format!(
+        "gmail/v1/users/{USER}/drafts/{}",
+        urlencode(draft_id)
+    ))?;
     client.drain(connection_id, request).await
 }
 

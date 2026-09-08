@@ -96,8 +96,11 @@ fn google_config(server: &MockServer) -> GoogleConfig {
 async fn bare() -> Harness {
     let server = MockServer::start().await;
     // The house rule, enforced on every test in this module: no request this
-    // code makes may ever reach a send endpoint.
-    Mock::given(path_regex(r"(?i).*send.*"))
+    // code makes may ever reach a send endpoint. Google spells all of them
+    // with `send` as a whole path segment (`messages/send`, `drafts/send`),
+    // which is what this matches; the word inside a percent-encoded id is a
+    // segment of its own and goes nowhere near them.
+    Mock::given(path_regex(r"(?i)(^|/)send(/|$)"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
         .named("nothing is ever sent")
@@ -160,7 +163,7 @@ impl Harness {
     /// A plain GET through the client. The tests below are about bearer
     /// injection, refresh and error mapping, so they go through no service.
     async fn probe(&self) -> Result<Value> {
-        let request = self.client.get(PROBE);
+        let request = self.client.get(PROBE)?;
         self.client.json(CONNECTION, request).await
     }
 
@@ -353,7 +356,7 @@ async fn a_sealed_token_from_another_secret_cannot_be_opened() {
     }
     let client =
         Client::from_config(&google_config(&server), SECRET.to_vec(), Arc::new(Wrong)).unwrap();
-    let request = client.get(PROBE);
+    let request = client.get(PROBE).unwrap();
     let error = client.json::<Value>(CONNECTION, request).await.unwrap_err();
     assert!(matches!(error, Error::Connection(_)), "{error:?}");
     assert!(error.to_string().contains("GMCP_SECRET"));
@@ -366,7 +369,7 @@ async fn a_service_with_its_own_host_still_answers_on_the_configured_base() {
     // so one mock server carries every service.
     let h = harness().await;
     h.mount_json("GET", PROBE_PATH, json!({"ok": true})).await;
-    let request = h.client.service("docs").get(PROBE);
+    let request = h.client.service("docs").get(PROBE).unwrap();
     let answer: Value = h.client.json(CONNECTION, request).await.unwrap();
     assert_eq!(answer, json!({"ok": true}));
 
@@ -384,11 +387,14 @@ async fn a_service_with_its_own_host_still_answers_on_the_configured_base() {
     )
     .unwrap();
     assert_eq!(
-        real.service("sheets").url("v4/spreadsheets/x").as_str(),
+        real.service("sheets")
+            .url("v4/spreadsheets/x")
+            .unwrap()
+            .as_str(),
         "https://sheets.googleapis.com/v4/spreadsheets/x"
     );
     assert_eq!(
-        real.url("drive/v3/files").as_str(),
+        real.url("drive/v3/files").unwrap().as_str(),
         "https://www.googleapis.com/drive/v3/files"
     );
 }

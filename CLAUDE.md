@@ -59,6 +59,10 @@ to say about itself is here and in `README.md`.
   ≤ 1568 px / ≤ 200 KB, `openwebui` additionally an `EmbeddedResource` with an
   `image/*` blob, which is the only thing its model actually sees. Never
   `structuredContent` on the image tools, and never the original bytes.
+- **Every id interpolated into a Google URL goes through
+  `google::client::urlencode`.** Ids are model-supplied; a `/`, `..`, `?` or
+  `#` in one of them would move the call to an endpoint the tools never make.
+  `join` refuses a path that does not come out as it went in.
 - **Connections, not one login.** A person has any number, each one Google
   account with a label; every tool takes `account` and resolves it against the
   principal's visible connections. Refresh tokens are sealed with AES-256-GCM

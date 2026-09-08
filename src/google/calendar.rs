@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::client::{Client, Result};
+use super::client::{Client, Result, urlencode};
 
 /// The calendar a tool uses when the caller does not name one.
 pub const PRIMARY: &str = "primary";
@@ -116,7 +116,7 @@ pub struct EventQuery {
 /// `calendarList.list`.
 pub async fn list_calendars(client: &Client, connection_id: i64) -> Result<Vec<Calendar>> {
     let request = client
-        .get("calendar/v3/users/me/calendarList")
+        .get("calendar/v3/users/me/calendarList")?
         .query(&[("minAccessRole", "reader")]);
     let wire: WireCalendarList = client.json(connection_id, request).await?;
     Ok(wire.items.into_iter().map(Into::into).collect())
@@ -134,7 +134,7 @@ pub async fn list_events(
         .get(&format!(
             "calendar/v3/calendars/{}/events",
             urlencode(calendar_id)
-        ))
+        ))?
         .query(&[("singleEvents", "true"), ("orderBy", "startTime")]);
     if let Some(min) = query.time_min {
         request = request.query(&[("timeMin", rfc3339(min))]);
@@ -165,7 +165,7 @@ pub async fn get_event(
         "calendar/v3/calendars/{}/events/{}",
         urlencode(calendar_id),
         urlencode(event_id)
-    ));
+    ))?;
     let wire: WireEvent = client.json(connection_id, request).await?;
     Ok(wire.into())
 }
@@ -181,7 +181,7 @@ pub async fn insert_event(
         .post(&format!(
             "calendar/v3/calendars/{}/events",
             urlencode(calendar_id)
-        ))
+        ))?
         .query(&[SEND_UPDATES])
         .json(draft);
     let wire: WireEvent = client.json(connection_id, request).await?;
@@ -202,7 +202,7 @@ pub async fn patch_event(
             "calendar/v3/calendars/{}/events/{}",
             urlencode(calendar_id),
             urlencode(event_id)
-        ))
+        ))?
         .query(&[SEND_UPDATES])
         .json(draft);
     let wire: WireEvent = client.json(connection_id, request).await?;
@@ -222,28 +222,13 @@ pub async fn delete_event(
             "calendar/v3/calendars/{}/events/{}",
             urlencode(calendar_id),
             urlencode(event_id)
-        ))
+        ))?
         .query(&[SEND_UPDATES]);
     client.drain(connection_id, request).await
 }
 
 fn rfc3339(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// A calendar id is an email address and an event id can hold anything; both
-/// go in the path.
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 #[derive(Debug, Default, Deserialize)]
