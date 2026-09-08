@@ -19,6 +19,7 @@
 // real ones.
 #![allow(dead_code)]
 
+pub mod calendar;
 pub mod client;
 pub mod docs;
 pub mod drive;

@@ -1,0 +1,21 @@
+{
+  "id": "5m1n2o3p4q5r6s7t8u9v0wxyz",
+  "status": "confirmed",
+  "htmlLink": "https://www.google.com/calendar/event?eid=NW0xbjJvM3A",
+  "summary": "Write the Q3 summary",
+  "description": "Block for the report",
+  "location": "Desk",
+  "start": {
+    "dateTime": "2026-09-09T09:00:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "end": {
+    "dateTime": "2026-09-09T10:30:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "organizer": {
+    "email": "anna@example.test",
+    "self": true
+  },
+  "updated": "2026-09-08T18:04:11.000Z"
+}

@@ -1,0 +1,57 @@
+{
+  "kind": "calendar#events",
+  "summary": "anna@example.test",
+  "timeZone": "Europe/Warsaw",
+  "items": [
+    {
+      "id": "5m1n2o3p4q5r6s7t8u9v0wxyz",
+      "status": "confirmed",
+      "htmlLink": "https://www.google.com/calendar/event?eid=NW0xbjJvM3A",
+      "summary": "Write the Q3 summary",
+      "description": "Block for the report",
+      "location": "Desk",
+      "start": {
+        "dateTime": "2026-09-09T09:00:00Z",
+        "timeZone": "Europe/Warsaw"
+      },
+      "end": {
+        "dateTime": "2026-09-09T10:30:00Z",
+        "timeZone": "Europe/Warsaw"
+      },
+      "organizer": {
+        "email": "anna@example.test",
+        "self": true
+      },
+      "updated": "2026-09-08T18:04:11.000Z"
+    },
+    {
+      "id": "7z8y9x0w1v2u3t4s5r6q7p8o",
+      "status": "confirmed",
+      "htmlLink": "https://www.google.com/calendar/event?eid=N3o4eTl4MHc",
+      "summary": "Phoenix handover",
+      "start": {
+        "dateTime": "2026-09-10T13:00:00Z",
+        "timeZone": "Europe/Warsaw"
+      },
+      "end": {
+        "dateTime": "2026-09-10T14:00:00Z",
+        "timeZone": "Europe/Warsaw"
+      },
+      "organizer": {
+        "email": "marta@example.test"
+      },
+      "attendees": [
+        {
+          "email": "anna@example.test",
+          "responseStatus": "accepted"
+        },
+        {
+          "email": "marta@example.test",
+          "responseStatus": "accepted",
+          "organizer": true
+        }
+      ],
+      "updated": "2026-09-07T11:00:00.000Z"
+    }
+  ]
+}

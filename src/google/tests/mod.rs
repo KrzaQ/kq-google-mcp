@@ -179,6 +179,7 @@ impl Harness {
 // themselves.
 mod connect;
 mod documents;
+mod events;
 mod files;
 mod mail;
 mod spreadsheets;

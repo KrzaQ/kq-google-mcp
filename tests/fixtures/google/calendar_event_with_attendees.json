@@ -1,0 +1,29 @@
+{
+  "id": "7z8y9x0w1v2u3t4s5r6q7p8o",
+  "status": "confirmed",
+  "htmlLink": "https://www.google.com/calendar/event?eid=N3o4eTl4MHc",
+  "summary": "Phoenix handover",
+  "start": {
+    "dateTime": "2026-09-10T13:00:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "end": {
+    "dateTime": "2026-09-10T14:00:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "organizer": {
+    "email": "marta@example.test"
+  },
+  "attendees": [
+    {
+      "email": "anna@example.test",
+      "responseStatus": "accepted"
+    },
+    {
+      "email": "marta@example.test",
+      "responseStatus": "accepted",
+      "organizer": true
+    }
+  ],
+  "updated": "2026-09-07T11:00:00.000Z"
+}

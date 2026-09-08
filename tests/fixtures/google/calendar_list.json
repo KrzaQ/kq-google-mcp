@@ -1,0 +1,19 @@
+{
+  "kind": "calendar#calendarList",
+  "items": [
+    {
+      "id": "anna@example.test",
+      "summary": "Anna Kowalska",
+      "primary": true,
+      "accessRole": "owner",
+      "timeZone": "Europe/Warsaw"
+    },
+    {
+      "id": "c_9a1b2c3d4e5f@group.calendar.google.com",
+      "summary": "Team",
+      "description": "Shared team calendar",
+      "accessRole": "writer",
+      "timeZone": "Europe/Warsaw"
+    }
+  ]
+}

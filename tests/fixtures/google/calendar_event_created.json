@@ -1,0 +1,19 @@
+{
+  "id": "9n8m7l6k5j4h3g2f1d0s",
+  "status": "confirmed",
+  "htmlLink": "https://www.google.com/calendar/event?eid=OW44bTdsNms",
+  "summary": "Draft the invoice run",
+  "start": {
+    "dateTime": "2026-09-11T08:00:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "end": {
+    "dateTime": "2026-09-11T09:00:00Z",
+    "timeZone": "Europe/Warsaw"
+  },
+  "organizer": {
+    "email": "anna@example.test",
+    "self": true
+  },
+  "updated": "2026-09-08T20:40:00.000Z"
+}
