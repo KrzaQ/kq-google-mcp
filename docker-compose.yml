@@ -1,0 +1,31 @@
+# One service; there is no database sidecar. All state is ./data next to this
+# file: gmcp.db plus its -wal and -shm, owned by uid 10001, the image's gmcp
+# user (`sudo chown -R 10001:10001 data`). Back it up with
+# `sqlite3 data/gmcp.db ".backup ..."` while it runs — a plain copy of a WAL
+# database under load is not a consistent backup.
+services:
+  gmcp:
+    # The image is built here (or in the development checkout) and never
+    # pulled: an unqualified name would otherwise be looked up on Docker Hub.
+    build: .
+    image: gmcp:local
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:13386:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Log timestamps on the house clock; everything stored is RFC 3339 UTC.
+      TZ: Europe/Warsaw
+    volumes:
+      - ./data:/data
+    # The image has its own HEALTHCHECK; repeating it here keeps `docker
+    # compose ps` honest when the stack is started from an older image.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

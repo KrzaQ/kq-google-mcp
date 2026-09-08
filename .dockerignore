@@ -1,0 +1,10 @@
+target/
+frontend/node_modules/
+frontend/dist/
+data/
+docs/
+packaging/
+.env
+.git/
+Makefile.local
+PLAN.md
