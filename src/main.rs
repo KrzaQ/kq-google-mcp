@@ -1,4 +1,5 @@
 mod config;
+mod domain;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
