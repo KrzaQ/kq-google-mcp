@@ -180,6 +180,7 @@ impl Harness {
 mod connect;
 mod documents;
 mod events;
+mod extraction;
 mod files;
 mod mail;
 mod spreadsheets;

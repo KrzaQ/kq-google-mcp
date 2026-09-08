@@ -26,6 +26,7 @@ pub mod drive;
 pub mod gmail;
 pub mod oauth;
 pub mod sheets;
+pub mod text;
 
 #[cfg(test)]
 mod tests;

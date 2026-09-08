@@ -63,7 +63,18 @@ async fn main() -> Result<()> {
         // should fail here rather than on the first request.
         Command::Serve => {
             let config = Config::from_env()?;
-            tracing::info!("{}", config.summary());
+            // The poppler lookup happens once, here, so /api/health and the
+            // first extraction answer from the same decision.
+            google::text::init();
+            tracing::info!(
+                "{}, pdftotext {}",
+                config.summary(),
+                if google::text::pdftotext_available() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
             if !config.google.configured() {
                 tracing::warn!(
                     "GMCP_GOOGLE_CLIENT_ID and GMCP_GOOGLE_CLIENT_SECRET are unset; \
