@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod db;
 mod domain;
+mod google;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

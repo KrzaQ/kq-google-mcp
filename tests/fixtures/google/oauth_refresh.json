@@ -1,0 +1,6 @@
+{
+  "access_token": "ya29.a0AfB_refreshedAccessTokenForTests",
+  "expires_in": 3599,
+  "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/gmail.modify",
+  "token_type": "Bearer"
+}
