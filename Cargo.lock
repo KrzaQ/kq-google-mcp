@@ -905,6 +905,7 @@ dependencies = [
 name = "gmcp"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "axum-extra",
@@ -913,6 +914,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "hex",
+ "hkdf",
  "http",
  "http-body-util",
  "mime_guess",

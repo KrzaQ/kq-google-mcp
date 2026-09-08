@@ -4,11 +4,13 @@
 //! the network, or the clock beyond what it is handed.
 
 // The layers that consume these land later: `scope` in the MCP server
-// (step 5) and the token API (step 4), `token` in the token flows (step 4)
-// and the CLI (step 6).
+// (step 5) and the token API (step 4), `token` and `seal` in the token and
+// connection flows (step 4) and the CLI (step 6).
 #[allow(dead_code)]
 pub mod limits;
 #[allow(dead_code)]
 pub mod scope;
+#[allow(dead_code)]
+pub mod seal;
 #[allow(dead_code)]
 pub mod token;
