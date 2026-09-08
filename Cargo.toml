@@ -18,6 +18,7 @@ getrandom = "0.3"
 hex = "0.4"
 hkdf = "0.12"
 http = "1"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 mime_guess = "2"
 rmcp = { version = "3.2.0", features = ["server", "transport-streamable-http-server", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
