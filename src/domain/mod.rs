@@ -3,10 +3,9 @@
 //! audit argument are cut down to size. Nothing here touches the database,
 //! the network, or the clock beyond what it is handed.
 
-// The layers that consume these land later: `scope` and `image` in the MCP
-// server (step 5) and the token API (step 4), `token` and `seal` in the
-// token and connection flows (step 4) and the CLI (step 6), `link` in the
-// download route (step 4), `audit` wherever a call is logged.
+// The HTTP layer consumes `scope`, `token`, `seal`, `link` and `audit`; what
+// is left of them, and all of `image`, belongs to the MCP tools (step 5) and
+// the CLI (step 6), which is why the allows stay for now.
 #[allow(dead_code)]
 pub mod audit;
 #[allow(dead_code)]

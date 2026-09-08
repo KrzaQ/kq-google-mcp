@@ -6,10 +6,9 @@
 //! asking. Instants are always passed in or taken from `Utc::now()` here;
 //! nothing has a SQL default, so a test can place a row wherever it likes.
 
-// The query surface is written once, whole; its callers are the HTTP, MCP and
-// CLI layers that come later. Until they land the binary itself uses only a
-// few of these (the tests below use them all), and dead-code warnings would
-// drown out real ones. Remove this when `http/` exists.
+// The query surface is written once, whole. The HTTP layer uses most of it;
+// what is left is what the MCP tools (step 5) and the CLI (step 6) call, and
+// the tests below exercise all of it.
 #![allow(dead_code)]
 
 mod rows;
@@ -150,6 +149,15 @@ impl Db {
     #[cfg(test)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Does the database answer at all? `/api/health` asks, and its answer
+    /// is what the container's HEALTHCHECK reports.
+    pub async fn ping(&self) -> DbResult<()> {
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -446,6 +454,18 @@ impl Db {
     pub async fn list_tokens(&self, user_id: Option<i64>) -> DbResult<Vec<ApiToken>> {
         Ok(sqlx::query_as(
             "SELECT * FROM api_tokens WHERE (?1 IS NULL OR user_id = ?1) \
+             ORDER BY created_at, id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The tokens one person manages in the portal: their own personal ones
+    /// and the delegate tokens they made, which belong to nobody.
+    pub async fn list_user_tokens(&self, user_id: i64) -> DbResult<Vec<ApiToken>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM api_tokens WHERE user_id = ?1 OR created_by = ?1 \
              ORDER BY created_at, id",
         )
         .bind(user_id)

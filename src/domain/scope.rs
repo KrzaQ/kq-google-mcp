@@ -209,14 +209,22 @@ impl From<Scope> for String {
     }
 }
 
+impl FromStr for Service {
+    type Err = ScopeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Service::ALL
+            .into_iter()
+            .find(|x| x.as_str() == s.trim())
+            .ok_or_else(|| ScopeError::Unknown(s.to_string()))
+    }
+}
+
 impl TryFrom<String> for Service {
     type Error = ScopeError;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Service::ALL
-            .into_iter()
-            .find(|x| x.as_str() == s)
-            .ok_or(ScopeError::Unknown(s))
+        s.parse()
     }
 }
 
@@ -226,18 +234,25 @@ impl From<Service> for String {
     }
 }
 
-/// Every string a token may carry, in canonical order. This is what an error
-/// message lists, and what `/api/scopes` is built from.
-pub fn valid_scopes() -> Vec<String> {
+/// Every scope in the registry, in canonical order, `delegate` last. A
+/// session carries all of the service ones, because a person is not narrowed
+/// by anything but their own connections.
+pub fn all_scopes() -> Vec<Scope> {
     REGISTRY
         .iter()
         .flat_map(|(service, levels)| {
             levels
                 .iter()
-                .map(move |level| Scope::Service(*service, *level).to_string())
+                .map(move |level| Scope::Service(*service, *level))
         })
-        .chain(std::iter::once(SCOPE_DELEGATE.to_string()))
+        .chain(std::iter::once(Scope::Delegate))
         .collect()
+}
+
+/// Every string a token may carry, in canonical order. This is what an error
+/// message lists, and what `/api/scopes` is built from.
+pub fn valid_scopes() -> Vec<String> {
+    all_scopes().iter().map(ToString::to_string).collect()
 }
 
 /// Validate a stored or submitted scope list against the registry. The result

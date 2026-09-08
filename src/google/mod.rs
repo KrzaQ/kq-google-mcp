@@ -13,10 +13,10 @@
 //! `connections` table through the [`ConnectionStore`] trait, which the HTTP
 //! layer implements over `Db`.
 
-// The callers land in step 4 (the connect flow, the download route and
-// health) and step 5 (the MCP tools). Until then the surface below is written
-// whole and used only by its own tests, and dead-code warnings would drown out
-// real ones.
+// The HTTP layer uses the connect flow, the download route and health; the
+// rest of this surface — most of the per-service wrappers, the image and text
+// helpers — is what the MCP tools call in step 5. It is written whole and
+// tested whole, so until then dead-code warnings would drown out real ones.
 #![allow(dead_code)]
 
 pub mod calendar;
@@ -31,9 +31,10 @@ pub mod text;
 #[cfg(test)]
 mod tests;
 
-// Re-exported for the layers that come later; nothing in the binary reaches
-// for them yet.
+// `Download`, `GoogleError` and `TokenSource` are named by the MCP tools of
+// step 5; the re-export is the whole surface even while part of it waits.
 #[allow(unused_imports)]
 pub use client::{
-    Client, ConnectionStore, Download, Error, GoogleError, Result, TokenSource, http_client,
+    BoxFuture, Client, ConnectionStore, Download, Error, GoogleError, Result, TokenSource,
+    http_client,
 };
