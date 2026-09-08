@@ -1,9 +1,12 @@
+mod cli;
 mod config;
+mod db;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
+use crate::db::Db;
 
 #[derive(Parser)]
 #[command(
@@ -67,7 +70,11 @@ async fn main() -> Result<()> {
             }
             not_implemented("serve")
         }
-        Command::Migrate { .. } => not_implemented("migrate"),
+        // The one subcommand that needs nothing but the database path.
+        Command::Migrate { status } => {
+            let db = Db::open(config::database_from_env()).await?;
+            cli::migrate::run(&db, status).await
+        }
         Command::Token => not_implemented("token"),
         Command::Connection => not_implemented("connection"),
         Command::User => not_implemented("user"),
