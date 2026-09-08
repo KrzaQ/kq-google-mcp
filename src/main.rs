@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod domain;
 mod google;
+mod http;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -59,30 +60,9 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        // Serve parses its configuration even so: a misconfigured deployment
+        // Serve parses its configuration first: a misconfigured deployment
         // should fail here rather than on the first request.
-        Command::Serve => {
-            let config = Config::from_env()?;
-            // The poppler lookup happens once, here, so /api/health and the
-            // first extraction answer from the same decision.
-            google::text::init();
-            tracing::info!(
-                "{}, pdftotext {}",
-                config.summary(),
-                if google::text::pdftotext_available() {
-                    "present"
-                } else {
-                    "missing"
-                }
-            );
-            if !config.google.configured() {
-                tracing::warn!(
-                    "GMCP_GOOGLE_CLIENT_ID and GMCP_GOOGLE_CLIENT_SECRET are unset; \
-                     no account can be connected until they are"
-                );
-            }
-            not_implemented("serve")
-        }
+        Command::Serve => http::serve(Config::from_env()?).await,
         // The one subcommand that needs nothing but the database path.
         Command::Migrate { status } => {
             let db = Db::open(config::database_from_env()).await?;
