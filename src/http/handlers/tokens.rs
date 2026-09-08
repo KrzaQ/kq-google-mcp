@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 
 use super::dto::{TokenCreated, TokenDto, TokenInput};
 use crate::db::{ApiToken, AuditKind, AuditOutcome, ClientProfile, NewAuditEntry, NewToken, User};
-use crate::domain::scope::{self, Scope};
+use crate::domain::scope::Scope;
 use crate::domain::token;
 use crate::http::auth::Principal;
 use crate::http::error::{ApiError, ApiResult, ErrorBody};
@@ -42,38 +42,34 @@ pub async fn create_token(
     Json(input): Json<TokenInput>,
 ) -> ApiResult<(StatusCode, Json<TokenCreated>)> {
     let me = p.require_session()?;
-    let name = input.name.trim();
-    if name.is_empty() {
-        return Err(ApiError::bad_request("a token needs a name"));
-    }
     let client: ClientProfile = match &input.client {
         Some(c) => c.parse().map_err(ApiError::bad_request)?,
         None => ClientProfile::Generic,
     };
-    // The registry is the authority: an unknown string comes back with the
-    // list of valid ones, and a write level without its read level comes back
-    // saying which one to add.
-    let scopes =
-        scope::parse_scopes(&input.scopes).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    scope::check_requirements(&scopes).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let delegate = scope::is_delegate(&scopes);
-    let user_id = if delegate {
-        if input.all_connections || !input.connection_ids.is_empty() {
-            return Err(ApiError::bad_request(
-                "a delegate token reaches whatever the acting person has flagged for the gateway; \
-                 it has no connection list of its own",
-            ));
-        }
+    // The same rules the CLI applies, in the same words: the registry is the
+    // authority on the scopes, a delegate token takes no allowlist, and a
+    // personal token has to reach something. The person asking is the person
+    // a personal token acts as, so nothing here names a user.
+    let valid = token::validate(token::Request {
+        name: &input.name,
+        scopes: &input.scopes,
+        owner: token::Owner::Caller,
+        all_connections: input.all_connections,
+        connections: input.connection_ids.len(),
+    })
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let scopes = valid.scopes;
+    let user_id = if valid.delegate {
         None
     } else {
-        check_allowlist(&state, me, &input.connection_ids, input.all_connections).await?;
+        check_allowlist(&state, me, &input.connection_ids).await?;
         Some(me.id)
     };
     let secret = token::generate();
     let created = state
         .db
         .create_token(NewToken {
-            name: name.to_string(),
+            name: valid.name.to_string(),
             token_hash: secret.hash,
             scopes: scopes.iter().map(ToString::to_string).collect(),
             client,
@@ -120,17 +116,8 @@ pub async fn revoke_token(
 
 /// Every id on a personal token's allowlist must be a connection of the person
 /// the token acts as; someone else's is refused rather than silently dropped.
-async fn check_allowlist(
-    state: &AppState,
-    me: &User,
-    ids: &[i64],
-    all_connections: bool,
-) -> ApiResult<()> {
-    if ids.is_empty() && !all_connections {
-        return Err(ApiError::bad_request(
-            "a personal token needs all_connections or at least one connection",
-        ));
-    }
+/// That there is an allowlist at all is [`token::validate`]'s business.
+async fn check_allowlist(state: &AppState, me: &User, ids: &[i64]) -> ApiResult<()> {
     let mine = state.db.list_connections(me.id).await?;
     for id in ids {
         if !mine.iter().any(|c| c.id == *id) {
