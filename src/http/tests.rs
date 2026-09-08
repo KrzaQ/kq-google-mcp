@@ -588,6 +588,10 @@ async fn a_delegate_token_acts_only_for_someone_who_logged_in_lately() {
 
 /// The token endpoint and userinfo, as the connect flow needs them.
 async fn mount_google(server: &MockServer, email: &str) {
+    mount_google_with(server, email, true).await;
+}
+
+async fn mount_google_with(server: &MockServer, email: &str, email_verified: bool) {
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("oauth_token.json")))
@@ -598,7 +602,7 @@ async fn mount_google(server: &MockServer, email: &str) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "sub": "104729384756102938475",
             "email": email,
-            "email_verified": true
+            "email_verified": email_verified
         })))
         .mount(server)
         .await;
@@ -742,6 +746,34 @@ async fn a_second_connection_of_the_same_google_account_is_refused() {
         "/connections?error=already_connected"
     );
     assert_eq!(db.list_connections(dev.id).await.unwrap().len(), 1);
+}
+
+/// Everything about a connection hangs off the Google address: the label a
+/// tool names, the one-account-per-person rule, what the audit log says. An
+/// address Google itself has not verified is not one to hang that on.
+#[tokio::test]
+async fn an_unverified_google_address_is_refused() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    mount_google_with(&server, "anna@example.test", false).await;
+    let app = google_app(&db, &server);
+    let (_, me, _) = call(&app, req("GET", "/api/me", None, None)).await;
+    let dev = db
+        .get_user(me["user"]["id"].as_i64().unwrap())
+        .await
+        .unwrap();
+
+    let (consent, cookies) = start(
+        &app,
+        "/api/connections/start",
+        json!({"label": "work", "services": ["gmail"]}),
+    )
+    .await;
+    assert_eq!(
+        finish(&app, &consent, &cookies).await,
+        "/connections?error=no_verified_email"
+    );
+    assert!(db.list_connections(dev.id).await.unwrap().is_empty());
 }
 
 #[tokio::test]

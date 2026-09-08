@@ -210,9 +210,9 @@ pub async fn bearer(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<P
     let Some(t) = state.db.find_active_token(&token::hash(secret)).await? else {
         return Err(ApiError::unauthorized());
     };
-    state.db.touch_token_used(&t).await?;
     if let Some(user_id) = t.user_id {
         let user = state.db.get_user(user_id).await?;
+        state.db.touch_token_used(&t).await?;
         return Ok(Some(Principal::Token { token: t, user }));
     }
     let email = headers
@@ -235,6 +235,9 @@ pub async fn bearer(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<P
              log in there once to keep using the gateway"
         )));
     }
+    // Only now, with every delegate check passed: `last_used_at` is what the
+    // portal shows as the token's last use, and a refused call is not one.
+    state.db.touch_token_used(&t).await?;
     Ok(Some(Principal::Delegate { token: t, user }))
 }
 
@@ -300,9 +303,14 @@ pub struct LoginQuery {
     pub next: Option<String>,
 }
 
+/// A `next` is a path on this server and nothing else. A second `/` makes it
+/// a protocol-relative URL, and a backslash there is read as one by browsers,
+/// so both are refused: either would turn the login into an open redirect.
 fn safe_next(next: Option<String>) -> String {
+    let local =
+        |n: &str| n.starts_with('/') && !matches!(n.as_bytes().get(1), Some(b'/') | Some(b'\\'));
     match next {
-        Some(n) if n.starts_with('/') && !n.starts_with("//") => n,
+        Some(n) if local(&n) => n,
         _ => "/".to_string(),
     }
 }
@@ -477,7 +485,9 @@ mod tests {
     fn next_must_be_a_local_path() {
         assert_eq!(safe_next(Some("/connections".into())), "/connections");
         assert_eq!(safe_next(Some("//evil.example".into())), "/");
+        assert_eq!(safe_next(Some("/\\evil.example".into())), "/");
         assert_eq!(safe_next(Some("https://evil.example".into())), "/");
+        assert_eq!(safe_next(Some("/".into())), "/");
         assert_eq!(safe_next(None), "/");
     }
 

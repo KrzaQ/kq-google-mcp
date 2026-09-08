@@ -71,6 +71,8 @@ pub enum Error {
     Unsupported(String),
     #[error("poppler's pdftotext is not installed, so PDF text cannot be extracted here")]
     PdftotextMissing,
+    #[error("pdftotext did not finish within {0} seconds and was stopped; use the download link")]
+    PdftotextTimeout(u64),
     #[error("the file is larger than the {} MB download cap", DOWNLOAD_MAX_BYTES / (1024 * 1024))]
     TooLarge,
     /// A path that would not stay inside the endpoint it was built for. Ids

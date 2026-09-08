@@ -285,6 +285,31 @@ async fn a_label_and_a_google_account_are_unique_per_person() {
         )
         .await;
     assert!(matches!(clash, Err(DbError::Conflict(_))), "{clash:?}");
+
+    // And case is not what tells two labels apart: every lookup folds it, so
+    // "Work" would be a second row that answers to "work".
+    let clash = db
+        .create_connection(NewConnection {
+            user_id: w.alice.id,
+            label: "Work".into(),
+            google_email: "alice@third.example".into(),
+            services: strings(&["gmail"]),
+            granted_scopes: strings(&["gmail.modify"]),
+            refresh_token_sealed: sealed("x"),
+            delegate_ok: false,
+        })
+        .await;
+    assert!(matches!(clash, Err(DbError::Conflict(_))), "{clash:?}");
+    let clash = db
+        .update_connection(
+            w.personal.id,
+            ConnectionPatch {
+                label: Some("WORK".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(clash, Err(DbError::Conflict(_))), "{clash:?}");
 }
 
 #[tokio::test]

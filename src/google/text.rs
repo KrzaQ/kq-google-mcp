@@ -22,6 +22,9 @@ use crate::domain::limits::TEXT_MAX_CHARS;
 
 /// The poppler binary this module shells out to.
 pub const PDFTOTEXT: &str = "pdftotext";
+/// How long `pdftotext` gets before it is killed. A PDF this server hands it
+/// is at most the download cap, and poppler reads that in seconds.
+const PDFTOTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PDF_MIME: &str = "application/pdf";
 /// Where the paragraph text lives inside a .docx.
@@ -152,6 +155,9 @@ impl Extractor {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // The timeout below drops the child, and a dropped child that is
+            // still running is a process nobody is left to wait for.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::Malformed(format!("could not run {}: {e}", program.display())))?;
         let mut stdin = child
@@ -163,10 +169,14 @@ impl Extractor {
             .await
             .map_err(|e| Error::Malformed(format!("writing the PDF to pdftotext: {e}")))?;
         drop(stdin);
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| Error::Malformed(format!("waiting for pdftotext: {e}")))?;
+        // A PDF that makes poppler spin forever would otherwise hold a task
+        // and a process for as long as the server runs.
+        let output = match tokio::time::timeout(PDFTOTEXT_TIMEOUT, child.wait_with_output()).await {
+            Ok(output) => {
+                output.map_err(|e| Error::Malformed(format!("waiting for pdftotext: {e}")))?
+            }
+            Err(_) => return Err(Error::PdftotextTimeout(PDFTOTEXT_TIMEOUT.as_secs())),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Malformed(format!(

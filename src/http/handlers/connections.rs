@@ -256,6 +256,13 @@ async fn connect(
             "userinfo_failed"
         })?;
     let google_email = info.email.ok_or("no_email")?;
+    // An unverified address is one Google has not tied to the account, and the
+    // label, the delegate rule and the one-account-per-person constraint are
+    // all keyed on it.
+    if !info.email_verified {
+        tracing::warn!("google reported {google_email} as unverified");
+        return Err("no_verified_email");
+    }
     let services: Vec<String> = services_implied(&flow.services)
         .iter()
         .map(ToString::to_string)

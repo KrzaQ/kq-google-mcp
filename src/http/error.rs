@@ -121,6 +121,9 @@ impl From<google::Error> for ApiError {
             // asked for something this server does not do.
             G::Path(m) => Self::bad_request(m),
             G::TooLarge | G::PdftotextMissing => Self::bad_request(e.to_string()),
+            G::PdftotextTimeout(_) => {
+                Self::new(StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string())
+            }
             G::Connection(_) | G::Malformed(_) => Self::internal(e),
         }
     }
