@@ -1,4 +1,8 @@
 //! Configuration comes from `GMCP_*` environment variables only.
+//!
+//! The parsing itself takes a [`Vars`] lookup rather than reading the
+//! environment: `from_env` passes the process environment and the tests pass a
+//! map, so no test needs — or can be disturbed by — an ambient variable.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -73,27 +77,31 @@ impl GoogleConfig {
         )
     }
 
-    fn from_env() -> Result<Self> {
+    fn from_vars(vars: Vars) -> Result<Self> {
         Ok(Self {
-            client_id: var("GMCP_GOOGLE_CLIENT_ID"),
-            client_secret: var("GMCP_GOOGLE_CLIENT_SECRET"),
-            api_base: base("GMCP_GOOGLE_API_BASE", DEFAULT_API_BASE)?,
-            oauth_base: base("GMCP_GOOGLE_OAUTH_BASE", DEFAULT_OAUTH_BASE)?,
-            accounts_base: base("GMCP_GOOGLE_ACCOUNTS_BASE", DEFAULT_ACCOUNTS_BASE)?,
+            client_id: vars("GMCP_GOOGLE_CLIENT_ID"),
+            client_secret: vars("GMCP_GOOGLE_CLIENT_SECRET"),
+            api_base: base(vars, "GMCP_GOOGLE_API_BASE", DEFAULT_API_BASE)?,
+            oauth_base: base(vars, "GMCP_GOOGLE_OAUTH_BASE", DEFAULT_OAUTH_BASE)?,
+            accounts_base: base(vars, "GMCP_GOOGLE_ACCOUNTS_BASE", DEFAULT_ACCOUNTS_BASE)?,
         })
     }
 }
+
+/// Where a variable is read from. The one implementation that ships is the
+/// process environment; a test passes a map of its own.
+pub type Vars<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 pub fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-pub fn require(name: &str) -> Result<String> {
-    var(name).with_context(|| format!("{name} is not set"))
+fn require(vars: Vars, name: &str) -> Result<String> {
+    vars(name).with_context(|| format!("{name} is not set"))
 }
 
-fn base(name: &str, default: &str) -> Result<url::Url> {
-    var(name)
+fn base(vars: Vars, name: &str, default: &str) -> Result<url::Url> {
+    vars(name)
         .unwrap_or_else(|| default.into())
         .parse()
         .with_context(|| format!("{name} must be an absolute URL"))
@@ -101,35 +109,44 @@ fn base(name: &str, default: &str) -> Result<url::Url> {
 
 /// `GMCP_DATABASE`, the path every subcommand opens.
 pub fn database_from_env() -> PathBuf {
-    var("GMCP_DATABASE")
+    database(&var)
+}
+
+fn database(vars: Vars) -> PathBuf {
+    vars("GMCP_DATABASE")
         .unwrap_or_else(|| DEFAULT_DATABASE.into())
         .into()
 }
 
 impl Config {
-    /// Everything `serve` needs.
+    /// Everything `serve` needs, from the process environment.
     pub fn from_env() -> Result<Self> {
-        let bind = var("GMCP_BIND")
+        Self::from_vars(&var)
+    }
+
+    /// The same, from wherever `vars` reads.
+    pub fn from_vars(vars: Vars) -> Result<Self> {
+        let bind = vars("GMCP_BIND")
             .unwrap_or_else(|| "0.0.0.0:8000".into())
             .parse()
             .context("GMCP_BIND must be host:port")?;
-        let public_url: url::Url = require("GMCP_PUBLIC_URL")?
+        let public_url: url::Url = require(vars, "GMCP_PUBLIC_URL")?
             .parse()
             .context("GMCP_PUBLIC_URL must be an absolute URL")?;
-        let auth = match var("GMCP_AUTH").as_deref().unwrap_or("oidc") {
+        let auth = match vars("GMCP_AUTH").as_deref().unwrap_or("oidc") {
             "dev" => {
                 check_dev(&public_url, bind)?;
                 AuthMode::Dev
             }
             "oidc" => AuthMode::Oidc(OidcConfig {
-                issuer: require("GMCP_OIDC_ISSUER")?,
-                client_id: require("GMCP_OIDC_CLIENT_ID")?,
-                client_secret: require("GMCP_OIDC_CLIENT_SECRET")?,
-                group: var("GMCP_OIDC_GROUP"),
+                issuer: require(vars, "GMCP_OIDC_ISSUER")?,
+                client_id: require(vars, "GMCP_OIDC_CLIENT_ID")?,
+                client_secret: require(vars, "GMCP_OIDC_CLIENT_SECRET")?,
+                group: vars("GMCP_OIDC_GROUP"),
             }),
             other => bail!("GMCP_AUTH must be oidc or dev, got {other:?}"),
         };
-        let secret = match (&auth, var("GMCP_SECRET")) {
+        let secret = match (&auth, vars("GMCP_SECRET")) {
             (_, Some(s)) if s.len() >= 32 => s.into_bytes(),
             (_, Some(_)) => bail!("GMCP_SECRET must be at least 32 bytes"),
             // Dev mode is loopback-only, a random per-process key is fine. It
@@ -143,13 +160,13 @@ impl Config {
             (AuthMode::Oidc(_), None) => bail!("GMCP_SECRET is not set"),
         };
         Ok(Self {
-            database: database_from_env(),
+            database: database(vars),
             bind,
             public_url,
             secret,
             auth,
-            google: GoogleConfig::from_env()?,
-            auto_migrate: var("GMCP_AUTO_MIGRATE").as_deref() != Some("0"),
+            google: GoogleConfig::from_vars(vars)?,
+            auto_migrate: vars("GMCP_AUTO_MIGRATE").as_deref() != Some("0"),
         })
     }
 
@@ -224,16 +241,60 @@ mod tests {
         assert!(check_dev(&url("http://localhost:8000"), "[::1]:8000".parse().unwrap()).is_ok());
     }
 
+    /// The variables a test hands the parser. Nothing here reads the process
+    /// environment, so these tests say what they mean whatever the shell has
+    /// exported.
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
     #[test]
     fn google_bases_default_to_the_real_endpoints() {
-        // The test process configures nothing, so this is the shape a fresh
-        // clone gets: the real Google endpoints, no credentials.
-        let google = GoogleConfig::from_env().unwrap();
+        // Nothing configured is the shape a fresh clone gets: the real Google
+        // endpoints, no credentials.
+        let google = GoogleConfig::from_vars(&vars(&[])).unwrap();
         assert_eq!(google.api_base.as_str(), "https://www.googleapis.com/");
         assert_eq!(google.oauth_base.as_str(), "https://oauth2.googleapis.com/");
         assert_eq!(
             google.accounts_base.as_str(),
             "https://accounts.google.com/"
         );
+        assert!(!google.configured());
+
+        // And what a deployment sets is what is used.
+        let google = GoogleConfig::from_vars(&vars(&[
+            ("GMCP_GOOGLE_CLIENT_ID", "id.apps.googleusercontent.com"),
+            ("GMCP_GOOGLE_CLIENT_SECRET", "secret"),
+            ("GMCP_GOOGLE_API_BASE", "http://127.0.0.1:9/"),
+        ]))
+        .unwrap();
+        assert!(google.configured());
+        assert_eq!(google.api_base.as_str(), "http://127.0.0.1:9/");
+        assert_eq!(google.oauth_base.as_str(), "https://oauth2.googleapis.com/");
+    }
+
+    #[test]
+    fn dev_mode_will_not_start_on_the_default_bind() {
+        let dev = [
+            ("GMCP_AUTH", "dev"),
+            ("GMCP_PUBLIC_URL", "http://localhost:8000"),
+        ];
+        // GMCP_BIND unset means 0.0.0.0, which dev auth must never answer on.
+        let error = Config::from_vars(&vars(&dev)).unwrap_err();
+        assert!(error.to_string().contains("GMCP_BIND"), "{error}");
+
+        let mut with_bind = dev.to_vec();
+        with_bind.push(("GMCP_BIND", "127.0.0.1:8000"));
+        let config = Config::from_vars(&vars(&with_bind)).unwrap();
+        assert!(matches!(config.auth, AuthMode::Dev));
+        assert_eq!(config.database, PathBuf::from(DEFAULT_DATABASE));
+        assert!(config.auto_migrate);
+        // Dev mode with no GMCP_SECRET gets a random one, per process.
+        assert_eq!(config.secret.len(), 64);
     }
 }

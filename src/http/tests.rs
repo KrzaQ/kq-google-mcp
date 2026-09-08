@@ -996,6 +996,19 @@ async fn a_link_streams_from_google_once_it_is_hit() {
             .last_used_at
             .is_some()
     );
+
+    // The hit spent a use, and three is the whole allowance: enough for a
+    // retry and a second reader, not enough to be a hosting service.
+    assert_eq!(db.get_link(&minted.id).await.unwrap().unwrap().uses_left, 2);
+    for _ in 0..2 {
+        let (s, bytes, _) =
+            call_bytes(&app, req("GET", &format!("/dl/{}", minted.id), None, None)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(bytes, b"%PDF-1.7 a small report");
+    }
+    let (s, _, _) = call(&app, req("GET", &format!("/dl/{}", minted.id), None, None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the fourth hit has nothing left");
+    assert_eq!(db.get_link(&minted.id).await.unwrap().unwrap().uses_left, 0);
 }
 
 /// The route has no principal — the id is the permission — but the row it

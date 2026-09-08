@@ -220,6 +220,33 @@ async fn a_cached_token_is_reused_across_calls() {
     assert_eq!(h.refreshes().await, 1);
 }
 
+/// The per-connection lock is the whole point of the token cache: ten tools
+/// firing at once on one account must produce one token request, not ten.
+/// The delay is what makes them overlap — without it the first call finishes
+/// before the second starts and the test would pass on any implementation.
+#[tokio::test]
+async fn a_burst_of_calls_on_one_connection_asks_for_one_token() {
+    let h = bare().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(fixture("oauth_refresh.json"))
+                .set_delay(std::time::Duration::from_millis(200)),
+        )
+        .expect(1)
+        .named("one token for the whole burst")
+        .mount(&h.server)
+        .await;
+
+    let tokens = h.client.tokens();
+    let calls = (0..10).map(|_| tokens.access_token(CONNECTION));
+    for token in futures_util::future::join_all(calls).await {
+        assert_eq!(token.unwrap(), "ya29.a0AfB_refreshedAccessTokenForTests");
+    }
+    assert_eq!(h.refreshes().await, 1);
+}
+
 #[tokio::test]
 async fn a_401_refreshes_once_and_retries_once() {
     let h = harness().await;
