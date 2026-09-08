@@ -191,10 +191,16 @@ impl DraftContent {
     }
 }
 
-/// `Re: ` exactly once, however the original was spelled.
+/// `Re: ` exactly once, however the original was spelled. The prefix is
+/// looked for on character boundaries: a subject that starts with an emoji
+/// has a multi-byte character across the first three bytes, and slicing
+/// through it would panic on a mail nobody controls but the sender.
 fn reply_subject(subject: Option<&str>) -> String {
     let subject = subject.unwrap_or_default().trim();
-    if subject.len() >= 3 && subject[..3].eq_ignore_ascii_case("re:") {
+    if subject
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+    {
         subject.to_string()
     } else if subject.is_empty() {
         "Re:".to_string()

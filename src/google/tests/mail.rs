@@ -512,4 +512,17 @@ fn a_reply_keeps_one_re_and_drops_the_replying_account_from_the_recipients() {
 
     let alone = gmail::DraftContent::reply_to(&message, "anna@example.test", "yes", false);
     assert!(alone.cc.is_empty());
+
+    // A subject whose first three bytes are not three characters: the `Re:`
+    // check must look at characters, or replying to a mail that opens with an
+    // emoji panics inside a tool call.
+    let subject_of = |subject: &str| {
+        let mut m = message.clone();
+        m.subject = Some(subject.to_string());
+        gmail::DraftContent::reply_to(&m, "anna@example.test", "yes", false).subject
+    };
+    assert_eq!(subject_of("ab😀 report"), "Re: ab😀 report");
+    assert_eq!(subject_of("Ре: тема"), "Re: Ре: тема");
+    assert_eq!(subject_of("re: budget"), "re: budget");
+    assert_eq!(subject_of(""), "Re:");
 }
