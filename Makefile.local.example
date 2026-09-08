@@ -1,0 +1,19 @@
+# Machine-specific make targets. Copy to Makefile.local (gitignored) and adjust.
+#
+# The main Makefile ends with `-include Makefile.local`, so anything defined
+# here is available as a normal target. Keep deploy hosts and extra git remotes
+# out of the committed Makefile so a fresh clone stays reproducible.
+
+.PHONY: push deploy
+
+# The run directory: docker-compose.yml, .env and data/, nothing else. The
+# image is built from this checkout and started there; the compose file is
+# copied on every deploy so the two never drift.
+RUN_DIR ?= /storage/encrypted/gmcp
+
+push: ## Push to every configured remote
+	git push origin main && git push gh main
+
+deploy: image ## Build the image here, then restart the stack in $(RUN_DIR)
+	install -m 644 docker-compose.yml $(RUN_DIR)/docker-compose.yml
+	cd $(RUN_DIR) && docker compose up -d --no-build
