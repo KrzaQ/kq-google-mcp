@@ -38,10 +38,28 @@ pub fn uses() -> i64 {
     LINK_USES
 }
 
-/// A file larger than this is refused rather than streamed.
+/// A file larger than this is refused rather than streamed. Checked when the
+/// link is minted, so a model is told at once, and again when it is hit,
+/// because Google is free to answer with something else by then.
 pub fn too_large(size: u64) -> bool {
     size > DOWNLOAD_MAX_BYTES
 }
+
+/// What a link is streamed as. The stored type is whatever Gmail read out of
+/// a mail header or whatever the uploader told Drive, so it can be anything
+/// at all — including bytes that cannot go into a response header. Anything
+/// that is not a MIME type becomes `application/octet-stream`, which is the
+/// honest answer for bytes nobody can vouch for.
+pub fn safe_mime(value: &str) -> String {
+    match value.trim().parse::<mime_guess::Mime>() {
+        // The parser is happy with an empty subtype ("text/"); a browser is
+        // not, so that goes the same way as the rest of the nonsense.
+        Ok(mime) if !mime.subtype().as_str().is_empty() => mime.to_string(),
+        _ => OCTET_STREAM.to_string(),
+    }
+}
+
+pub const OCTET_STREAM: &str = "application/octet-stream";
 
 #[cfg(test)]
 mod tests {
@@ -72,8 +90,26 @@ mod tests {
     }
 
     #[test]
-    fn the_download_cap_is_fifty_megabytes() {
+    fn a_file_over_fifty_megabytes_is_refused() {
         assert!(!too_large(50 * 1024 * 1024));
         assert!(too_large(50 * 1024 * 1024 + 1));
+    }
+
+    #[test]
+    fn a_mime_type_that_is_not_one_becomes_octet_stream() {
+        assert_eq!(safe_mime("application/pdf"), "application/pdf");
+        assert_eq!(
+            safe_mime("  text/plain; charset=utf-8 "),
+            "text/plain; charset=utf-8"
+        );
+        for junk in [
+            "application/pdf\r\nX-Evil: 1",
+            "not a mime type",
+            "",
+            "text/",
+            "\u{1F600}",
+        ] {
+            assert_eq!(safe_mime(junk), OCTET_STREAM, "{junk:?}");
+        }
     }
 }

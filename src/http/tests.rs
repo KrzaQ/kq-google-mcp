@@ -966,6 +966,81 @@ async fn a_link_streams_from_google_once_it_is_hit() {
     );
 }
 
+/// The cap is the reason the link route can stream from Google at all; a
+/// model that asks for a link to a 100 MB file is told so while it is still in
+/// the tool call, not by a download that dies halfway.
+#[tokio::test]
+async fn a_file_over_the_download_cap_is_refused_at_mint() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    let (state, c, t) = link_fixture(&db, &server).await;
+    let error = links::mint(
+        &state,
+        c.user_id,
+        links::NewDownload {
+            connection_id: c.id,
+            token_id: t.id,
+            target: links::Target::DriveDownload {
+                file_id: "1AbC".into(),
+            },
+            filename: "huge.iso".into(),
+            mime_type: "application/octet-stream".into(),
+            size: Some(60 * 1024 * 1024),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("50 MB"), "{}", error.message);
+    // Nothing was written down, so there is no link to hit.
+    assert!(db.list_audit(Default::default()).await.unwrap().is_empty());
+}
+
+/// The stored type is whatever a mail header or an uploader said. A row from
+/// before it was normalised at mint can hold anything, including bytes that
+/// would end the header and start another one.
+#[tokio::test]
+async fn a_stored_mime_type_that_is_not_one_streams_as_octet_stream() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("oauth_refresh.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/files/1AbC"))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+        .mount(&server)
+        .await;
+    let (state, c, t) = link_fixture(&db, &server).await;
+    let app = router(state);
+    db.create_link(NewLink {
+        id: "badmime00000000000000".into(),
+        connection_id: c.id,
+        token_id: t.id,
+        kind: LinkKind::DriveDownload,
+        target: json!({"file_id": "1AbC"}),
+        filename: "report.pdf".into(),
+        mime_type: "application/pdf\r\nX-Evil: 1".into(),
+        size: Some(99),
+        expires_at: Utc::now() + Duration::minutes(5),
+        uses_left: 3,
+    })
+    .await
+    .unwrap();
+
+    let (s, bytes, h) = call_bytes(&app, req("GET", "/dl/badmime00000000000000", None, None)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(bytes, b"bytes");
+    assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    // The length is the one this response carries, not the one recorded at
+    // mint: the file may have changed, and a wrong one truncates the download.
+    assert_eq!(h[header::CONTENT_LENGTH], "5");
+}
+
 #[tokio::test]
 async fn the_three_refusals_are_one_answer() {
     let db = Db::open_memory().await.unwrap();

@@ -34,6 +34,8 @@ const EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEFAULT_TOKEN_LIFETIME_SECONDS: i64 = 3000;
 /// Neither Google nor a wiremock server should ever need longer than this.
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+/// How much of an error response is read before the message is truncated.
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// Google's own error, as its JSON envelope reports it. This is what a tool
 /// error says: the HTTP status and Google's message, passed through.
@@ -361,14 +363,21 @@ impl Client {
         check(retry.bearer_auth(fresh).send().await?).await
     }
 
-    /// Send and decode the JSON body.
+    /// Send and decode the JSON body, which is capped like every other body
+    /// this client reads. Gmail hands attachments back base64 inside JSON, so
+    /// the download cap has to apply here too or a 200 MB attachment arrives
+    /// as a 270 MB string in memory.
     pub async fn json<T: serde::de::DeserializeOwned>(
         &self,
         connection_id: i64,
         request: RequestBuilder,
     ) -> Result<T> {
-        let body = self.send(connection_id, request).await?.text().await?;
-        serde_json::from_str(&body)
+        let body = self
+            .download(connection_id, request)
+            .await?
+            .collect()
+            .await?;
+        serde_json::from_slice(&body)
             .map_err(|e| Error::Malformed(format!("google answered something unexpected: {e}")))
     }
 
@@ -549,7 +558,7 @@ async fn check(response: Response) -> Result<Response> {
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = error_body(response).await;
     Err(GoogleError {
         status: status.as_u16(),
         message: api_error(&body).unwrap_or_else(|| {
@@ -560,6 +569,21 @@ async fn check(response: Response) -> Result<Response> {
         }),
     }
     .into())
+}
+
+/// As much of a failed response as an error message can possibly need. The
+/// body of an error is read to be quoted at a person, so it is read with a cap
+/// of its own rather than with the download cap.
+async fn error_body(mut response: Response) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        out.extend_from_slice(&chunk);
+        if out.len() >= ERROR_BODY_MAX_BYTES {
+            out.truncate(ERROR_BODY_MAX_BYTES);
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Google's REST envelope: `{"error": {"code": 404, "message": "…"}}`, with

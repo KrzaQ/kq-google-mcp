@@ -27,6 +27,7 @@ use super::AppState;
 use super::audit;
 use super::error::{ApiError, ApiResult};
 use crate::db::{AuditKind, AuditOutcome, Link, LinkKind, LinkRefusal, NewAuditEntry, NewLink};
+use crate::domain::limits::DOWNLOAD_MAX_BYTES;
 use crate::domain::link;
 use crate::google::drive::ExportFormat;
 use crate::google::{drive, gmail};
@@ -139,6 +140,19 @@ pub struct Minted {
 #[allow(dead_code)]
 pub async fn mint(state: &AppState, user_id: i64, new: NewDownload) -> ApiResult<Minted> {
     let now = Utc::now();
+    // Google already said how big it is, so the refusal belongs here, in the
+    // tool call the model is waiting on, rather than in a link that turns out
+    // to be a 404 with a stranger's ip in the log.
+    if let Some(size) = new.size
+        && link::too_large(size.max(0) as u64)
+    {
+        return Err(ApiError::bad_request(format!(
+            "{} is {} MB, over the {} MB download cap",
+            new.filename,
+            size / (1024 * 1024),
+            DOWNLOAD_MAX_BYTES / (1024 * 1024)
+        )));
+    }
     if let Err(e) = state.db.delete_expired_links(now).await {
         tracing::warn!("sweeping expired links: {e}");
     }
@@ -151,7 +165,7 @@ pub async fn mint(state: &AppState, user_id: i64, new: NewDownload) -> ApiResult
             kind: new.target.kind(),
             target: new.target.to_json(),
             filename: new.filename,
-            mime_type: new.mime_type,
+            mime_type: link::safe_mime(&new.mime_type),
             size: new.size,
             expires_at: link::expires_at(now),
             uses_left: link::uses(),
@@ -276,13 +290,11 @@ async fn stream(state: &AppState, link: &Link, ip: Option<String>) -> ApiResult<
         }
         Target::DriveDownload { file_id } => {
             let file = drive::download(&google.client, link.connection_id, &file_id).await?;
-            let length = file.size();
-            (Body::from_stream(file.into_stream()), length)
+            streamed(file)?
         }
         Target::DriveExport { file_id, format } => {
             let file = drive::export(&google.client, link.connection_id, &file_id, format).await?;
-            let length = file.size();
-            (Body::from_stream(file.into_stream()), length)
+            streamed(file)?
         }
     };
     if let Err(e) = state.db.touch_connection_used(link.connection_id).await {
@@ -301,13 +313,33 @@ async fn stream(state: &AppState, link: &Link, ip: Option<String>) -> ApiResult<
     .await;
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, link.mime_type.clone())
+        // The stored type came from a mail header or an uploader, so it is
+        // normalised again here: rows written before it was normalised at mint
+        // are still out there, and a browser must not sniff its way past it.
+        .header(header::CONTENT_TYPE, link::safe_mime(&link.mime_type))
         .header(header::CONTENT_DISPOSITION, disposition(&link.filename))
-        .header(header::CACHE_CONTROL, "private, no-store");
-    if let Some(length) = length.or(link.size.and_then(|s| u64::try_from(s).ok())) {
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    // Only what this response actually carries. The size recorded at mint
+    // describes a file Google may have changed since, and a Content-Length
+    // that disagrees with the body truncates the download.
+    if let Some(length) = length {
         response = response.header(header::CONTENT_LENGTH, length);
     }
-    Ok(response.body(body).expect("a download response"))
+    response
+        .body(body)
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "google", e.to_string()))
+}
+
+/// A Drive response, checked against the download cap before a byte of it is
+/// forwarded. `into_stream` enforces the cap as the bytes go past as well, for
+/// a response that lied about its length.
+fn streamed(file: crate::google::Download) -> ApiResult<(Body, Option<u64>)> {
+    if file.size().is_some_and(link::too_large) {
+        return Err(ApiError::from(crate::google::Error::TooLarge));
+    }
+    let length = file.size();
+    Ok((Body::from_stream(file.into_stream()), length))
 }
 
 /// Everything that is not an unreserved character is percent-encoded, which is

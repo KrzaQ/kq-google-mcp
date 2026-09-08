@@ -2,6 +2,7 @@
 //! thing this server ever writes into a mailbox.
 
 use super::*;
+use crate::domain::limits::DOWNLOAD_MAX_BYTES;
 use crate::google::gmail;
 
 #[tokio::test]
@@ -191,6 +192,30 @@ async fn an_attachment_comes_back_as_bytes() {
         .await
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&bytes), "%PDF-1.7 not really a pdf");
+}
+
+/// Gmail hands attachments back base64 inside JSON, which the download cap
+/// has to cover as well: without it a mail with a 200 MB attachment is read
+/// whole into this process before anything looks at its size.
+#[tokio::test]
+async fn an_attachment_over_the_download_cap_is_refused_before_it_is_read() {
+    let h = harness().await;
+    let at = "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6/attachments/ANGjdJ8pdfQ3";
+    Mock::given(method("GET"))
+        .and(path(at))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(vec![b'x'; DOWNLOAD_MAX_BYTES as usize + 1])
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&h.server)
+        .await;
+
+    let error = gmail::get_attachment(&h.client, CONNECTION, "18f0a1b2c3d4e5f6", "ANGjdJ8pdfQ3")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::TooLarge), "{error:?}");
+    assert!(error.to_string().contains("50 MB"), "{error}");
 }
 
 #[tokio::test]
