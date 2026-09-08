@@ -201,6 +201,57 @@ describe('views', () => {
     expect(errors).toEqual([])
   })
 
+  it('TokensView lists tokens and draws the grid from the registry', async () => {
+    const w = await render(TokensView, '/tokens')
+    expect(w.findAll('[data-testid="token-row"]')).toHaveLength(2)
+    expect(w.text()).toContain('all connections')
+    expect(w.text()).toContain('gateway')
+    expect(w.find('[data-testid="scope-gmail:draft"]').exists()).toBe(true)
+    expect(w.find('[data-testid="scope-calendar:write"]').exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView ticks the read level along and disables the picker for a delegate', async () => {
+    const w = await render(TokensView, '/tokens')
+    await w.find('[data-testid="scope-docs:write"]').setValue(true)
+    expect((w.find('[data-testid="scope-docs:read"]').element as HTMLInputElement).checked).toBe(
+      true,
+    )
+    const picker = w.find('[data-testid="connection-picker"]')
+    expect((picker.element as HTMLFieldSetElement).disabled).toBe(false)
+    await w.find('[data-testid="token-delegate"]').setValue(true)
+    expect((picker.element as HTMLFieldSetElement).disabled).toBe(true)
+    expect(w.find('[data-testid="picker-note"]').exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView shows the secret once, with a snippet per client', async () => {
+    const w = await render(TokensView, '/tokens')
+    await w.find('[data-testid="token-name"]').setValue('claude-code')
+    await w.find('[data-testid="scope-gmail:draft"]').setValue(true)
+    await w.find('[data-testid="token-form"]').trigger('submit')
+    await flushPromises()
+    expect(bodies.get('POST /api/tokens')).toEqual({
+      name: 'claude-code',
+      client: 'generic',
+      scopes: ['gmail:read', 'gmail:draft'],
+      all_connections: true,
+      connection_ids: [],
+    })
+    const shown = w.find('[data-testid="token-secret"]')
+    expect(shown.text()).toContain('gg_shown_once')
+    expect(w.find('[data-testid="snippet-claude-code"]').text()).toContain(
+      'claude mcp add --transport http gmcp https://gmcp.example/mcp',
+    )
+    expect(w.find('[data-testid="snippet-opencode"]').text()).toContain('"type": "remote"')
+    expect(w.find('[data-testid="snippet-openwebui"]').text()).toContain(
+      'X-Gmcp-User: {{USER_EMAIL}}',
+    )
+    await w.find('[data-testid="secret-done"]').trigger('click')
+    expect(w.find('[data-testid="token-secret"]').exists()).toBe(false)
+    expect(errors).toEqual([])
+  })
+
   it('the login button carries the page that was asked for', async () => {
     const w = await render(LoginView, '/login?next=/tokens')
     expect(w.find('[data-testid="login-button"]').attributes('href')).toBe(
