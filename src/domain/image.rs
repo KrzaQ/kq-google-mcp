@@ -20,7 +20,7 @@ use image::{DynamicImage, ImageFormat, RgbImage};
 use super::limits::{
     IMAGE_LONG_SIDE, IMAGE_LONG_SIDE_CLAUDE_CODE, IMAGE_MAX_BYTES, IMAGE_MAX_BYTES_CLAUDE_CODE,
 };
-use super::scope::ClientProfile;
+use crate::db::ClientProfile;
 
 const JPEG_QUALITY: u8 = 80;
 /// What the second attempt drops to when the first is over the cap.
