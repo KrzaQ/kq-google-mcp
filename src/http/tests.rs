@@ -966,6 +966,91 @@ async fn a_link_streams_from_google_once_it_is_hit() {
     );
 }
 
+/// The route has no principal — the id is the permission — but the row it
+/// spends belongs to somebody, and the Activity page filters on the person
+/// looking at it. A hit logged against nobody is a hit nobody can see.
+#[tokio::test]
+async fn a_link_hit_shows_up_on_the_owners_activity_page() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("oauth_refresh.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/files/1AbC"))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"a report".to_vec()))
+        .mount(&server)
+        .await;
+    // Dev mode is the person behind the browser, so the log has to name them.
+    let me = auth::dev_user(&db).await.unwrap();
+    let c = connection(&db, &me, "work", "dev@example.test").await;
+    let (t, _) = token_for(&db, "claude", &["drive:read"], Some(&me), me.id).await;
+    let state = state_of(
+        &db,
+        config(AuthMode::Dev, "http://localhost:8000", mocked(&server)),
+    );
+    let app = router(state.clone());
+    let minted = links::mint(
+        &state,
+        me.id,
+        links::NewDownload {
+            connection_id: c.id,
+            token_id: t.id,
+            target: links::Target::DriveDownload {
+                file_id: "1AbC".into(),
+            },
+            filename: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (s, _, _) = call_bytes(&app, req("GET", &format!("/dl/{}", minted.id), None, None)).await;
+    assert_eq!(s, StatusCode::OK);
+    // And a hit on a link that is past it belongs to the same person.
+    db.create_link(NewLink {
+        id: "expired0000000000000y".into(),
+        connection_id: c.id,
+        token_id: t.id,
+        kind: LinkKind::DriveDownload,
+        target: json!({"file_id": "1AbC"}),
+        filename: "old.pdf".into(),
+        mime_type: "application/pdf".into(),
+        size: None,
+        expires_at: Utc::now() - Duration::minutes(1),
+        uses_left: 3,
+    })
+    .await
+    .unwrap();
+    let (s, _, _) = call(&app, req("GET", "/dl/expired0000000000000y", None, None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    let (s, b, _) = call(&app, req("GET", "/api/audit", None, None)).await;
+    assert_eq!(s, StatusCode::OK);
+    let entries = b["entries"].as_array().unwrap();
+    let kinds: Vec<&str> = entries
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["link_refused", "link_used", "link_created"]);
+    for entry in entries {
+        assert_eq!(entry["connection_id"], c.id);
+        assert_eq!(entry["token_id"], t.id);
+    }
+
+    // A hit on an id that was never minted belongs to nobody, so it is not on
+    // anyone's page.
+    let (s, _, _) = call(&app, req("GET", "/dl/nonsense", None, None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, b, _) = call(&app, req("GET", "/api/audit", None, None)).await;
+    assert_eq!(b["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(db.list_audit(Default::default()).await.unwrap().len(), 4);
+}
+
 /// The cap is the reason the link route can stream from Google at all; a
 /// model that asks for a link to a 100 MB file is told so while it is still in
 /// the tool call, not by a download that dies halfway.

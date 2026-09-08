@@ -639,6 +639,16 @@ impl Db {
         }))
     }
 
+    /// One link row whatever its state, for the refusal path: a hit on an
+    /// expired or spent link still belongs to somebody, and the log says so.
+    /// Spending a use is `take_link` and nothing else.
+    pub async fn get_link(&self, id: &str) -> DbResult<Option<Link>> {
+        Ok(sqlx::query_as("SELECT * FROM links WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
     /// Expired rows are deleted by `prune` and opportunistically on mint.
     pub async fn delete_expired_links(&self, now: DateTime<Utc>) -> DbResult<u64> {
         Ok(sqlx::query("DELETE FROM links WHERE expires_at <= ?")

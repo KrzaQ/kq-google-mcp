@@ -235,12 +235,14 @@ pub async fn download(
             return ApiError::not_found().into_response();
         }
     };
-    match stream(&state, &link, ip.clone()).await {
+    let user_id = owner(&state, link.connection_id).await;
+    match stream(&state, &link, user_id, ip.clone()).await {
         Ok(response) => response,
         Err(e) => {
             audit::record(
                 &state.db,
                 NewAuditEntry {
+                    user_id,
                     token_id: Some(link.token_id),
                     connection_id: Some(link.connection_id),
                     detail: Some(format!("{}: {}", link.filename, e.message)),
@@ -254,12 +256,43 @@ pub async fn download(
     }
 }
 
+/// Whose link this is. The route has no principal — the id is the permission —
+/// but the row does: it names a connection, and a connection belongs to a
+/// person. Without this the hit is logged against nobody and never appears on
+/// the Activity page of the one person who wanted to see it.
+async fn owner(state: &AppState, connection_id: i64) -> Option<i64> {
+    match state.db.get_connection(connection_id).await {
+        Ok(connection) => Some(connection.user_id),
+        Err(e) => {
+            tracing::warn!("connection {connection_id} behind a link: {e}");
+            None
+        }
+    }
+}
+
 /// A refused hit is logged with the reason and the ip, and answered with the
-/// same 404 as the other two so the id cannot be probed.
+/// same 404 as the other two so the id cannot be probed. An id that exists is
+/// logged against its owner, so an expired link someone kept clicking is on
+/// their page; an id that was never minted belongs to nobody.
 async fn refused(state: &AppState, id: &str, refusal: LinkRefusal, ip: Option<String>) {
+    let link = state.db.get_link(id).await.unwrap_or_else(|e| {
+        tracing::warn!("reading the refused link {id}: {e}");
+        None
+    });
+    let (user_id, token_id, connection_id) = match &link {
+        Some(link) => (
+            owner(state, link.connection_id).await,
+            Some(link.token_id),
+            Some(link.connection_id),
+        ),
+        None => (None, None, None),
+    };
     audit::record(
         &state.db,
         NewAuditEntry {
+            user_id,
+            token_id,
+            connection_id,
             detail: Some(format!("{id}: {refusal}")),
             ip,
             ..NewAuditEntry::new(Utc::now(), AuditKind::LinkRefused, AuditOutcome::Forbidden)
@@ -268,7 +301,12 @@ async fn refused(state: &AppState, id: &str, refusal: LinkRefusal, ip: Option<St
     .await;
 }
 
-async fn stream(state: &AppState, link: &Link, ip: Option<String>) -> ApiResult<Response> {
+async fn stream(
+    state: &AppState,
+    link: &Link,
+    user_id: Option<i64>,
+    ip: Option<String>,
+) -> ApiResult<Response> {
     let google = state.google().ok_or_else(ApiError::google_unconfigured)?;
     let target = Target::from_row(link).map_err(ApiError::internal)?;
     let (body, length) = match target {
@@ -303,6 +341,7 @@ async fn stream(state: &AppState, link: &Link, ip: Option<String>) -> ApiResult<
     audit::record(
         &state.db,
         NewAuditEntry {
+            user_id,
             token_id: Some(link.token_id),
             connection_id: Some(link.connection_id),
             detail: Some(format!("{} ({})", link.filename, link.id)),
@@ -363,13 +402,20 @@ fn disposition(filename: &str) -> String {
     )
 }
 
-/// Where a hit came from. Apache fronts this server on loopback, so a
-/// `X-Forwarded-For` is believed — its first value, the original client — only
-/// when the socket peer is loopback. From anywhere else the header is a claim
-/// by whoever connected and the socket address is the truth.
+/// Where a hit came from.
+///
+/// The shipped topology is one container whose port is published on the
+/// host's loopback only, with apache in front of it: nothing outside the host
+/// can open a socket to this server, and the peer address inside the container
+/// is apache seen through the Docker bridge — a private address like
+/// `172.18.0.1`, not loopback. So `X-Forwarded-For` is believed — its first
+/// value, the original client — when the peer is loopback or a private
+/// address, and only apache can be either. A public peer address means
+/// something else is talking to this process directly, and then the header is
+/// a claim by whoever connected and the socket address is the truth.
 pub fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> Option<String> {
     let peer = peer?.ip();
-    if peer.is_loopback()
+    if from_the_proxy(peer)
         && let Some(forwarded) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
@@ -383,19 +429,45 @@ pub fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> Option<String
     Some(peer.to_string())
 }
 
+/// Whether an address can only be the house proxy: loopback, an RFC 1918
+/// private range, or a link-local one. The container port is published on
+/// loopback, so nothing else can reach this server from a private address.
+fn from_the_proxy(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            // fc00::/7 (unique local) and fe80::/10 (link local), spelled out
+            // rather than taken from std so this compiles on any toolchain.
+            let first = ip.octets()[0];
+            let second = ip.octets()[1];
+            ip.is_loopback() || first & 0xfe == 0xfc || (first == 0xfe && second & 0xc0 == 0x80)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The topology this assumes: the container's port published on the
+    /// host's loopback with apache in front, so the peer is either loopback
+    /// (apache on the host itself) or the Docker bridge gateway, which is a
+    /// private address. Nothing else can reach the socket at all.
     #[test]
-    fn a_forwarded_address_is_believed_only_from_the_local_proxy() {
+    fn a_forwarded_address_is_believed_from_loopback_or_the_docker_bridge() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
         let local: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+        let bridge: SocketAddr = "172.18.0.1:44444".parse().unwrap();
         let remote: SocketAddr = "198.51.100.9:44444".parse().unwrap();
         assert_eq!(
             client_ip(Some(local), &headers).as_deref(),
             Some("203.0.113.7")
+        );
+        assert_eq!(
+            client_ip(Some(bridge), &headers).as_deref(),
+            Some("203.0.113.7"),
+            "in the container the peer is the bridge gateway, not loopback"
         );
         assert_eq!(
             client_ip(Some(remote), &headers).as_deref(),
