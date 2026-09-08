@@ -344,13 +344,34 @@ pub struct CallbackQuery {
 
 /// The login flow is the one place a browser, not the frontend, is talking to
 /// the API, so a failure is a page and not a JSON envelope.
+///
+/// Both parts are escaped: this page is served as `text/html` from the portal
+/// origin, where a script would run with the session cookie in reach, so
+/// nothing interpolated here is ever allowed to be markup.
 pub fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    let (title, body) = (escape(title), escape(body));
     let html = format!(
         "<!doctype html><meta charset=utf-8><title>{title}</title>\
          <body style=\"font-family:sans-serif;max-width:40em;margin:4em auto\"><h1>{title}</h1><p>{body}</p>\
          <p><a href=\"/\">Back</a></p></body>"
     );
     (status, Html(html)).into_response()
+}
+
+/// The five characters that can end an HTML text node or an attribute value.
+fn escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[utoipa::path(get, path = "/api/auth/callback", tag = "auth",
@@ -364,11 +385,14 @@ pub async fn callback(
         return page(StatusCode::NOT_FOUND, "Not found", "OIDC is not enabled.");
     };
     if let Some(err) = q.error {
+        // Whatever the provider sent is the query string of a link anyone can
+        // hand out, so it goes to the log and never to the page.
         let desc = q.error_description.unwrap_or_default();
+        tracing::warn!("OIDC callback refused: {err}: {desc}");
         return page(
             StatusCode::BAD_REQUEST,
             "Login failed",
-            &format!("{err}: {desc}"),
+            "The identity provider rejected the login.",
         );
     }
     let Some(cookie) = jar.get(LOGIN_COOKIE) else {
@@ -417,7 +441,7 @@ pub async fn callback(
         return page(
             StatusCode::FORBIDDEN,
             "Not allowed",
-            &format!("Your account is not in the <code>{group}</code> group."),
+            &format!("Your account is not in the {group} group."),
         );
     }
     let user = match state
@@ -455,5 +479,20 @@ mod tests {
         assert_eq!(safe_next(Some("//evil.example".into())), "/");
         assert_eq!(safe_next(Some("https://evil.example".into())), "/");
         assert_eq!(safe_next(None), "/");
+    }
+
+    #[tokio::test]
+    async fn a_page_never_carries_markup_it_was_handed() {
+        let page = page(StatusCode::BAD_REQUEST, "a<b>", "<script>alert(1)</script>");
+        let body = axum::body::to_bytes(page.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
     }
 }

@@ -1246,6 +1246,35 @@ mod oidc_flow {
         assert_eq!(db.list_users().await.unwrap().len(), 1);
     }
 
+    /// The provider's own `error` and `error_description` land in the query
+    /// string of a link anyone can send around, and the page is served as
+    /// text/html from the portal origin, where a script would reach the
+    /// session cookie and mint a bearer token.
+    #[tokio::test]
+    async fn a_provider_error_is_never_reflected_into_the_page() {
+        let db = Db::open_memory().await.unwrap();
+        let iss = issuer().await;
+        let app = oidc_app(&db, &iss, Some("gmcp")).await;
+        let (s, body, h) = call_bytes(
+            &app,
+            req(
+                "GET",
+                "/api/auth/callback?error=%3Cscript%3Ealert(1)%3C/script%3E\
+                 &error_description=%3Cimg%20src=x%20onerror=alert(2)%3E",
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(h[header::CONTENT_TYPE].to_str().unwrap().contains("html"));
+        let html = String::from_utf8(body).unwrap();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("alert(1)"), "{html}");
+        assert!(!html.contains("onerror"), "{html}");
+        assert!(html.contains("The identity provider rejected the login."));
+    }
+
     #[tokio::test]
     async fn a_state_mismatch_and_a_missing_cookie_fail() {
         let db = Db::open_memory().await.unwrap();
