@@ -1,0 +1,56 @@
+{
+  "id": "18f0a1b2c3d4e5f6",
+  "threadId": "18f0a1b2c3d4e5f0",
+  "labelIds": [
+    "INBOX",
+    "IMPORTANT",
+    "UNREAD"
+  ],
+  "snippet": "the quarterly figures are in the attached PDF",
+  "internalDate": "1788528800000",
+  "sizeEstimate": 48210,
+  "payload": {
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Subject",
+        "value": "=?UTF-8?Q?Q3_figures_for_Krak=C3=B3w?="
+      },
+      {
+        "name": "From",
+        "value": "Marta Nowak <marta@example.test>"
+      },
+      {
+        "name": "To",
+        "value": "Anna Kowalska <anna@example.test>, team@example.test"
+      },
+      {
+        "name": "Date",
+        "value": "Thu, 04 Sep 2026 15:33:20 +0200"
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [],
+        "body": {
+          "size": 212
+        }
+      },
+      {
+        "mimeType": "application/pdf",
+        "filename": "q3-figures.pdf",
+        "headers": [],
+        "body": {
+          "attachmentId": "ANGjdJ8pdfQ3",
+          "size": 26112
+        }
+      }
+    ]
+  }
+}

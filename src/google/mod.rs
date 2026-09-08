@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 pub mod client;
+pub mod gmail;
 pub mod oauth;
 
 #[cfg(test)]

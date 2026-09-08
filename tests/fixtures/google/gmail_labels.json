@@ -1,0 +1,39 @@
+{
+  "labels": [
+    {
+      "id": "INBOX",
+      "name": "INBOX",
+      "type": "system",
+      "messagesTotal": 1842,
+      "messagesUnread": 12
+    },
+    {
+      "id": "SENT",
+      "name": "SENT",
+      "type": "system",
+      "messagesTotal": 903,
+      "messagesUnread": 0
+    },
+    {
+      "id": "DRAFT",
+      "name": "DRAFT",
+      "type": "system",
+      "messagesTotal": 4,
+      "messagesUnread": 0
+    },
+    {
+      "id": "Label_18",
+      "name": "Invoices",
+      "type": "user",
+      "messagesTotal": 61,
+      "messagesUnread": 2
+    },
+    {
+      "id": "Label_24",
+      "name": "Clients/Phoenix",
+      "type": "user",
+      "messagesTotal": 130,
+      "messagesUnread": 0
+    }
+  ]
+}

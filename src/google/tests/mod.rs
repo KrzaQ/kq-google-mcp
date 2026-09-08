@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::client::{BoxFuture, Client, ConnectionStore, Error, Result};
@@ -176,6 +176,7 @@ impl Harness {
 // module it exercises, so the names do not collide with the modules
 // themselves.
 mod connect;
+mod mail;
 
 // ---------------------------------------------------------------------------
 // The client: bearer, refresh, retry and error mapping.
