@@ -4,6 +4,7 @@ mod db;
 mod domain;
 mod google;
 mod http;
+mod mcp;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
