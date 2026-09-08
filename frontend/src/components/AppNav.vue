@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { NavigationFailureType, isNavigationFailure } from 'vue-router'
+import { NavigationFailureType, isNavigationFailure, useRouter } from 'vue-router'
 import AppLogo from '@/components/AppLogo.vue'
 import ThemeChooser from '@/components/ThemeChooser.vue'
 import { bumpReload } from '@/lib/reload'
+import { useSession } from '@/stores/session'
+
+const session = useSession()
+const router = useRouter()
 
 const links = [
   { to: '/', label: 'Home', match: '/home' },
@@ -19,6 +23,11 @@ const links = [
 async function follow(e: MouseEvent, navigate: (e: MouseEvent) => Promise<unknown>) {
   const failure = await navigate(e)
   if (isNavigationFailure(failure, NavigationFailureType.duplicated)) bumpReload()
+}
+
+async function logout() {
+  await session.logout()
+  router.push({ name: 'login' })
 }
 </script>
 
@@ -42,6 +51,17 @@ async function follow(e: MouseEvent, navigate: (e: MouseEvent) => Promise<unknow
       </RouterLink>
       <span class="flex-1"></span>
       <ThemeChooser />
+      <span v-if="session.me" class="text-sm text-muted" data-testid="nav-user">{{
+        session.me.user.name ?? session.me.user.email
+      }}</span>
+      <button
+        v-if="session.me"
+        class="text-sm text-muted hover:text-fg"
+        data-testid="nav-logout"
+        @click="logout"
+      >
+        Log out
+      </button>
     </nav>
   </header>
 </template>

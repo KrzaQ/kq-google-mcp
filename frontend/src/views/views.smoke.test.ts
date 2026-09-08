@@ -252,6 +252,33 @@ describe('views', () => {
     expect(errors).toEqual([])
   })
 
+  it('ActivityView filters and pages by the cursor', async () => {
+    const w = await render(ActivityView, '/activity')
+    expect(w.findAll('[data-testid="audit-row"]')).toHaveLength(3)
+
+    await w.find('[data-testid="filter-kind"]').setValue('tool_call')
+    await w.find('[data-testid="filter-connection"]').setValue('1')
+    await w.find('[data-testid="filter-tool"]').setValue('gmail_search')
+    await w.find('[data-testid="filter-from"]').setValue('2026-09-01')
+    await w.find('[data-testid="activity-filters"]').trigger('submit')
+    await flushPromises()
+    const filtered = calls.filter((c) => c.startsWith('GET /api/audit')).at(-1)!
+    expect(filtered).toContain('connection=1')
+    expect(filtered).toContain('kind=tool_call')
+    expect(filtered).toContain('tool=gmail_search')
+    // A day typed in the filter becomes an instant on the reader's own clock;
+    // which instant is lib/time's business and is tested there.
+    expect(filtered).toMatch(/from=\d{4}-\d{2}-\d{2}T/)
+
+    await w.find('[data-testid="load-more"]').trigger('click')
+    await flushPromises()
+    const paged = calls.filter((c) => c.startsWith('GET /api/audit')).at(-1)!
+    expect(paged).toContain(`before=${encodeURIComponent(fixtures.audit.next!)}`)
+    expect(w.findAll('[data-testid="audit-row"]')).toHaveLength(4)
+    expect(w.find('[data-testid="load-more"]').exists()).toBe(false)
+    expect(errors).toEqual([])
+  })
+
   it('the login button carries the page that was asked for', async () => {
     const w = await render(LoginView, '/login?next=/tokens')
     expect(w.find('[data-testid="login-button"]').attributes('href')).toBe(
