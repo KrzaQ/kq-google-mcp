@@ -87,8 +87,8 @@ to say about itself is here and in `README.md`.
   401. `/api` is session-only; bearer tokens are for `/mcp` and nothing else.
 - After changing an API shape, regenerate `frontend/src/api/schema.d.ts`
   (`make types` with `make dev-backend` running) and commit it.
-- `GMCP_AUTH=dev` logs everyone in as one fixed user and is refused on any
-  public URL that is not loopback.
+- `GMCP_AUTH=dev` logs everyone in as one fixed user and is refused unless
+  both `GMCP_PUBLIC_URL` and `GMCP_BIND` are loopback.
 
 ## Commands
 

@@ -118,7 +118,7 @@ impl Config {
             .context("GMCP_PUBLIC_URL must be an absolute URL")?;
         let auth = match var("GMCP_AUTH").as_deref().unwrap_or("oidc") {
             "dev" => {
-                check_dev_url(&public_url)?;
+                check_dev(&public_url, bind)?;
                 AuthMode::Dev
             }
             "oidc" => AuthMode::Oidc(OidcConfig {
@@ -183,16 +183,24 @@ impl Config {
 }
 
 /// Dev auth logs everyone in as the same person, so it must never be
-/// reachable from anywhere but the developer's own machine.
-pub fn check_dev_url(public_url: &url::Url) -> Result<()> {
+/// reachable from anywhere but the developer's own machine. Both halves are
+/// checked: a loopback public URL says nothing about which addresses the
+/// server answers on, and `GMCP_BIND` defaults to `0.0.0.0`, which would log
+/// the whole network in as the dev user.
+pub fn check_dev(public_url: &url::Url, bind: SocketAddr) -> Result<()> {
     let host = public_url.host_str().unwrap_or("");
-    if public_url.scheme() == "http" && (host == "localhost" || host == "127.0.0.1") {
-        Ok(())
-    } else {
+    if public_url.scheme() != "http" || (host != "localhost" && host != "127.0.0.1") {
         bail!(
             "GMCP_AUTH=dev is only allowed with GMCP_PUBLIC_URL on http://localhost or http://127.0.0.1, got {public_url}"
         )
     }
+    if !bind.ip().is_loopback() {
+        bail!(
+            "GMCP_AUTH=dev logs every request in as the dev user, so it is only allowed with \
+             GMCP_BIND on a loopback address; set GMCP_BIND=127.0.0.1:8000, got {bind}"
+        )
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -201,11 +209,19 @@ mod tests {
 
     #[test]
     fn dev_guard() {
-        assert!(check_dev_url(&"http://localhost:8000".parse().unwrap()).is_ok());
-        assert!(check_dev_url(&"http://127.0.0.1:1234".parse().unwrap()).is_ok());
-        assert!(check_dev_url(&"https://localhost:8000".parse().unwrap()).is_err());
-        assert!(check_dev_url(&"http://google-mcp.int.krzaq.cc".parse().unwrap()).is_err());
-        assert!(check_dev_url(&"http://0.0.0.0:8000".parse().unwrap()).is_err());
+        let local: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:8000".parse().unwrap();
+        let url = |u: &str| u.parse::<url::Url>().unwrap();
+        assert!(check_dev(&url("http://localhost:8000"), local).is_ok());
+        assert!(check_dev(&url("http://127.0.0.1:1234"), local).is_ok());
+        assert!(check_dev(&url("https://localhost:8000"), local).is_err());
+        assert!(check_dev(&url("http://google-mcp.int.krzaq.cc"), local).is_err());
+        assert!(check_dev(&url("http://0.0.0.0:8000"), local).is_err());
+        // A loopback public URL says nothing about what the socket answers on:
+        // the default bind is 0.0.0.0, and that would log the LAN in as dev.
+        let error = check_dev(&url("http://localhost:8000"), any).unwrap_err();
+        assert!(error.to_string().contains("GMCP_BIND"), "{error}");
+        assert!(check_dev(&url("http://localhost:8000"), "[::1]:8000".parse().unwrap()).is_ok());
     }
 
     #[test]
