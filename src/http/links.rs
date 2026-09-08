@@ -32,11 +32,6 @@ use crate::domain::link;
 use crate::google::drive::ExportFormat;
 use crate::google::{drive, gmail};
 
-// Minting is written here, with its tests, but its callers are the MCP tools
-// of step 5: `gmail_attachment_link`, `drive_download_link` and
-// `drive_export_link`. Until they land the mint half of this module is live
-// only under `cfg(test)`, hence the allows below.
-
 /// Where a download link points. This is the `target` column, typed; the JSON
 /// shape is this module's business and nothing else reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +50,6 @@ pub enum Target {
 }
 
 impl Target {
-    #[allow(dead_code)]
     pub fn kind(&self) -> LinkKind {
         match self {
             Self::GmailAttachment { .. } => LinkKind::GmailAttachment,
@@ -64,7 +58,6 @@ impl Target {
         }
     }
 
-    #[allow(dead_code)]
     fn to_json(&self) -> Value {
         match self {
             Self::GmailAttachment {
@@ -108,7 +101,6 @@ impl Target {
 
 /// What a tool knows when it mints a link.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct NewDownload {
     pub connection_id: i64,
     /// The token whose call minted it; the log ties the hit back to it.
@@ -122,7 +114,6 @@ pub struct NewDownload {
 
 /// A minted link, as a tool result reports it.
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[allow(dead_code)]
 pub struct Minted {
     pub url: String,
     pub id: String,
@@ -137,7 +128,6 @@ pub struct Minted {
 ///
 /// Expired rows are swept on the way past: minting is the one moment there is
 /// certainly a writer, and it keeps the table from being a job's problem.
-#[allow(dead_code)]
 pub async fn mint(state: &AppState, user_id: i64, new: NewDownload) -> ApiResult<Minted> {
     let now = Utc::now();
     // Google already said how big it is, so the refusal belongs here, in the
@@ -194,7 +184,6 @@ pub async fn mint(state: &AppState, user_id: i64, new: NewDownload) -> ApiResult
 
 /// The public URL of a link. Built from `GMCP_PUBLIC_URL` and never from a
 /// request header, so a forwarded `Host` cannot move where people are sent.
-#[allow(dead_code)]
 fn url_of(state: &AppState, id: &str) -> String {
     match state.config.public_url.join(&format!("/dl/{id}")) {
         Ok(url) => url.to_string(),
@@ -373,7 +362,7 @@ async fn stream(
 /// A Drive response, checked against the download cap before a byte of it is
 /// forwarded. `into_stream` enforces the cap as the bytes go past as well, for
 /// a response that lied about its length.
-fn streamed(file: crate::google::Download) -> ApiResult<(Body, Option<u64>)> {
+fn streamed(file: crate::google::client::Download) -> ApiResult<(Body, Option<u64>)> {
     if file.size().is_some_and(link::too_large) {
         return Err(ApiError::from(crate::google::Error::TooLarge));
     }

@@ -137,6 +137,9 @@ pub fn router(state: AppState) -> Router {
     let openapi_json = axum::Json(openapi);
     Router::new()
         .merge(api)
+        // Bearer only, and its own transport: the MCP endpoint shares this
+        // state and nothing else with the API.
+        .merge(crate::mcp::router(state.clone()))
         .route(
             "/api/openapi.json",
             axum::routing::get(move || async move { openapi_json.clone() }),

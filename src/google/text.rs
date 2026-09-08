@@ -111,12 +111,14 @@ impl Extractor {
     /// An extractor that looks for a named program instead of the real one.
     /// This is how the absence of poppler is tested: point it at a name that
     /// is not on `PATH` and nothing on the machine has to change.
+    #[allow(dead_code)]
     pub fn with_program(program: &str) -> Self {
         Self {
             pdftotext: which(program),
         }
     }
 
+    #[allow(dead_code)]
     pub fn pdftotext_available(&self) -> bool {
         self.pdftotext.is_some()
     }

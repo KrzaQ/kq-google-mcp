@@ -296,6 +296,7 @@ pub fn check_requirements(scopes: &[Scope]) -> Result<(), ScopeError> {
 
 /// The scopes a set must be extended with to satisfy [`Scope::requires`].
 /// The token UI ticks these along instead of refusing.
+#[allow(dead_code)]
 pub fn with_requirements(scopes: &[Scope]) -> Vec<Scope> {
     let mut out = scopes.to_vec();
     for scope in scopes {
@@ -428,71 +429,6 @@ pub fn google_scopes_for(services: &[Service]) -> Vec<&'static str> {
         }
     }
     out
-}
-
-/// How a token's client wants binary results shaped. Stored on the token row
-/// and chosen when it is created; `generic` is the safe default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub enum ClientProfile {
-    #[default]
-    Generic,
-    OpenWebUi,
-    ClaudeCode,
-    OpenCode,
-}
-
-impl ClientProfile {
-    pub const ALL: [ClientProfile; 4] = [
-        ClientProfile::Generic,
-        ClientProfile::OpenWebUi,
-        ClientProfile::ClaudeCode,
-        ClientProfile::OpenCode,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ClientProfile::Generic => "generic",
-            ClientProfile::OpenWebUi => "openwebui",
-            ClientProfile::ClaudeCode => "claude-code",
-            ClientProfile::OpenCode => "opencode",
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("unknown client profile {0:?}; use generic, openwebui, claude-code or opencode")]
-pub struct ClientProfileError(pub String);
-
-impl fmt::Display for ClientProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ClientProfile {
-    type Err = ClientProfileError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ClientProfile::ALL
-            .into_iter()
-            .find(|p| p.as_str() == s)
-            .ok_or_else(|| ClientProfileError(s.to_string()))
-    }
-}
-
-impl TryFrom<String> for ClientProfile {
-    type Error = ClientProfileError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        s.parse()
-    }
-}
-
-impl From<ClientProfile> for String {
-    fn from(p: ClientProfile) -> String {
-        p.as_str().to_string()
-    }
 }
 
 #[cfg(test)]
@@ -676,36 +612,12 @@ mod tests {
     }
 
     #[test]
-    fn client_profiles() {
-        for profile in ClientProfile::ALL {
-            assert_eq!(profile.as_str().parse::<ClientProfile>().unwrap(), profile);
-        }
-        assert_eq!(ClientProfile::default(), ClientProfile::Generic);
-        assert_eq!(ClientProfile::ClaudeCode.to_string(), "claude-code");
-        assert_eq!(
-            "claude_code".parse::<ClientProfile>().unwrap_err(),
-            ClientProfileError("claude_code".into())
-        );
-        assert!(
-            "claude_code"
-                .parse::<ClientProfile>()
-                .unwrap_err()
-                .to_string()
-                .contains("openwebui")
-        );
-    }
-
-    #[test]
-    fn scopes_and_profiles_serialise_as_the_strings_the_database_stores() {
+    fn scopes_serialise_as_the_strings_the_database_stores() {
         let list = scopes(&["gmail:read", "gmail:draft", "delegate"]);
         let json = serde_json::to_string(&list).unwrap();
         assert_eq!(json, r#"["gmail:read","gmail:draft","delegate"]"#);
         assert_eq!(serde_json::from_str::<Vec<Scope>>(&json).unwrap(), list);
         assert!(serde_json::from_str::<Vec<Scope>>(r#"["gmail:send"]"#).is_err());
-        assert_eq!(
-            serde_json::to_string(&ClientProfile::OpenWebUi).unwrap(),
-            "\"openwebui\""
-        );
         assert_eq!(
             serde_json::from_str::<Service>("\"sheets\"").unwrap(),
             Service::Sheets

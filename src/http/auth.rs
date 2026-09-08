@@ -54,9 +54,6 @@ pub enum Principal {
 }
 
 impl Principal {
-    // The tools of step 5 act as this person; here only `require_session` and
-    // `reach` are asked for.
-    #[allow(dead_code)]
     pub fn user(&self) -> &User {
         match self {
             Self::Session(u) | Self::Token { user: u, .. } | Self::Delegate { user: u, .. } => u,
@@ -72,8 +69,6 @@ impl Principal {
     }
 
     /// The token behind a bearer call, for the log and for link ownership.
-    // Used by the MCP tools of step 5, which mint links against the token.
-    #[allow(dead_code)]
     pub fn token(&self) -> Option<&ApiToken> {
         match self {
             Self::Session(_) => None,
@@ -108,8 +103,6 @@ impl Principal {
     }
 
     /// How results are shaped for whoever is on the other end.
-    // Read by the image and result shaping of step 5.
-    #[allow(dead_code)]
     pub fn client_profile(&self) -> ClientProfile {
         match self {
             Self::Session(_) => ClientProfile::Generic,
