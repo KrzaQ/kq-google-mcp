@@ -1,0 +1,38 @@
+{
+  "files": [
+    {
+      "id": "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc",
+      "name": "Q3 report",
+      "mimeType": "application/vnd.google-apps.document",
+      "modifiedTime": "2026-09-04T13:33:20.000Z",
+      "webViewLink": "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc/edit?usp=drivesdk",
+      "parents": [
+        "0AFolderIdExample01234"
+      ],
+      "owners": [
+        {
+          "displayName": "Anna Kowalska",
+          "emailAddress": "anna@example.test"
+        }
+      ]
+    },
+    {
+      "id": "1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210pdf",
+      "name": "q3-figures.pdf",
+      "mimeType": "application/pdf",
+      "modifiedTime": "2026-09-03T09:12:00.000Z",
+      "size": "26112",
+      "webViewLink": "https://drive.google.com/file/d/1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210pdf/view?usp=drivesdk",
+      "parents": [
+        "0AFolderIdExample01234"
+      ],
+      "owners": [
+        {
+          "displayName": "Marta Nowak",
+          "emailAddress": "marta@example.test"
+        }
+      ]
+    }
+  ],
+  "incompleteSearch": false
+}

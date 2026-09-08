@@ -1,0 +1,30 @@
+{
+  "range": "September!A1:D4",
+  "majorDimension": "ROWS",
+  "values": [
+    [
+      "Date",
+      "Customer",
+      "Hours",
+      "Note"
+    ],
+    [
+      "2026-09-01",
+      "Phoenix",
+      "1.5",
+      "Restarted the exporter"
+    ],
+    [
+      "2026-09-03",
+      "Aurora",
+      "2",
+      "Migration, \"phase two\""
+    ],
+    [
+      "2026-09-04",
+      "Phoenix",
+      "0.5",
+      "Follow-up"
+    ]
+  ]
+}

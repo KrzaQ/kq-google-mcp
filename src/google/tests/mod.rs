@@ -24,6 +24,8 @@ const REFRESH_TOKEN: &str = "1//09exampleRefreshTokenForTests";
 /// The connection every call in these tests is made for.
 const CONNECTION: i64 = 7;
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/google/");
+/// The spreadsheet the Sheets and text-extraction fixtures describe.
+const SHEET: &str = "1SpReAdShEeTiDeXaMpLe0123456789abcdefgh";
 /// A stand-in endpoint for the tests that exercise the client and not a
 /// service. Its shape does not matter; that it is reached does.
 const PROBE: &str = "probe/v1/thing";
@@ -176,7 +178,10 @@ impl Harness {
 // module it exercises, so the names do not collide with the modules
 // themselves.
 mod connect;
+mod documents;
+mod files;
 mod mail;
+mod spreadsheets;
 
 // ---------------------------------------------------------------------------
 // The client: bearer, refresh, retry and error mapping.

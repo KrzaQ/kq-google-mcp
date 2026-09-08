@@ -1,0 +1,19 @@
+{
+  "spreadsheetId": "1SpReAdShEeTiDeXaMpLe0123456789abcdefgh",
+  "replies": [
+    {
+      "addSheet": {
+        "properties": {
+          "sheetId": 774411,
+          "title": "October",
+          "index": 2,
+          "sheetType": "GRID",
+          "gridProperties": {
+            "rowCount": 1000,
+            "columnCount": 26
+          }
+        }
+      }
+    }
+  ]
+}

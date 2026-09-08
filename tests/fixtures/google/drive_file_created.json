@@ -1,0 +1,16 @@
+{
+  "id": "1NeWlYcReAtEdDoCiDeXaMpLe0123456789abcd",
+  "name": "Meeting notes",
+  "mimeType": "application/vnd.google-apps.document",
+  "modifiedTime": "2026-09-08T20:15:00.000Z",
+  "webViewLink": "https://docs.google.com/document/d/1NeWlYcReAtEdDoCiDeXaMpLe0123456789abcd/edit?usp=drivesdk",
+  "parents": [
+    "0AFolderIdExample01234"
+  ],
+  "owners": [
+    {
+      "displayName": "Anna Kowalska",
+      "emailAddress": "anna@example.test"
+    }
+  ]
+}

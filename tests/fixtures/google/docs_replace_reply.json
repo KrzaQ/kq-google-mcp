@@ -1,0 +1,13 @@
+{
+  "documentId": "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc",
+  "writeControl": {
+    "requiredRevisionId": "ALm37BW0Example"
+  },
+  "replies": [
+    {
+      "replaceAllText": {
+        "occurrencesChanged": 3
+      }
+    }
+  ]
+}

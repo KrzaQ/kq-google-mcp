@@ -20,8 +20,11 @@
 #![allow(dead_code)]
 
 pub mod client;
+pub mod docs;
+pub mod drive;
 pub mod gmail;
 pub mod oauth;
+pub mod sheets;
 
 #[cfg(test)]
 mod tests;

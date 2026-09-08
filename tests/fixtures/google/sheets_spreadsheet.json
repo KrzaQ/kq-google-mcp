@@ -1,0 +1,33 @@
+{
+  "spreadsheetId": "1SpReAdShEeTiDeXaMpLe0123456789abcdefgh",
+  "properties": {
+    "title": "Support hours 2026"
+  },
+  "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1SpReAdShEeTiDeXaMpLe0123456789abcdefgh/edit",
+  "sheets": [
+    {
+      "properties": {
+        "sheetId": 0,
+        "title": "September",
+        "index": 0,
+        "sheetType": "GRID",
+        "gridProperties": {
+          "rowCount": 200,
+          "columnCount": 12
+        }
+      }
+    },
+    {
+      "properties": {
+        "sheetId": 1298374,
+        "title": "Rates",
+        "index": 1,
+        "sheetType": "GRID",
+        "gridProperties": {
+          "rowCount": 50,
+          "columnCount": 4
+        }
+      }
+    }
+  ]
+}

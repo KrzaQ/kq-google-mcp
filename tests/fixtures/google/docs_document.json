@@ -1,0 +1,50 @@
+{
+  "documentId": "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc",
+  "title": "Q3 report",
+  "revisionId": "ALm37BW0Example",
+  "tabs": [
+    {
+      "tabProperties": {
+        "tabId": "t.0",
+        "title": "Summary",
+        "index": 0
+      },
+      "childTabs": [
+        {
+          "tabProperties": {
+            "tabId": "t.1",
+            "title": "Appendix",
+            "index": 0
+          },
+          "childTabs": []
+        }
+      ]
+    }
+  ],
+  "body": {
+    "content": [
+      {
+        "startIndex": 0,
+        "endIndex": 1,
+        "sectionBreak": {
+          "sectionStyle": {}
+        }
+      },
+      {
+        "startIndex": 1,
+        "endIndex": 32,
+        "paragraph": {
+          "elements": [
+            {
+              "startIndex": 1,
+              "endIndex": 32,
+              "textRun": {
+                "content": "Revenue held up in September.\n"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
