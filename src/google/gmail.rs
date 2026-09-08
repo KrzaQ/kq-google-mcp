@@ -383,6 +383,7 @@ fn draft_message_id(draft: &WireDraft) -> Result<String> {
 }
 
 /// `users.drafts.get`, the draft read back in full.
+#[allow(dead_code)]
 pub async fn get_draft(client: &Client, connection_id: i64, draft_id: &str) -> Result<Message> {
     let request = client
         .service(GMAIL)
@@ -491,6 +492,7 @@ pub fn build_mime(content: &DraftContent) -> Result<Vec<u8>> {
 }
 
 /// A `Message-ID` header, for the rare caller that needs to set one.
+#[allow(dead_code)]
 pub fn message_id_header(value: &str) -> MessageId {
     MessageId::from(value.to_string())
 }

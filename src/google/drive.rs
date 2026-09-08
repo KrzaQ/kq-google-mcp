@@ -13,6 +13,7 @@ use super::client::{Client, Download, Error, Result};
 /// What Google calls a Doc, a Sheet and a folder.
 pub const DOCUMENT_MIME: &str = "application/vnd.google-apps.document";
 pub const SPREADSHEET_MIME: &str = "application/vnd.google-apps.spreadsheet";
+#[allow(dead_code)]
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
 /// The fields a file is asked for. Drive returns almost nothing by default,

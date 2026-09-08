@@ -11,6 +11,8 @@ use super::limits::{DOWNLOAD_MAX_BYTES, LINK_TTL_MINUTES, LINK_USES};
 
 /// 16 random bytes, which is 22 characters of base64url without padding.
 const ID_BYTES: usize = 16;
+// Read by the CLI and the token grid of the later steps.
+#[allow(dead_code)]
 pub const ID_LEN: usize = 22;
 
 /// A fresh link id. Unguessable is the point: the route is unauthenticated,
@@ -39,6 +41,7 @@ pub fn uses() -> i64 {
 }
 
 /// A file larger than this is refused rather than streamed.
+#[allow(dead_code)]
 pub fn too_large(size: u64) -> bool {
     size > DOWNLOAD_MAX_BYTES
 }
