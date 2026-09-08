@@ -1,0 +1,20 @@
+import type { components } from './schema'
+
+type S = components['schemas']
+
+export type Me = S['Me']
+export type UserDto = S['UserDto']
+export type Health = S['Health']
+export type ConnectionDto = S['ConnectionDto']
+export type ConnectInput = S['ConnectInput']
+export type ConnectionPatchInput = S['ConnectionPatchInput']
+export type ReconnectInput = S['ReconnectInput']
+export type ConsentUrl = S['ConsentUrl']
+export type TokenDto = S['TokenDto']
+export type TokenInput = S['TokenInput']
+export type TokenCreated = S['TokenCreated']
+export type ScopeRegistry = S['ScopeRegistry']
+export type ServiceDto = S['ServiceDto']
+export type ScopeDto = S['ScopeDto']
+export type AuditDto = S['AuditDto']
+export type AuditPage = S['AuditPage']
