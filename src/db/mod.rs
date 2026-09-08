@@ -6,11 +6,6 @@
 //! asking. Instants are always passed in or taken from `Utc::now()` here;
 //! nothing has a SQL default, so a test can place a row wherever it likes.
 
-// The query surface is written once, whole. The HTTP layer uses most of it;
-// what is left is what the MCP tools (step 5) and the CLI (step 6) call, and
-// the tests below exercise all of it.
-#![allow(dead_code)]
-
 mod rows;
 #[cfg(test)]
 mod tests;

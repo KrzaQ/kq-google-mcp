@@ -37,8 +37,10 @@ two halves for development; `make test` needs no database and no network.
 - **Every call is logged** — who, which token, which connection, which tool,
   the arguments with secrets stripped, the outcome — and the log is the
   portal's front page.
-- `gmcp token`, `gmcp connection`, `gmcp user`, `gmcp prune` and
-  `gmcp migrate` are the admin CLI. Connecting an account is browser-only.
+- `gmcp token`, `gmcp connection`, `gmcp user`, `gmcp prune`,
+  `gmcp check-secret` and `gmcp migrate` are the admin CLI. Connecting an
+  account is browser-only; `token create` prints the secret once, with the
+  snippet each client needs to use it.
 
 ## Make targets
 

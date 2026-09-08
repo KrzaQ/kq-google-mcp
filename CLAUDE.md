@@ -19,7 +19,7 @@ to say about itself is here and in `README.md`.
 
 ## Layout
 
-- `src/main.rs` — clap entry point: `serve | migrate | token | connection | user | prune`
+- `src/main.rs` — clap entry point: `serve | migrate | token | connection | user | prune | check-secret`
 - `src/config.rs` — `GMCP_*` environment parsing, dev-auth guard
 - `src/db/` — `Db` (SQLite via sqlx, runtime queries) and row types
 - `src/domain/` — scope registry, token helpers, refresh-token sealing, links, image policy
@@ -51,6 +51,9 @@ to say about itself is here and in `README.md`.
   `delegate`, the only non-matrix scope. Adding a service is a code change,
   never a migration. Levels are not cumulative in storage; the UI ticks lower
   levels along and the CLI refuses a write level without its read level.
+  `domain::token::validate` is the one place those rules live: `POST
+  /api/tokens` and `gmcp token create` both call it, so the portal and the
+  terminal refuse the same request in the same words.
 - `tools/list` is filtered per token: a model that cannot see a tool never
   tries it. `call_tool` re-checks and answers a clean error anyway.
 - A token also carries a **client profile**, and images are shaped for it:
