@@ -13,7 +13,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
 use super::dto::{self, Confirmable, PreviewOut};
-use super::{Call, Gmcp, bad, capped, google_err};
+use super::{Call, Gmcp, bad, capped};
 use crate::domain::scope::Service;
 use crate::google::{drive, sheets, text};
 
@@ -110,7 +110,7 @@ impl Gmcp {
             p.spreadsheet_id.trim(),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(spreadsheet_out(connection.label, sheet)))
     }
 
@@ -135,7 +135,7 @@ impl Gmcp {
             Some(max + 1),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         let truncated = rows.len() > max;
         let mut rows = rows;
         rows.truncate(max);
@@ -183,7 +183,7 @@ impl Gmcp {
             p.rows.clone(),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(write_out(
             connection.label,
             spreadsheet_id,
@@ -230,7 +230,7 @@ impl Gmcp {
             p.rows.clone(),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(write_out(
             connection.label,
             spreadsheet_id,
@@ -270,7 +270,7 @@ impl Gmcp {
             &title,
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(dto::SheetWriteOut {
             account: connection.label,
             url: Some(format!(
@@ -327,7 +327,7 @@ impl Gmcp {
             ))));
         }
         let client = &self.google()?.client;
-        let csv = text::to_csv(&rows).map_err(google_err)?;
+        let csv = text::to_csv(&rows).map_err(|e| self.google_err_for(&connection, e))?;
         let file = drive::create_sheet_from_csv(
             client,
             connection.id,
@@ -339,11 +339,11 @@ impl Gmcp {
                 .filter(|f| !f.is_empty()),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         for tab in &tabs {
             sheets::add_tab(client, connection.id, &file.id, tab)
                 .await
-                .map_err(google_err)?;
+                .map_err(|e| self.google_err_for(&connection, e))?;
         }
         Ok(Json(Confirmable::Done(dto::SheetWriteOut {
             account: connection.label,

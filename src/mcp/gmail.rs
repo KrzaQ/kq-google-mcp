@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::dto;
 use super::images::{self, Kind, Source};
-use super::{Call, Gmcp, api_err, bad, cap_text, capped, google_err, refuse};
+use super::{Call, Gmcp, api_err, bad, cap_text, capped, refuse};
 use crate::domain::scope::Service;
 use crate::google::{gmail, text};
 use crate::http::links::{self, NewDownload, Target};
@@ -177,7 +177,7 @@ impl Gmcp {
             capped(p.max, 20, 100),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::MessagesOut {
             account: connection.label,
             count: found.len(),
@@ -203,7 +203,7 @@ impl Gmcp {
             p.max_messages.map(|m| m.max(1) as usize),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::ThreadOut {
             account: connection.label,
             thread_id: thread.id,
@@ -225,7 +225,7 @@ impl Gmcp {
         let message =
             gmail::get_message(&self.google()?.client, connection.id, p.message_id.trim())
                 .await
-                .map_err(google_err)?;
+                .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(message.into()))
     }
 
@@ -238,7 +238,7 @@ impl Gmcp {
         let connection = self.account(&call, &p.account, Service::Gmail).await?;
         let labels = gmail::list_labels(&self.google()?.client, connection.id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::LabelsOut {
             account: connection.label,
             labels: labels.into_iter().map(Into::into).collect(),
@@ -259,7 +259,7 @@ impl Gmcp {
         let message =
             gmail::get_message(&self.google()?.client, connection.id, p.message_id.trim())
                 .await
-                .map_err(google_err)?;
+                .map_err(|e| self.google_err_for(&connection, e))?;
         let attachment = find_attachment(&message, p.attachment_id.trim())?;
         let minted = links::mint(
             &self.state,
@@ -295,7 +295,7 @@ impl Gmcp {
         let client = &self.google()?.client;
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let attachment = find_attachment(&message, p.attachment_id.trim())?.clone();
         let extraction = text::gmail_attachment(
             client,
@@ -305,7 +305,7 @@ impl Gmcp {
             &attachment,
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         let (body, truncated) = cap_text(extraction.text, extraction.truncated_chars, p.max_chars);
         Ok(Json(dto::TextOut {
             account: connection.label,
@@ -332,11 +332,11 @@ impl Gmcp {
         let client = &self.google()?.client;
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let picture = find_picture(&message, p.attachment_id.trim())?;
         let bytes = gmail::get_attachment(client, connection.id, &message.id, &picture.id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         images::content(
             call.principal.client_profile(),
             Source {
@@ -382,7 +382,7 @@ impl Gmcp {
         };
         let draft = gmail::create_draft(&self.google()?.client, connection.id, &content)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(draft_out(connection.label, draft)))
     }
 
@@ -400,7 +400,7 @@ impl Gmcp {
         let client = &self.google()?.client;
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let mut content = gmail::DraftContent::reply_to(
             &message,
             &connection.google_email,
@@ -410,7 +410,7 @@ impl Gmcp {
         content.html = p.html;
         let draft = gmail::create_draft(client, connection.id, &content)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(draft_out(connection.label, draft)))
     }
 
@@ -451,7 +451,7 @@ impl Gmcp {
             &content,
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(draft_out(connection.label, draft)))
     }
 
@@ -468,7 +468,7 @@ impl Gmcp {
             capped(p.max, 20, 100),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::DraftsOut {
             account: connection.label,
             count: drafts.len(),
@@ -489,7 +489,7 @@ impl Gmcp {
         let draft_id = p.draft_id.trim().to_string();
         gmail::delete_draft(&self.google()?.client, connection.id, &draft_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::DraftOut {
             account: connection.label,
             url: String::new(),
@@ -549,7 +549,7 @@ impl Gmcp {
         // under a different name.
         let labels = gmail::list_labels(client, connection.id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let mut add = label_ids(&labels, &add)?;
         let mut remove = label_ids(&labels, &remove)?;
         for (set, on, id) in flags {
@@ -562,7 +562,7 @@ impl Gmcp {
         for id in &ids {
             let message = gmail::modify_labels(client, connection.id, id, &add, &remove)
                 .await
-                .map_err(google_err)?;
+                .map_err(|e| self.google_err_for(&connection, e))?;
             messages.push(dto::MessageBriefOut {
                 message_id: message.id,
                 thread_id: message.thread_id,

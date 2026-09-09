@@ -13,7 +13,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
 use super::dto::{self, Confirmable, PreviewOut};
-use super::{Call, Gmcp, bad, cap_text, google_err};
+use super::{Call, Gmcp, bad, cap_text};
 use crate::domain::scope::Service;
 use crate::google::{docs, drive, text};
 
@@ -82,10 +82,10 @@ impl Gmcp {
         let doc_id = p.doc_id.trim();
         let document = docs::get(client, connection.id, doc_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let markdown = text::google_doc(client, connection.id, doc_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let extraction = text::Extraction::new(markdown, "google-doc");
         let (body, truncated) = cap_text(extraction.text, extraction.truncated_chars, p.max_chars);
         Ok(Json(dto::DocOut {
@@ -138,7 +138,7 @@ impl Gmcp {
                 .filter(|f| !f.is_empty()),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(dto::DocWriteOut {
             account: connection.label,
             url: format!("https://docs.google.com/document/d/{}/edit", file.id),
@@ -182,7 +182,7 @@ impl Gmcp {
         }
         let index = docs::append_text(&self.google()?.client, connection.id, &doc_id, &p.text)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(dto::DocWriteOut {
             account: connection.label,
             url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
@@ -243,7 +243,7 @@ impl Gmcp {
             p.match_case.unwrap_or(false),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(dto::DocWriteOut {
             account: connection.label,
             url: format!("https://docs.google.com/document/d/{doc_id}/edit"),

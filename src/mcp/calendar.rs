@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use super::drive::instant;
 use super::dto::{self, Confirmable, PreviewOut};
-use super::{Call, Gmcp, bad, capped, google_err, refuse};
+use super::{Call, Gmcp, bad, capped, refuse};
 use crate::domain::scope::Service;
 use crate::google::calendar::{self, EventDraft, EventQuery, PRIMARY, When};
 
@@ -111,7 +111,7 @@ impl Gmcp {
         let connection = self.account(&call, &p.account, Service::Calendar).await?;
         let calendars = calendar::list_calendars(&self.google()?.client, connection.id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::CalendarsOut {
             account: connection.label,
             calendars: calendars.into_iter().map(Into::into).collect(),
@@ -153,7 +153,7 @@ impl Gmcp {
             },
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::EventsOut {
             account: connection.label,
             calendar_id,
@@ -179,7 +179,7 @@ impl Gmcp {
             p.event_id.trim(),
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(event.into()))
     }
 
@@ -239,7 +239,7 @@ impl Gmcp {
             },
         )
         .await
-        .map_err(google_err)?;
+        .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(written(
             connection.label,
             calendar_id,
@@ -266,7 +266,7 @@ impl Gmcp {
         let event_id = p.event_id.trim().to_string();
         let existing = calendar::get_event(client, connection.id, &calendar_id, &event_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         refuse_attendees(&existing, "change")?;
         let all_day = p.all_day.unwrap_or(existing.start.date.is_some());
         let draft = EventDraft {
@@ -320,7 +320,7 @@ impl Gmcp {
         }
         let event = calendar::patch_event(client, connection.id, &calendar_id, &event_id, &draft)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(written(
             connection.label,
             calendar_id,
@@ -345,7 +345,7 @@ impl Gmcp {
         let event_id = p.event_id.trim().to_string();
         let existing = calendar::get_event(client, connection.id, &calendar_id, &event_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         refuse_attendees(&existing, "delete")?;
         if !p.confirmed {
             return Ok(Json(Confirmable::Preview(PreviewOut::new(
@@ -366,7 +366,7 @@ impl Gmcp {
         }
         calendar::delete_event(client, connection.id, &calendar_id, &event_id)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(Confirmable::Done(written(
             connection.label,
             calendar_id,

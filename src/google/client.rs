@@ -222,8 +222,23 @@ impl TokenSource {
     /// connection's lock held.
     async fn refresh(&self, connection_id: i64) -> Result<Cached> {
         let sealed = self.store.sealed_refresh_token(connection_id).await?;
-        let refresh_token = seal::open(&self.secret, &sealed)
-            .map_err(|e| Error::Connection(format!("connection {connection_id}: {e}")))?;
+        // A token that will not open is as dead as one Google refused, and for
+        // the same practical reason: only reconnecting the account replaces it.
+        // Recording that is what keeps a rotated GMCP_SECRET from looking like
+        // a healthy connection that fails every call.
+        let refresh_token = match seal::open(&self.secret, &sealed) {
+            Ok(token) => token,
+            Err(e) => {
+                let detail = format!(
+                    "{e}. GMCP_SECRET may have been rotated; `gmcp check-secret` says which \
+                     connections it can still open"
+                );
+                self.store.mark_needs_reauth(connection_id, &detail).await;
+                return Err(Error::Connection(format!(
+                    "connection {connection_id}: {detail}"
+                )));
+            }
+        };
         let response = self
             .http
             .post(self.token_url.clone())

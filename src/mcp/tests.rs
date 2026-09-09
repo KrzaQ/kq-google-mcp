@@ -1098,3 +1098,89 @@ async fn one_server_instance_serves_two_tokens_with_different_scopes() {
     );
     assert!(!b.names().await.contains(&"gmail_search".to_string()));
 }
+
+// ----- a grant that stops working halfway through a call ---------------------
+
+/// A server for the other services: the token endpoint and nothing else.
+async fn google_server() -> MockServer {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    server
+}
+
+#[tokio::test]
+async fn a_grant_google_refuses_mid_call_names_the_account_and_the_portal() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    Mock::given(http_method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(fixture("oauth_invalid_grant.json")))
+        .mount(&server)
+        .await;
+    let (_, work, secret) = one_of_everything(&db, &["gmail:read"], ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    // The same sentence list_accounts and the next call would give, rather
+    // than a connection id the model cannot show anyone.
+    let refused = c
+        .refused(
+            "gmail_search",
+            json!({"account": "work", "query": "from:marta"}),
+        )
+        .await;
+    assert!(refused.contains("`work`"), "{refused}");
+    assert!(refused.contains("work@example.test"), "{refused}");
+    assert!(
+        refused.contains("https://gmcp.example/connections"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains(&format!("connection {}", work.id)),
+        "{refused}"
+    );
+    let after = db.get_connection(work.id).await.unwrap();
+    assert_eq!(after.status, ConnectionStatus::NeedsReauth);
+}
+
+#[tokio::test]
+async fn a_refresh_token_sealed_under_another_secret_asks_for_a_reconnect() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let anna = user(&db, "anna", "anna@example.test").await;
+    // Sealed before GMCP_SECRET was rotated, so nothing here can open it.
+    let work = db
+        .create_connection(NewConnection {
+            user_id: anna.id,
+            label: "work".into(),
+            google_email: "work@example.test".into(),
+            services: vec!["gmail".into()],
+            granted_scopes: vec!["openid".into()],
+            refresh_token_sealed: seal::seal(
+                b"the secret this deployment used to have, long enough",
+                "1//09exampleRefreshTokenForTests",
+            ),
+            delegate_ok: true,
+        })
+        .await
+        .unwrap();
+    let (_, secret) = token(&db, &["gmail:read"], Some(&anna), ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    let refused = c
+        .refused("gmail_list_labels", json!({"account": "work"}))
+        .await;
+    assert!(refused.contains("`work`"), "{refused}");
+    assert!(
+        refused.contains("https://gmcp.example/connections"),
+        "{refused}"
+    );
+    // And the connection stops claiming to be healthy, with the one command
+    // that says whether the secret is the problem.
+    let after = db.get_connection(work.id).await.unwrap();
+    assert_eq!(after.status, ConnectionStatus::NeedsReauth);
+    let detail = after.status_detail.unwrap();
+    assert!(detail.contains("GMCP_SECRET"), "{detail}");
+    assert!(detail.contains("gmcp check-secret"), "{detail}");
+}

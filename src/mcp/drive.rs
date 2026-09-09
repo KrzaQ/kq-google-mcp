@@ -13,7 +13,7 @@ use serde::Deserialize;
 use super::dto;
 use super::gmail::link_out;
 use super::images::{self, Kind, Source};
-use super::{Call, Gmcp, api_err, bad, cap_text, capped, google_err, refuse};
+use super::{Call, Gmcp, api_err, bad, cap_text, capped, refuse};
 use crate::domain::scope::Service;
 use crate::google::drive::{self, ExportFormat};
 use crate::google::text;
@@ -81,7 +81,7 @@ impl Gmcp {
         };
         let files = drive::list(&self.google()?.client, connection.id, &search)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(dto::FilesOut {
             account: connection.label,
             count: files.len(),
@@ -98,7 +98,7 @@ impl Gmcp {
         let connection = self.account(&call, &p.account, Service::Drive).await?;
         let file = drive::get(&self.google()?.client, connection.id, p.file_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(file.into()))
     }
 
@@ -115,7 +115,7 @@ impl Gmcp {
         let connection = self.account(&call, &p.account, Service::Drive).await?;
         let file = drive::get(&self.google()?.client, connection.id, p.file_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         if file.is_google_native() {
             return Err(refuse(format!(
                 "{} is a Google {} and has no file to download; use drive_export_link",
@@ -161,8 +161,9 @@ impl Gmcp {
             .map_err(|e: drive::ExportFormatError| bad(e.to_string()))?;
         let file = drive::get(&self.google()?.client, connection.id, p.file_id.trim())
             .await
-            .map_err(google_err)?;
-        drive::check_export_format(&file, format).map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        drive::check_export_format(&file, format)
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let minted = links::mint(
             &self.state,
             call.principal.user().id,
@@ -199,10 +200,10 @@ impl Gmcp {
         let client = &self.google()?.client;
         let file = drive::get(client, connection.id, p.file_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let extraction = text::drive_file(client, connection.id, &self.extractor, &file)
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let (body, truncated) = cap_text(extraction.text, extraction.truncated_chars, p.max_chars);
         Ok(Json(dto::TextOut {
             account: connection.label,
@@ -228,7 +229,7 @@ impl Gmcp {
         let client = &self.google()?.client;
         let file = drive::get(client, connection.id, p.file_id.trim())
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         if !file.mime_type.starts_with("image/") {
             return Err(refuse(format!(
                 "{} is a {}, not a picture; use drive_read_text or drive_download_link",
@@ -237,10 +238,10 @@ impl Gmcp {
         }
         let bytes = drive::download(client, connection.id, &file.id)
             .await
-            .map_err(google_err)?
+            .map_err(|e| self.google_err_for(&connection, e))?
             .collect()
             .await
-            .map_err(google_err)?;
+            .map_err(|e| self.google_err_for(&connection, e))?;
         images::content(
             call.principal.client_profile(),
             Source {

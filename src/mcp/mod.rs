@@ -148,9 +148,9 @@ pub fn db_err(e: DbError) -> ErrorData {
 }
 
 /// Google's own failures, passed through as the plan says: the status and
-/// Google's message, except `invalid_grant`, which is the one failure the
-/// person can do something about.
-pub fn google_err(e: crate::google::Error) -> ErrorData {
+/// Google's message. The two a person can act on are answered by
+/// [`Gmcp::google_err_for`] instead, which knows which account they are about.
+fn google_err(e: crate::google::Error) -> ErrorData {
     use crate::google::Error as G;
     match e {
         G::NeedsReauth { .. } | G::NotConfigured(_) => refuse(e.to_string()),
@@ -189,6 +189,33 @@ impl Gmcp {
             .ok_or_else(|| refuse("this server has no Google credentials configured"))
     }
 
+    /// The sentence a dead grant gets, in the one place both callers read it
+    /// from: [`Gmcp::account`] says it when the row is already marked, and
+    /// [`Gmcp::google_err_for`] says the same thing when Google refuses the
+    /// refresh token in the middle of a call. A model that saw a connection id
+    /// and no URL would have nothing to tell the person.
+    pub fn reconnect_message(&self, connection: &Connection) -> String {
+        format!(
+            "the Google account behind `{}` ({}) must be connected again; \
+             retrying will not help. Ask the person to reconnect it at {}",
+            connection.label,
+            connection.google_email,
+            self.portal()
+        )
+    }
+
+    /// A Google failure with the resolved connection in hand. A refused
+    /// refresh token and a refresh token that will not open are the same thing
+    /// to the person — the account has to be connected again — so both answer
+    /// with the label and the portal rather than with an id or a 500.
+    pub fn google_err_for(&self, connection: &Connection, e: crate::google::Error) -> ErrorData {
+        use crate::google::Error as G;
+        match e {
+            G::NeedsReauth { .. } | G::Connection(_) => refuse(self.reconnect_message(connection)),
+            other => google_err(other),
+        }
+    }
+
     pub fn portal(&self) -> String {
         match self.state.config.public_url.join("/connections") {
             Ok(url) => url.to_string(),
@@ -224,13 +251,7 @@ impl Gmcp {
         };
         call.resolve(connection.id);
         if connection.status == ConnectionStatus::NeedsReauth {
-            return Err(refuse(format!(
-                "the Google account behind `{}` ({}) must be connected again; \
-                 retrying will not help. Ask the person to reconnect it at {}",
-                connection.label,
-                connection.google_email,
-                self.portal()
-            )));
+            return Err(refuse(self.reconnect_message(&connection)));
         }
         if !connection.services.iter().any(|s| s == service.as_str()) {
             return Err(refuse(format!(
