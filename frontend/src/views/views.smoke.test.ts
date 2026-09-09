@@ -279,6 +279,24 @@ describe('views', () => {
     expect(errors).toEqual([])
   })
 
+  it('ActivityView pages the query it applied, not the one being typed', async () => {
+    const w = await render(ActivityView, '/activity')
+    await w.find('[data-testid="filter-tool"]').setValue('gmail_search')
+    await w.find('[data-testid="activity-filters"]').trigger('submit')
+    await flushPromises()
+
+    // The person starts typing a second search and does not press Apply. The
+    // rows on screen are still the first one's, and so is its next page.
+    await w.find('[data-testid="filter-tool"]').setValue('drive_search')
+    await w.find('[data-testid="load-more"]').trigger('click')
+    await flushPromises()
+    const paged = calls.filter((c) => c.startsWith('GET /api/audit')).at(-1)!
+    expect(paged).toContain('tool=gmail_search')
+    expect(paged).not.toContain('drive_search')
+    expect(paged).toContain(`before=${encodeURIComponent(fixtures.audit.next!)}`)
+    expect(errors).toEqual([])
+  })
+
   it('the login button carries the page that was asked for', async () => {
     const w = await render(LoginView, '/login?next=/tokens')
     expect(w.find('[data-testid="login-button"]').attributes('href')).toBe(

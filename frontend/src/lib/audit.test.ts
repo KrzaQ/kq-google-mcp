@@ -37,6 +37,10 @@ describe('an audit row', () => {
     expect(kindLabel('link_refused')).toBe('link refused')
     expect(kindLabel('connection_removed')).toBe('connection removed')
     expect(kindLabel('something_new')).toBe('something new')
+    // A plain-object lookup would answer these from Object.prototype, and a
+    // function where a label belongs renders as its own source.
+    expect(kindLabel('constructor')).toBe('constructor')
+    expect(kindLabel('__proto__')).toBe('  proto  ')
   })
 
   it('colours by outcome, because the log is read to find failures', () => {

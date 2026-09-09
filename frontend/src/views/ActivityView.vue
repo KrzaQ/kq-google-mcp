@@ -27,6 +27,11 @@ const filters = reactive({
   to: '',
 })
 
+// The query the rows on screen came from. Paging walks on from this rather
+// than from the live filters, so a filter typed but not applied cannot make
+// the second page of a result set come from a different search.
+const applied = ref<AuditQuery>({ limit: PAGE })
+
 const query = computed<AuditQuery>(() => ({
   connection: filters.connection ? Number(filters.connection) : undefined,
   token: filters.token ? Number(filters.token) : undefined,
@@ -40,8 +45,10 @@ const query = computed<AuditQuery>(() => ({
 async function search() {
   loading.value = true
   error.value = null
+  const asked = query.value
   try {
-    const page = await api.audit(query.value)
+    const page = await api.audit(asked)
+    applied.value = asked
     entries.value = page.entries
     next.value = page.next ?? null
   } catch (e) {
@@ -55,7 +62,7 @@ async function more() {
   if (!next.value) return
   loading.value = true
   try {
-    const page = await api.audit({ ...query.value, before: next.value })
+    const page = await api.audit({ ...applied.value, before: next.value })
     entries.value = [...entries.value, ...page.entries]
     next.value = page.next ?? null
   } catch (e) {

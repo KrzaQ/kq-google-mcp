@@ -31,6 +31,12 @@ const MESSAGES: Record<string, string> = {
   label_taken: 'A connection with that label already exists.',
 }
 
+// A plain object inherits from Object.prototype, so `?error=constructor` would
+// otherwise find a function and render it. Only a code this file wrote counts,
+// and everything else gets the same sentence: the query string is the person's
+// to set, so nothing out of it is repeated back onto the page.
 export function connectErrorMessage(code: string): string {
-  return MESSAGES[code] ?? `Connecting failed (${code}).`
+  return Object.hasOwn(MESSAGES, code)
+    ? MESSAGES[code]!
+    : 'Connecting failed. Start again; the activity log has the detail.'
 }

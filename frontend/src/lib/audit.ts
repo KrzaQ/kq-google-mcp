@@ -32,8 +32,11 @@ const KIND_LABELS: Record<string, string> = {
   token_revoked: 'token revoked',
 }
 
+// Guarded the same way: `KIND_LABELS['constructor']` is a function, not a
+// label. A kind this file does not know is still the API's own word for
+// something and is shown as words.
 export function kindLabel(kind: string): string {
-  return KIND_LABELS[kind] ?? kind.replace(/_/g, ' ')
+  return Object.hasOwn(KIND_LABELS, kind) ? KIND_LABELS[kind]! : kind.replace(/_/g, ' ')
 }
 
 export type AuditRow = {
