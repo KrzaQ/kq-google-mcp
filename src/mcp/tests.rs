@@ -277,6 +277,18 @@ async fn token(
     owner: Option<&User>,
     client: ClientProfile,
 ) -> (ApiToken, String) {
+    token_for(db, scopes, owner, client, None).await
+}
+
+/// The same, with a connection allowlist: `None` is a token that reaches all
+/// of its user's connections, `Some(ids)` one that reaches only those.
+async fn token_for(
+    db: &Db,
+    scopes: &[&str],
+    owner: Option<&User>,
+    client: ClientProfile,
+    allowlist: Option<&[i64]>,
+) -> (ApiToken, String) {
     let created_by = owner.map(|u| u.id).unwrap_or(1);
     let new = domain_token::generate();
     let row = db
@@ -286,11 +298,14 @@ async fn token(
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             client,
             user_id: owner.map(|u| u.id),
-            all_connections: true,
+            all_connections: allowlist.is_none(),
             created_by,
         })
         .await
         .unwrap();
+    if let Some(ids) = allowlist {
+        db.set_token_connections(row.id, ids).await.unwrap();
+    }
     (row, new.secret)
 }
 
@@ -617,15 +632,29 @@ async fn a_refused_call_is_logged_as_forbidden() {
 
 // ----- images -----------------------------------------------------------------
 
-/// A small PNG that survives a round trip through the image pipeline.
+/// A PNG wider than every profile's cap, so what each client gets back is the
+/// downscale its cap asks for and not simply the bytes that went in. A smooth
+/// gradient rather than noise: it has to survive re-encoding at 100 KB.
 fn png() -> Vec<u8> {
     use image::{ImageFormat, Rgb, RgbImage};
-    let img = RgbImage::from_fn(80, 60, |x, y| Rgb([(x * 3) as u8, (y * 4) as u8, 120]));
+    let img = RgbImage::from_fn(1600, 1200, |x, y| {
+        Rgb([(x / 8) as u8, (y / 8) as u8, ((x + y) / 16) as u8])
+    });
     let mut bytes = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(img)
         .write_to(&mut bytes, ImageFormat::Png)
         .unwrap();
     bytes.into_inner()
+}
+
+/// The size of a picture that came back, decoded from the block's base64.
+fn image_size(data: &str) -> (u32, u32) {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("an image block is base64");
+    let decoded = image::load_from_memory(&bytes).expect("an image block decodes");
+    (decoded.width(), decoded.height())
 }
 
 async fn mount_picture(server: &MockServer) {
@@ -650,6 +679,8 @@ async fn mount_picture(server: &MockServer) {
 
 #[tokio::test]
 async fn a_picture_comes_back_in_the_shape_each_client_can_see() {
+    let mut claude_code: Option<(u32, u32)> = None;
+    let mut generic: Option<(u32, u32)> = None;
     for (profile, blocks) in [
         (ClientProfile::ClaudeCode, 2),
         (ClientProfile::OpenCode, 2),
@@ -696,6 +727,14 @@ async fn a_picture_comes_back_in_the_shape_each_client_can_see() {
             "{content:?}"
         );
         assert!(!content[1]["data"].as_str().unwrap().is_empty());
+        // Claude Code is capped at 1024 px and everything else at 1568, so the
+        // 1600 px original comes back at two different sizes.
+        let size = image_size(content[1]["data"].as_str().unwrap());
+        match profile {
+            ClientProfile::ClaudeCode => claude_code = Some(size),
+            ClientProfile::Generic => generic = Some(size),
+            _ => {}
+        }
         if profile == ClientProfile::OpenWebUi {
             // The one block Open WebUI's model actually receives.
             assert_eq!(content[2]["type"], "resource");
@@ -708,6 +747,12 @@ async fn a_picture_comes_back_in_the_shape_each_client_can_see() {
             assert_eq!(resource["blob"], content[1]["data"]);
         }
     }
+    assert_eq!(claude_code, Some((1024, 768)));
+    assert_eq!(generic, Some((1568, 1176)));
+    assert_ne!(
+        claude_code, generic,
+        "the profiles must not share one picture"
+    );
 }
 
 #[tokio::test]
@@ -1006,15 +1051,26 @@ async fn labels_are_resolved_by_name_and_the_bin_is_refused() {
     assert_eq!(out["removed"], json!(["INBOX", "UNREAD"]));
     assert_eq!(out["modified"], 1);
 
-    for label in ["TRASH", "spam"] {
+    // However they are spelled and whichever side they are named on: taking a
+    // message out of the bin is not a thing this server does either.
+    for (side, label) in [
+        ("add", "TRASH"),
+        ("add", "spam"),
+        ("remove", "TRASH"),
+        ("remove", "spam"),
+        ("remove", " Trash "),
+    ] {
         let refused = c
             .refused(
                 "gmail_modify_labels",
                 json!({"account": "work", "message_ids": ["18f0a1b2c3d4e5f6"],
-                       "add": [label]}),
+                       side: [label]}),
             )
             .await;
-        assert!(refused.contains("never moves mail to"), "{refused}");
+        assert!(
+            refused.contains("never moves mail to"),
+            "{side} {label}: {refused}"
+        );
     }
     let unknown = c
         .refused(
@@ -1399,4 +1455,965 @@ fn a_tool_s_own_cap_counts_content_and_not_the_first_cap_s_notice() {
     let (text, cut) = crate::mcp::cap_text(content, 0, Some(100));
     assert_eq!(cut, 900);
     assert!(text.ends_with(&truncation_notice(900)));
+}
+
+// ----- one test per tool, over the same router -------------------------------
+//
+// Everything above proves the plumbing; what follows walks each remaining tool
+// once, against the endpoints it actually calls, and checks the shape it hands
+// back. The Gmail tests keep the send and trash guards mounted whatever they
+// are about, because the rule they enforce is not about drafts.
+
+/// The `format=metadata` read `gmail_search` and `gmail_list_drafts` make per
+/// hit; one mock serves every id.
+async fn mount_summaries(server: &MockServer) {
+    Mock::given(http_method("GET"))
+        .and(path_regex(r"^/gmail/v1/users/me/messages/[^/]+$"))
+        .and(query_param("format", "metadata"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture("gmail_message_metadata.json")),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The Google Doc that `drive_files_list.json` and `docs_document.json` both
+/// describe, and its metadata as Drive answers it.
+const DOC: &str = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc";
+const PDF: &str = "1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210pdf";
+const SHEET: &str = "1SpReAdShEeTiDeXaMpLe0123456789abcdefgh";
+
+fn doc_file() -> Value {
+    fixture("drive_files_list.json")["files"][0].clone()
+}
+
+// ----- gmail ------------------------------------------------------------------
+
+#[tokio::test]
+async fn gmail_search_asks_gmail_the_query_it_was_given_and_answers_in_rows() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages",
+        fixture("gmail_messages_list.json"),
+    )
+    .await;
+    mount_summaries(&server).await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    let out = c
+        .ok(
+            "gmail_search",
+            json!({"account": "work", "query": "from:marta has:attachment",
+                   "newer_than": "7d", "max": 5}),
+        )
+        .await;
+    assert_eq!(out["account"], "work");
+    assert_eq!(out["count"], 2);
+    assert_eq!(out["messages"][0]["subject"], "Q3 figures for Kraków");
+    assert_eq!(
+        out["messages"][0]["from"],
+        "Marta Nowak <marta@example.test>"
+    );
+    assert_eq!(out["messages"][0]["attachments"], 1);
+
+    let asked = server.received_requests().await.unwrap();
+    let list = asked
+        .iter()
+        .find(|r| r.url.path() == "/gmail/v1/users/me/messages")
+        .expect("the list call");
+    let query: std::collections::HashMap<_, _> = list.url.query_pairs().into_owned().collect();
+    assert_eq!(query["q"], "from:marta has:attachment newer_than:7d");
+    assert_eq!(query["maxResults"], "5");
+
+    // An age that is not one word is refused before anything is asked.
+    let bad = c
+        .refused(
+            "gmail_search",
+            json!({"account": "work", "query": "x", "newer_than": "7 days"}),
+        )
+        .await;
+    assert!(bad.contains("7d, 2m or 1y"), "{bad}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn gmail_get_thread_returns_the_conversation_in_order_and_can_keep_the_end() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/threads/18f0a1b2c3d4e5f0",
+        fixture("gmail_thread.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    let args = json!({"account": "work", "thread_id": "18f0a1b2c3d4e5f0"});
+    let out = c.ok("gmail_get_thread", args.clone()).await;
+    assert_eq!(out["thread_id"], "18f0a1b2c3d4e5f0");
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["message_id"], "18f0a1b2c3d4e5f6");
+    assert_eq!(messages[1]["message_id"], "18f0a1b2c3d4e5fa");
+    assert!(messages[0]["text"].as_str().unwrap().contains("quarterly"));
+
+    // A long conversation is read for what was said last.
+    let mut trimmed = args.as_object().unwrap().clone();
+    trimmed.insert("max_messages".into(), json!(1));
+    let last = c.ok("gmail_get_thread", Value::Object(trimmed)).await;
+    let messages = last["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["message_id"], "18f0a1b2c3d4e5fa");
+    drop(server);
+}
+
+/// The CSV attachment of `gmail_message_csv.json`, as the extractor reads it.
+const CSV: &str = "date,customer,hours\n2026-09-01,Phoenix,1.5\n2026-09-03,Aurora,2\n";
+
+#[tokio::test]
+async fn gmail_attachment_text_extracts_the_attachment_and_says_what_it_cut() {
+    use base64::Engine;
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5fc",
+        fixture("gmail_message_csv.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5fc/attachments/ANGjdJ8csvSep",
+        json!({
+            "size": CSV.len(),
+            "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(CSV),
+        }),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    let args = json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc",
+                      "attachment_id": "ANGjdJ8csvSep"});
+    let out = c.ok("gmail_attachment_text", args.clone()).await;
+    assert_eq!(out["source"], "text");
+    assert_eq!(out["filename"], "september-hours.csv");
+    assert_eq!(out["truncated_chars"], 0);
+    assert_eq!(out["text"], CSV);
+
+    // `max_chars` cuts and says by how much, in the text itself.
+    let mut short = args.as_object().unwrap().clone();
+    short.insert("max_chars".into(), json!(10));
+    let cut = c.ok("gmail_attachment_text", Value::Object(short)).await;
+    assert_eq!(cut["truncated_chars"], CSV.chars().count() - 10);
+    assert!(
+        cut["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("date,custo\n\n[… "),
+        "{}",
+        cut["text"]
+    );
+
+    // An attachment id the message does not have is refused with the ones it
+    // does, rather than fetched.
+    let missing = c
+        .refused(
+            "gmail_attachment_text",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc",
+                   "attachment_id": "nope"}),
+        )
+        .await;
+    assert!(missing.contains("september-hours.csv"), "{missing}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn gmail_list_drafts_names_every_draft_and_where_to_open_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_drafts_list.json"),
+    )
+    .await;
+    mount_summaries(&server).await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let out = c.ok("gmail_list_drafts", json!({"account": "work"})).await;
+    assert_eq!(out["count"], 2);
+    assert_eq!(out["drafts"][0]["draft_id"], "r-8812345678901234567");
+    assert_eq!(
+        out["drafts"][0]["url"],
+        "https://mail.google.com/mail/u/0/#drafts?compose=r-8812345678901234567"
+    );
+    assert_eq!(out["drafts"][1]["draft_id"], "r-4451234567890123456");
+    drop(server);
+}
+
+#[tokio::test]
+async fn gmail_update_draft_replaces_the_message_and_still_sends_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    Mock::given(http_method("PUT"))
+        .and(path("/gmail/v1/users/me/drafts/r-8812345678901234567"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_draft.json")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let out = c
+        .ok(
+            "gmail_update_draft",
+            json!({"account": "work", "draft_id": "r-8812345678901234567",
+                   "to": ["marta@example.test"], "subject": "Q3, again",
+                   "body": "the corrected figures"}),
+        )
+        .await;
+    assert_eq!(out["draft_id"], "r-8812345678901234567");
+    assert_eq!(out["thread_id"], "18f0a1b2c3d4e5f0");
+    assert!(out["note"].as_str().unwrap().contains("nothing was sent"));
+
+    // A draft with nobody to send it to is refused here, not by Gmail.
+    let empty = c
+        .refused(
+            "gmail_update_draft",
+            json!({"account": "work", "draft_id": "r-8812345678901234567",
+                   "to": [" "], "subject": "x", "body": "y"}),
+        )
+        .await;
+    assert!(empty.contains("at least one recipient"), "{empty}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn gmail_delete_draft_deletes_the_draft_and_touches_nothing_else() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    Mock::given(http_method("DELETE"))
+        .and(path("/gmail/v1/users/me/drafts/r-8812345678901234567"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The undo for a draft is a delete of that draft and nothing more: no
+    // read, no modify, no second write of any kind.
+    for verb in ["GET", "POST", "PUT"] {
+        server
+            .register(
+                Mock::given(http_method(verb))
+                    .and(path_regex(r"^/gmail/"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(0)
+                    .named("deleting a draft reads or writes something else"),
+            )
+            .await;
+    }
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let out = c
+        .ok(
+            "gmail_delete_draft",
+            json!({"account": "work", "draft_id": "r-8812345678901234567"}),
+        )
+        .await;
+    assert_eq!(out["draft_id"], "r-8812345678901234567");
+    assert_eq!(out["note"], "the draft is gone");
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_token_with_an_allowlist_cannot_name_a_connection_off_it() {
+    let db = Db::open_memory().await.unwrap();
+    let anna = user(&db, "anna", "anna@example.test").await;
+    let work = connect(&db, &anna, "work", &["gmail"], true).await;
+    connect(&db, &anna, "personal", &["gmail"], true).await;
+    let (_, secret) = token_for(
+        &db,
+        &["gmail:read"],
+        Some(&anna),
+        ClientProfile::Generic,
+        Some(&[work.id]),
+    )
+    .await;
+    let mut c = Client::new(app(&db, None).await, secret);
+    c.initialize().await;
+
+    let out = c.ok("list_accounts", json!({})).await;
+    let labels: Vec<&str> = out["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["work"]);
+
+    // The connection exists and belongs to the same person; this token still
+    // cannot name it, and is not told that it exists.
+    let refused = c
+        .refused("gmail_list_labels", json!({"account": "personal"}))
+        .await;
+    assert_eq!(
+        refused,
+        "there is no account called `personal`; this token can reach `work`"
+    );
+}
+
+// ----- drive ------------------------------------------------------------------
+
+/// What Drive's markdown export of `docs_document.json` would be.
+const MARKDOWN: &str = "# Q3 report\n\nRevenue held up in September.\n";
+
+async fn mount_markdown_export(server: &MockServer) {
+    Mock::given(http_method("GET"))
+        .and(path(format!("/drive/v3/files/{DOC}/export")))
+        .and(query_param("mimeType", "text/markdown"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(MARKDOWN.as_bytes().to_vec(), "text/markdown"),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn drive_search_answers_the_files_it_found_and_never_the_bin() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        "/drive/v3/files",
+        fixture("drive_files_list.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok(
+            "drive_search",
+            json!({"account": "work", "name_contains": "q3",
+                   "modified_after": "2026-09-01T00:00:00Z", "max": 5}),
+        )
+        .await;
+    assert_eq!(out["count"], 2);
+    assert_eq!(out["files"][0]["name"], "Q3 report");
+    assert_eq!(out["files"][1]["size"], 26112);
+    assert_eq!(out["files"][1]["owners"][0], "marta@example.test");
+
+    let asked = server.received_requests().await.unwrap();
+    let list = asked
+        .iter()
+        .find(|r| r.url.path() == "/drive/v3/files")
+        .expect("the files.list call");
+    let query: std::collections::HashMap<_, _> = list.url.query_pairs().into_owned().collect();
+    assert!(
+        query["q"].starts_with("trashed = false"),
+        "{:?}",
+        query["q"]
+    );
+    assert_eq!(query["pageSize"], "5");
+
+    // A date that is not an instant is refused by name.
+    let bad = c
+        .refused(
+            "drive_search",
+            json!({"account": "work", "modified_after": "last tuesday"}),
+        )
+        .await;
+    assert!(bad.contains("RFC 3339"), "{bad}");
+}
+
+#[tokio::test]
+async fn drive_get_file_answers_the_metadata_and_nothing_more() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{PDF}"),
+        fixture("drive_file.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok("drive_get_file", json!({"account": "work", "file_id": PDF}))
+        .await;
+    assert_eq!(out["file_id"], PDF);
+    assert_eq!(out["name"], "q3-figures.pdf");
+    assert_eq!(out["mime_type"], "application/pdf");
+    assert_eq!(out["size"], 26112);
+    assert_eq!(out["modified_time"], "2026-09-03T09:12:00Z");
+}
+
+#[tokio::test]
+async fn drive_download_link_mints_a_link_for_bytes_and_refuses_a_google_file() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{PDF}"),
+        fixture("drive_file.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{DOC}"),
+        doc_file(),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok(
+            "drive_download_link",
+            json!({"account": "work", "file_id": PDF}),
+        )
+        .await;
+    assert!(
+        out["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://gmcp.example/dl/"),
+        "{out}"
+    );
+    assert_eq!(out["filename"], "q3-figures.pdf");
+    assert_eq!(out["mime_type"], "application/pdf");
+    assert_eq!(out["size"], 26112);
+    assert!(out["note"].as_str().unwrap().contains("15 minutes"));
+
+    // A Google Doc has no bytes of its own, and the answer says which tool has.
+    let refused = c
+        .refused(
+            "drive_download_link",
+            json!({"account": "work", "file_id": DOC}),
+        )
+        .await;
+    assert!(refused.contains("drive_export_link"), "{refused}");
+}
+
+#[tokio::test]
+async fn drive_export_link_refuses_a_format_the_file_cannot_produce() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{DOC}"),
+        doc_file(),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok(
+            "drive_export_link",
+            json!({"account": "work", "file_id": DOC, "format": "markdown"}),
+        )
+        .await;
+    assert_eq!(out["filename"], "Q3 report.md");
+    assert_eq!(out["mime_type"], "text/markdown");
+    // An export has no size until it is made.
+    assert!(out["size"].is_null(), "{out}");
+
+    // A Doc does not export as a spreadsheet, and the refusal says what it does
+    // export as rather than leaving Google to answer that.
+    let refused = c
+        .refused(
+            "drive_export_link",
+            json!({"account": "work", "file_id": DOC, "format": "xlsx"}),
+        )
+        .await;
+    assert!(refused.contains("cannot be exported as xlsx"), "{refused}");
+    assert!(refused.contains("markdown, pdf, docx"), "{refused}");
+
+    // And a format that is not a format at all is refused before any call.
+    let unknown = c
+        .refused(
+            "drive_export_link",
+            json!({"account": "work", "file_id": DOC, "format": "epub"}),
+        )
+        .await;
+    assert!(unknown.contains("unknown export format"), "{unknown}");
+}
+
+#[tokio::test]
+async fn drive_read_text_reads_a_google_doc_as_markdown() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{DOC}"),
+        doc_file(),
+    )
+    .await;
+    mount_markdown_export(&server).await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok(
+            "drive_read_text",
+            json!({"account": "work", "file_id": DOC}),
+        )
+        .await;
+    assert_eq!(out["source"], "google-doc");
+    assert_eq!(out["filename"], "Q3 report");
+    assert_eq!(out["text"], MARKDOWN);
+    assert_eq!(out["chars"], MARKDOWN.chars().count());
+    assert_eq!(out["truncated_chars"], 0);
+}
+
+#[tokio::test]
+async fn drive_view_image_downscales_the_file_it_was_pointed_at() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let picture = "1PiCtUrEiDeXaMpLe0123456789abcdefghijk";
+    Mock::given(http_method("GET"))
+        .and(path(format!("/drive/v3/files/{picture}")))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(png(), "image/png"))
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{picture}"),
+        json!({
+            "id": picture,
+            "name": "chart.png",
+            "mimeType": "image/png",
+            "modifiedTime": "2026-09-05T10:00:00.000Z",
+            "size": "24096",
+            "webViewLink": format!("https://drive.google.com/file/d/{picture}/view"),
+            "owners": [{"displayName": "Anna Kowalska", "emailAddress": "anna@example.test"}],
+        }),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{PDF}"),
+        fixture("drive_file.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let v = c
+        .call(
+            "drive_view_image",
+            json!({"account": "work", "file_id": picture}),
+        )
+        .await;
+    assert!(!is_error(&v), "{}", error_text(&v));
+    let result = &v["result"];
+    assert!(result["structuredContent"].is_null(), "{result}");
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert!(content[0]["text"].as_str().unwrap().contains("chart.png"));
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(
+        image_size(content[1]["data"].as_str().unwrap()),
+        (1568, 1176)
+    );
+
+    // Anything that is not a picture is refused rather than downloaded.
+    let refused = c
+        .refused(
+            "drive_view_image",
+            json!({"account": "work", "file_id": PDF}),
+        )
+        .await;
+    assert!(refused.contains("not a picture"), "{refused}");
+    assert!(refused.contains("drive_read_text"), "{refused}");
+}
+
+// ----- docs -------------------------------------------------------------------
+
+#[tokio::test]
+async fn docs_read_answers_the_document_with_its_tabs_and_its_markdown() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{DOC}"),
+        fixture("docs_document.json"),
+    )
+    .await;
+    mount_markdown_export(&server).await;
+    let mut c = client(&db, &server, &["docs:read", "drive:read"]).await;
+
+    let out = c
+        .ok("docs_read", json!({"account": "work", "doc_id": DOC}))
+        .await;
+    assert_eq!(out["doc_id"], DOC);
+    assert_eq!(out["title"], "Q3 report");
+    assert_eq!(
+        out["url"],
+        format!("https://docs.google.com/document/d/{DOC}/edit")
+    );
+    // Child tabs are flattened, because a model asking for one wants the list.
+    assert_eq!(out["tabs"][0]["title"], "Summary");
+    assert_eq!(out["tabs"][1]["title"], "Appendix");
+    assert_eq!(out["text"], MARKDOWN);
+}
+
+#[tokio::test]
+async fn docs_create_previews_the_document_and_writes_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    // The one call that would make a document, which must not be made.
+    server
+        .register(
+            Mock::given(path("/upload/drive/v3/files"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(fixture("drive_file_created.json")),
+                )
+                .expect(0)
+                .named("an unconfirmed docs_create reaches Drive"),
+        )
+        .await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let out = c
+        .ok(
+            "docs_create",
+            json!({"account": "work", "title": "Meeting notes",
+                   "markdown": "# Meeting notes\n\n- one\n- two\n", "confirmed": false}),
+        )
+        .await;
+    assert_eq!(out["confirmed"], false);
+    assert_eq!(out["written"], false);
+    assert!(out["action"].as_str().unwrap().contains("Meeting notes"));
+    assert!(
+        out["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("# Meeting notes")),
+        "{out}"
+    );
+    assert!(out["next"].as_str().unwrap().contains("confirmed=true"));
+
+    // A document with no title is refused before the question is even asked.
+    let bad = c
+        .refused(
+            "docs_create",
+            json!({"account": "work", "title": "  ", "markdown": "x", "confirmed": true}),
+        )
+        .await;
+    assert!(bad.contains("needs a title"), "{bad}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_create_makes_the_document_once_it_is_confirmed() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("POST"))
+        .and(path("/upload/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("drive_file_created.json")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let out = c
+        .ok(
+            "docs_create",
+            json!({"account": "work", "title": "Meeting notes",
+                   "markdown": "# Meeting notes\n", "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["doc_id"], "1NeWlYcReAtEdDoCiDeXaMpLe0123456789abcd");
+    assert_eq!(out["title"], "Meeting notes");
+    assert!(
+        out["url"]
+            .as_str()
+            .unwrap()
+            .contains("1NeWlYcReAtEdDoCiDeXaMpLe0123456789abcd"),
+        "{out}"
+    );
+    assert!(out["written"].as_str().unwrap().contains("markdown"));
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_append_previews_and_then_writes_at_the_end_of_the_document() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{DOC}"),
+        fixture("docs_document.json"),
+    )
+    .await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v1/documents/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_batch_update.json")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": DOC, "text": "One more line.\n"});
+    let mut preview = args.as_object().unwrap().clone();
+    preview.insert("confirmed".into(), json!(false));
+    let shown = c.ok("docs_append", Value::Object(preview)).await;
+    assert_eq!(shown["written"], false);
+    assert!(shown["action"].as_str().unwrap().contains(DOC));
+    assert!(
+        shown["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("One more line.")),
+        "{shown}"
+    );
+
+    let mut confirmed = args.as_object().unwrap().clone();
+    confirmed.insert("confirmed".into(), json!(true));
+    let out = c.ok("docs_append", Value::Object(confirmed)).await;
+    assert_eq!(out["doc_id"], DOC);
+    // The document ends at 32, so the text goes in at 31.
+    assert_eq!(out["written"], "15 characters appended at index 31");
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_replace_text_reports_how_many_occurrences_it_changed() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v1/documents/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_replace_reply.json")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": DOC,
+                      "find": "September", "replace": "October"});
+    let mut preview = args.as_object().unwrap().clone();
+    preview.insert("confirmed".into(), json!(false));
+    let shown = c.ok("docs_replace_text", Value::Object(preview)).await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("cannot be undone")),
+        "{shown}"
+    );
+
+    let mut confirmed = args.as_object().unwrap().clone();
+    confirmed.insert("confirmed".into(), json!(true));
+    let out = c.ok("docs_replace_text", Value::Object(confirmed)).await;
+    assert_eq!(out["replacements"], 3);
+    assert_eq!(out["written"], "3 occurrences replaced");
+
+    // An empty needle would match everywhere and is refused.
+    let bad = c
+        .refused(
+            "docs_replace_text",
+            json!({"account": "work", "doc_id": DOC, "find": "",
+                   "replace": "x", "confirmed": true}),
+        )
+        .await;
+    assert!(bad.contains("match everywhere"), "{bad}");
+    drop(server);
+}
+
+// ----- sheets -----------------------------------------------------------------
+
+#[tokio::test]
+async fn sheets_list_tabs_answers_the_tabs_and_their_dimensions() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v4/spreadsheets/{SHEET}"),
+        fixture("sheets_spreadsheet.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["sheets:read"]).await;
+
+    let out = c
+        .ok(
+            "sheets_list_tabs",
+            json!({"account": "work", "spreadsheet_id": SHEET}),
+        )
+        .await;
+    assert_eq!(out["title"], "Support hours 2026");
+    assert_eq!(out["spreadsheet_id"], SHEET);
+    assert_eq!(out["tabs"][0]["title"], "September");
+    assert_eq!(out["tabs"][0]["rows"], 200);
+    assert_eq!(out["tabs"][0]["columns"], 12);
+    assert_eq!(out["tabs"][1]["title"], "Rates");
+}
+
+#[tokio::test]
+async fn sheets_read_range_answers_rows_and_says_when_it_cut_them() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_values.json")))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read"]).await;
+
+    let out = c
+        .ok(
+            "sheets_read_range",
+            json!({"account": "work", "spreadsheet_id": SHEET, "range": "September!A1:D4"}),
+        )
+        .await;
+    assert_eq!(out["range"], "September!A1:D4");
+    assert_eq!(out["row_count"], 4);
+    assert_eq!(out["truncated"], false);
+    assert_eq!(out["rows"][0][0], "Date");
+    assert_eq!(out["rows"][3][1], "Phoenix");
+
+    // `max_rows` cuts, and says so rather than leaving it to be guessed.
+    let short = c
+        .ok(
+            "sheets_read_range",
+            json!({"account": "work", "spreadsheet_id": SHEET,
+                   "range": "September!A1:D4", "max_rows": 2}),
+        )
+        .await;
+    assert_eq!(short["row_count"], 2);
+    assert_eq!(short["truncated"], true);
+}
+
+#[tokio::test]
+async fn sheets_update_range_previews_first_and_then_writes_once() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("PUT"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_update.json")))
+        .expect(1)
+        .named("values.update, exactly once")
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+
+    let args = json!({"account": "work", "spreadsheet_id": SHEET,
+                      "range": "September!A2:D2",
+                      "rows": [["2026-09-01", "Phoenix", "1.5", "Restarted the exporter"]]});
+    let mut preview = args.as_object().unwrap().clone();
+    preview.insert("confirmed".into(), json!(false));
+    let shown = c.ok("sheets_update_range", Value::Object(preview)).await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("there is no undo here")),
+        "{shown}"
+    );
+
+    let mut confirmed = args.as_object().unwrap().clone();
+    confirmed.insert("confirmed".into(), json!(true));
+    let out = c.ok("sheets_update_range", Value::Object(confirmed)).await;
+    assert_eq!(out["updated_range"], "September!A2:D2");
+    assert_eq!(out["updated_rows"], 1);
+    assert_eq!(out["updated_cells"], 4);
+    assert!(out["written"].as_str().unwrap().contains("1 rows written"));
+    drop(server);
+}
+
+#[tokio::test]
+async fn sheets_add_tab_previews_and_then_adds_the_tab() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_add_sheet.json")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+
+    let args = json!({"account": "work", "spreadsheet_id": SHEET, "title": "October"});
+    let mut preview = args.as_object().unwrap().clone();
+    preview.insert("confirmed".into(), json!(false));
+    let shown = c.ok("sheets_add_tab", Value::Object(preview)).await;
+    assert_eq!(shown["written"], false);
+    assert!(shown["action"].as_str().unwrap().contains("\"October\""));
+
+    let mut confirmed = args.as_object().unwrap().clone();
+    confirmed.insert("confirmed".into(), json!(true));
+    let out = c.ok("sheets_add_tab", Value::Object(confirmed)).await;
+    assert_eq!(out["updated_range"], "October");
+    assert_eq!(out["updated_rows"], 1000);
+    assert_eq!(out["written"], "tab \"October\" added");
+
+    // A tab with no title is refused before anything is asked of Google.
+    let bad = c
+        .refused(
+            "sheets_add_tab",
+            json!({"account": "work", "spreadsheet_id": SHEET,
+                   "title": " ", "confirmed": true}),
+        )
+        .await;
+    assert!(bad.contains("needs a title"), "{bad}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn sheets_create_previews_the_spreadsheet_and_writes_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    server
+        .register(
+            Mock::given(path("/upload/drive/v3/files"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("an unconfirmed sheets_create reaches Drive"),
+        )
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+
+    let out = c
+        .ok(
+            "sheets_create",
+            json!({"account": "work", "title": "Support hours 2027",
+                   "tabs": ["October", "November"],
+                   "rows": [["Date", "Customer", "Hours"]], "confirmed": false}),
+        )
+        .await;
+    assert_eq!(out["confirmed"], false);
+    assert_eq!(out["written"], false);
+    assert!(
+        out["action"]
+            .as_str()
+            .unwrap()
+            .contains("Support hours 2027"),
+        "{out}"
+    );
+    assert_eq!(
+        out["details"][0],
+        "1 rows on the first tab, plus empty tabs October, November"
+    );
+    assert_eq!(out["details"][1], "Date | Customer | Hours");
+    drop(server);
 }

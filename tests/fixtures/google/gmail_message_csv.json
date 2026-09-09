@@ -1,0 +1,71 @@
+{
+  "id": "18f0a1b2c3d4e5fc",
+  "threadId": "18f0a1b2c3d4e5fc",
+  "labelIds": [
+    "INBOX"
+  ],
+  "snippet": "The September hours are in the attached CSV.",
+  "internalDate": "1788528800000",
+  "sizeEstimate": 4210,
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Message-ID",
+        "value": "<CAF7n2sdef456@mail.example.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "September hours"
+      },
+      {
+        "name": "From",
+        "value": "Marta Nowak <marta@example.test>"
+      },
+      {
+        "name": "To",
+        "value": "Anna Kowalska <anna@example.test>"
+      },
+      {
+        "name": "Date",
+        "value": "Fri, 05 Sep 2026 10:00:00 +0200"
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [],
+        "body": {
+          "size": 45,
+          "data": "VGhlIFNlcHRlbWJlciBob3VycyBhcmUgaW4gdGhlIGF0dGFjaGVkIENTVi4K"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "text/csv",
+        "filename": "september-hours.csv",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/csv; charset=UTF-8; name=\"september-hours.csv\""
+          },
+          {
+            "name": "Content-Disposition",
+            "value": "attachment; filename=\"september-hours.csv\""
+          }
+        ],
+        "body": {
+          "attachmentId": "ANGjdJ8csvSep",
+          "size": 61
+        }
+      }
+    ]
+  }
+}

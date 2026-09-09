@@ -247,18 +247,24 @@ async fn labels_are_added_and_removed_but_never_trash_or_spam() {
     assert_eq!(body["addLabelIds"], json!(["Label_18"]));
     assert_eq!(body["removeLabelIds"], json!(["UNREAD", "INBOX"]));
 
-    // The two labels this server refuses, however they are spelled, and
-    // before any request goes out.
-    for label in ["TRASH", "spam", " Trash "] {
-        let error = gmail::modify_labels(
-            &h.client,
-            CONNECTION,
-            "18f0a1b2c3d4e5f6",
-            &[label.to_string()],
-            &[],
-        )
-        .await
-        .unwrap_err();
+    // The two labels this server refuses, however they are spelled, on
+    // whichever side they are named, and before any request goes out. Taking a
+    // message out of the bin is not a thing this server does either: it would
+    // be an untrash, and the rule is that the bin is not touched at all.
+    for (label, on_add) in [
+        ("TRASH", true),
+        ("spam", true),
+        (" Trash ", true),
+        ("TRASH", false),
+        ("spam", false),
+        (" Trash ", false),
+    ] {
+        let named = [label.to_string()];
+        let (add, remove): (&[String], &[String]) =
+            if on_add { (&named, &[]) } else { (&[], &named) };
+        let error = gmail::modify_labels(&h.client, CONNECTION, "18f0a1b2c3d4e5f6", add, remove)
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
         assert!(error.to_string().contains("never"), "{error}");
     }
