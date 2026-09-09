@@ -1184,3 +1184,153 @@ async fn a_refresh_token_sealed_under_another_secret_asks_for_a_reconnect() {
     assert!(detail.contains("GMCP_SECRET"), "{detail}");
     assert!(detail.contains("gmcp check-secret"), "{detail}");
 }
+
+// ----- the plumbing the tool tests below share -------------------------------
+
+/// One JSON endpoint.
+async fn mount(server: &MockServer, verb: &str, at: &str, body: Value) {
+    Mock::given(http_method(verb))
+        .and(path(at))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// A mock server with the token endpoint and the two guards every Gmail test
+/// keeps mounted.
+async fn gmail_server() -> MockServer {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    for mock in expect_no_send() {
+        server.register(mock).await;
+    }
+    server
+}
+
+/// One person with everything connected, and an initialised client for a
+/// token with these scopes.
+async fn client(db: &Db, server: &MockServer, scopes: &[&str]) -> Client {
+    let (_, _, secret) = one_of_everything(db, scopes, ClientProfile::Generic).await;
+    let mut c = Client::new(app(db, Some(server)).await, secret);
+    c.initialize().await;
+    c
+}
+
+// ----- what survives a call that only partly worked ---------------------------
+
+#[tokio::test]
+async fn a_label_change_reports_the_messages_it_could_not_change() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/labels",
+        fixture("gmail_labels.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6/modify",
+        fixture("gmail_message_modified.json"),
+    )
+    .await;
+    Mock::given(http_method("POST"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5f7/modify"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(fixture("error_not_found.json")))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:modify"]).await;
+
+    // One id is gone; the other is still labelled, and the answer says both.
+    let out = c
+        .ok(
+            "gmail_modify_labels",
+            json!({"account": "work",
+                   "message_ids": ["18f0a1b2c3d4e5f6", "18f0a1b2c3d4e5f7"],
+                   "add": ["Invoices"]}),
+        )
+        .await;
+    assert_eq!(out["modified"], 1);
+    assert_eq!(out["messages"][0]["message_id"], "18f0a1b2c3d4e5f6");
+    assert_eq!(out["failed"][0]["message_id"], "18f0a1b2c3d4e5f7");
+    assert!(
+        out["failed"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Requested entity was not found"),
+        "{out}"
+    );
+
+    // A call where nothing at all worked is an error, as it always was.
+    let refused = c
+        .refused(
+            "gmail_modify_labels",
+            json!({"account": "work", "message_ids": ["18f0a1b2c3d4e5f7"],
+                   "add": ["Invoices"]}),
+        )
+        .await;
+    assert!(refused.contains("404"), "{refused}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_spreadsheet_that_lost_a_tab_still_comes_back_with_its_id() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let made = "1NeWsPrEaDsHeEtIdExAmPlE0123456789abcd";
+    mount(
+        &server,
+        "POST",
+        "/upload/drive/v3/files",
+        json!({
+            "id": made,
+            "name": "Support hours 2027",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "modifiedTime": "2026-09-09T08:00:00.000Z",
+            "webViewLink": format!("https://docs.google.com/spreadsheets/d/{made}/edit"),
+            "owners": [{"displayName": "Anna Kowalska", "emailAddress": "anna@example.test"}],
+        }),
+    )
+    .await;
+    // The first tab fails, the second is added: the spreadsheet exists either
+    // way, and an error here would drop its id and invite a second one.
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"code": 500, "message": "Internal error encountered."}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_add_sheet.json")))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+
+    let out = c
+        .ok(
+            "sheets_create",
+            json!({"account": "work", "title": "Support hours 2027",
+                   "tabs": ["October", "November"],
+                   "rows": [["Date", "Customer", "Hours"]], "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["spreadsheet_id"], made);
+    assert_eq!(
+        out["url"],
+        format!("https://docs.google.com/spreadsheets/d/{made}/edit")
+    );
+    let written = out["written"].as_str().unwrap();
+    assert!(written.contains("created with 1 rows"), "{written}");
+    assert!(
+        written.contains("tab \"October\" could not be added"),
+        "{written}"
+    );
+    assert!(written.contains("sheets_add_tab"), "{written}");
+    // The one that worked is not reported as missing.
+    assert!(!written.contains("November"), "{written}");
+}

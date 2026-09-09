@@ -340,10 +340,16 @@ impl Gmcp {
         )
         .await
         .map_err(|e| self.google_err_for(&connection, e))?;
+        // The spreadsheet exists from here on. A tab that will not be added is
+        // reported rather than raised: an error would drop the new file's id,
+        // and the retry it invites would make a second spreadsheet.
+        let mut missing: Vec<String> = Vec::new();
+        let mut reason: Option<String> = None;
         for tab in &tabs {
-            sheets::add_tab(client, connection.id, &file.id, tab)
-                .await
-                .map_err(|e| self.google_err_for(&connection, e))?;
+            if let Err(e) = sheets::add_tab(client, connection.id, &file.id, tab).await {
+                reason.get_or_insert_with(|| e.to_string());
+                missing.push(tab.clone());
+            }
         }
         Ok(Json(Confirmable::Done(dto::SheetWriteOut {
             account: connection.label,
@@ -355,17 +361,32 @@ impl Gmcp {
             updated_range: None,
             updated_rows: Some(rows.len() as i64),
             updated_cells: None,
-            written: format!(
-                "created with {} rows{}",
-                rows.len(),
-                if tabs.is_empty() {
-                    String::new()
-                } else {
-                    format!(" and {} extra tabs", tabs.len())
-                }
-            ),
+            written: created_line(rows.len(), &tabs, &missing, reason.as_deref()),
         })))
     }
+}
+
+/// What `sheets_create` says it did, including the tabs it could not add. The
+/// spreadsheet is named as made either way, because it was.
+fn created_line(rows: usize, tabs: &[String], missing: &[String], reason: Option<&str>) -> String {
+    let added = tabs.len() - missing.len();
+    let mut line = format!("created with {rows} rows");
+    if added > 0 {
+        line.push_str(&format!(" and {added} extra tabs"));
+    }
+    if !missing.is_empty() {
+        line.push_str(&format!(
+            ". The spreadsheet was made, but the {} could not be added ({}); \
+             add them with sheets_add_tab rather than creating the spreadsheet again",
+            missing
+                .iter()
+                .map(|t| format!("tab {t:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            reason.unwrap_or("no reason given")
+        ));
+    }
+    line
 }
 
 fn spreadsheet_out(account: String, sheet: sheets::Spreadsheet) -> dto::SpreadsheetOut {

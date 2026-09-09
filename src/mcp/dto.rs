@@ -257,6 +257,16 @@ pub struct ModifiedOut {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub messages: Vec<MessageBriefOut>,
+    /// The messages that could not be changed, with what Google said about
+    /// each. The rest were changed all the same, so a retry should name only
+    /// these.
+    pub failed: Vec<FailedMessageOut>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FailedMessageOut {
+    pub message_id: String,
+    pub error: String,
 }
 
 // ----- files, links and text -------------------------------------------------

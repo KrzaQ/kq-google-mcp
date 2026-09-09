@@ -503,7 +503,9 @@ impl Gmcp {
     #[tool(
         description = "Add and remove labels on messages, archive them, mark them read or \
                        unread, star or unstar them. Labels may be named or given by id. TRASH and \
-                       SPAM are refused: this server never bins mail and never marks it spam."
+                       SPAM are refused: this server never bins mail and never marks it spam. \
+                       Messages are changed one by one: any that fail come back in `failed` while \
+                       the others still change, so a retry names only the ones that failed."
     )]
     async fn gmail_modify_labels(
         &self,
@@ -558,22 +560,38 @@ impl Gmcp {
                 side.push(id.to_string());
             }
         }
+        // One request per message, so one message Gmail will not change — an
+        // id that is gone, a message another client moved — must not throw
+        // away the ones that were changed before it. Only a call where nothing
+        // at all worked is an error.
         let mut messages = Vec::with_capacity(ids.len());
+        let mut failed: Vec<dto::FailedMessageOut> = Vec::new();
+        let mut first_failure: Option<ErrorData> = None;
         for id in &ids {
-            let message = gmail::modify_labels(client, connection.id, id, &add, &remove)
-                .await
-                .map_err(|e| self.google_err_for(&connection, e))?;
-            messages.push(dto::MessageBriefOut {
-                message_id: message.id,
-                thread_id: message.thread_id,
-                date: dto::instant(message.date),
-                from: message.from,
-                to: message.to,
-                subject: message.subject,
-                snippet: message.snippet,
-                labels: message.labels,
-                attachments: message.attachments.len(),
-            });
+            match gmail::modify_labels(client, connection.id, id, &add, &remove).await {
+                Ok(message) => messages.push(dto::MessageBriefOut {
+                    message_id: message.id,
+                    thread_id: message.thread_id,
+                    date: dto::instant(message.date),
+                    from: message.from,
+                    to: message.to,
+                    subject: message.subject,
+                    snippet: message.snippet,
+                    labels: message.labels,
+                    attachments: message.attachments.len(),
+                }),
+                Err(e) => {
+                    let error = self.google_err_for(&connection, e);
+                    failed.push(dto::FailedMessageOut {
+                        message_id: id.clone(),
+                        error: error.message.to_string(),
+                    });
+                    first_failure.get_or_insert(error);
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Err(first_failure.expect("a message that neither changed nor failed"));
         }
         Ok(Json(dto::ModifiedOut {
             account: connection.label,
@@ -581,6 +599,7 @@ impl Gmcp {
             added: add,
             removed: remove,
             messages,
+            failed,
         }))
     }
 }
