@@ -25,6 +25,7 @@ use crate::db::{
     NewConnection, NewToken, User,
 };
 use crate::domain::{seal, token as domain_token};
+use crate::google::text::truncation_notice;
 use crate::http::{AppState, router};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1333,4 +1334,69 @@ async fn a_spreadsheet_that_lost_a_tab_still_comes_back_with_its_id() {
     assert!(written.contains("sheets_add_tab"), "{written}");
     // The one that worked is not reported as missing.
     assert!(!written.contains("November"), "{written}");
+}
+
+// ----- what is fetched, and what is counted ----------------------------------
+
+#[tokio::test]
+async fn a_picture_that_is_not_a_picture_is_refused_before_it_is_fetched() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6",
+        fixture("gmail_message_full.json"),
+    )
+    .await;
+    server
+        .register(
+            Mock::given(path_regex(r"/attachments/"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("a PDF is downloaded to be shown as a picture"),
+        )
+        .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    let refused = c
+        .refused(
+            "gmail_view_image",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6",
+                   "attachment_id": "ANGjdJ8pdfQ3"}),
+        )
+        .await;
+    assert!(refused.contains("q3-figures.pdf"), "{refused}");
+    assert!(refused.contains("not a picture"), "{refused}");
+    assert!(refused.contains("gmail_attachment_text"), "{refused}");
+    assert!(refused.contains("gmail_attachment_link"), "{refused}");
+    drop(server);
+}
+
+#[test]
+fn a_tool_s_own_cap_counts_content_and_not_the_first_cap_s_notice() {
+    let content = "x".repeat(1000);
+    // What the extractor hands over when it has already cut 500 characters.
+    let extracted = format!("{content}{}", truncation_notice(500));
+
+    let (text, cut) = crate::mcp::cap_text(extracted.clone(), 500, Some(100));
+    // 900 of the thousand characters left, plus the 500 the extractor cut.
+    assert_eq!(cut, 1400);
+    assert_eq!(
+        text,
+        format!("{}{}", "x".repeat(100), truncation_notice(1400))
+    );
+    // One notice, not two, and the count is a count of characters that were
+    // in the document rather than of the notice the extractor wrote.
+    assert_eq!(text.matches("more characters were cut off here").count(), 1);
+
+    // A cap that does not fire changes neither the text nor the count.
+    let (same, cut) = crate::mcp::cap_text(extracted.clone(), 500, Some(5000));
+    assert_eq!(same, extracted);
+    assert_eq!(cut, 500);
+
+    // And with nothing cut before, the count is the cap's own.
+    let (text, cut) = crate::mcp::cap_text(content, 0, Some(100));
+    assert_eq!(cut, 900);
+    assert!(text.ends_with(&truncation_notice(900)));
 }

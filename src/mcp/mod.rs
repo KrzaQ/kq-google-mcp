@@ -56,7 +56,7 @@ use serde::Deserialize;
 use crate::db::{AuditKind, AuditOutcome, Connection, ConnectionStatus, DbError, NewAuditEntry};
 use crate::domain::limits::TEXT_MAX_CHARS;
 use crate::domain::scope::{self, Service};
-use crate::google::text::Extractor;
+use crate::google::text::{Extractor, truncation_notice};
 use crate::http::auth::{self, Principal};
 use crate::http::error::ApiError;
 use crate::http::{AppState, Google, audit};
@@ -354,21 +354,29 @@ pub fn capped(value: Option<u32>, default: u32, max: u32) -> u32 {
 /// A tool's own `max_chars`, applied on top of the domain cap that
 /// `google::text` has already enforced. The notice is part of the text
 /// because that is the only place a model reliably reads it.
+///
+/// When both caps fire, the text arriving here already ends in the extractor's
+/// own notice. That line is not content: counting its characters as cut would
+/// report a number larger than the document, so it is taken off before the
+/// second cap is measured and written afresh with the total.
 pub fn cap_text(text: String, already_cut: usize, max_chars: Option<u32>) -> (String, usize) {
     let max = max_chars
         .map(|m| m.max(1) as usize)
         .unwrap_or(TEXT_MAX_CHARS)
         .min(TEXT_MAX_CHARS);
-    let total = text.chars().count();
+    let notice = (already_cut > 0).then(|| truncation_notice(already_cut));
+    let body = match &notice {
+        Some(n) => text.strip_suffix(n.as_str()).unwrap_or(&text),
+        None => text.as_str(),
+    };
+    let total = body.chars().count();
     if total <= max {
         return (text, already_cut);
     }
-    let kept: String = text.chars().take(max).collect();
+    let kept: String = body.chars().take(max).collect();
     let cut = total - max + already_cut;
-    (
-        format!("{kept}\n\n[… {cut} more characters were cut off here]"),
-        cut,
-    )
+    let notice = truncation_notice(cut);
+    (format!("{kept}{notice}"), cut)
 }
 
 /// A portal error on the way out of a tool. Only link minting raises one, and

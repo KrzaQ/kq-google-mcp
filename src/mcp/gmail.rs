@@ -666,7 +666,23 @@ struct Picture {
     mime_type: String,
 }
 
+/// The named part, once it is established that it is a picture at all. An
+/// attachment id is an attachment id: nothing stops a model from handing over
+/// the PDF's, and downloading one to feed it to an image decoder would waste
+/// the fetch and answer with a decoding error instead of the two tools that do
+/// read a PDF. This mirrors `drive_view_image`.
 fn find_picture(message: &gmail::Message, wanted: &str) -> Result<Picture, ErrorData> {
+    let picture = locate_picture(message, wanted)?;
+    if !picture.mime_type.starts_with("image/") {
+        return Err(refuse(format!(
+            "{} is a {}, not a picture; use gmail_attachment_text or gmail_attachment_link",
+            picture.filename, picture.mime_type
+        )));
+    }
+    Ok(picture)
+}
+
+fn locate_picture(message: &gmail::Message, wanted: &str) -> Result<Picture, ErrorData> {
     let bare = wanted.trim_start_matches('<').trim_end_matches('>');
     if let Some(a) = message.attachments.iter().find(|a| a.id == wanted) {
         return Ok(Picture {

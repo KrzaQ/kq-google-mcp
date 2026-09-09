@@ -60,11 +60,19 @@ impl Extraction {
         let kept: String = text.chars().take(max_chars).collect();
         let cut = total - max_chars;
         Extraction {
-            text: format!("{kept}\n\n[… {cut} more characters were cut off here]"),
+            text: format!("{kept}{}", truncation_notice(cut)),
             truncated_chars: cut,
             source,
         }
     }
+}
+
+/// The line a truncated text ends with. It is spelled here once because
+/// `mcp::cap_text` applies a second, smaller cap on top of this one and has to
+/// recognise the notice it was handed: the notice is not content, and counting
+/// it would report more characters cut than the document ever had.
+pub fn truncation_notice(cut: usize) -> String {
+    format!("\n\n[… {cut} more characters were cut off here]")
 }
 
 /// Where `pdftotext` was found, looked for once per process.
