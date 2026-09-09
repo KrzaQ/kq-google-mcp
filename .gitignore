@@ -6,3 +6,4 @@
 Makefile.local
 .limes.local.toml
 PLAN.md
+/.claude/
