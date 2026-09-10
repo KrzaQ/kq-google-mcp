@@ -144,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         // Public and unauthenticated: Google's consent screen links to both,
         // and a person deciding whether to connect an account must be able to
         // read them without one.
+        .route("/about", axum::routing::get(legal::about))
         .route("/privacy", axum::routing::get(legal::privacy))
         .route("/terms", axum::routing::get(legal::terms))
         .route(

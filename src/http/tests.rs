@@ -1512,7 +1512,7 @@ async fn the_legal_pages_are_public_and_say_what_the_server_does() {
     let db = Db::open_memory().await.unwrap();
     let app = strict_app(&db);
 
-    for path in ["/privacy", "/terms"] {
+    for path in ["/about", "/privacy", "/terms"] {
         let (status, body, headers) = call_bytes(&app, req("GET", path, None, None)).await;
         assert_eq!(status, StatusCode::OK, "{path} must not need a session");
         let html = String::from_utf8(body).unwrap();
@@ -1538,4 +1538,18 @@ async fn the_legal_pages_are_public_and_say_what_the_server_does() {
         privacy.contains("api-services-user-data-policy"),
         "Google asks that the Limited Use terms be referenced"
     );
+
+    // Google's branding check reads the home page and refuses the app when it
+    // does not name itself, does not say what it is for, or does not link to
+    // the policy.
+    let (_, body, _) = call_bytes(&app, req("GET", "/about", None, None)).await;
+    let about = String::from_utf8(body).unwrap();
+    for needed in [
+        "kq Google MCP",
+        "never sends email",
+        "href=\"/privacy\"",
+        "href=\"/terms\"",
+    ] {
+        assert!(about.contains(needed), "the home page must carry {needed}");
+    }
 }

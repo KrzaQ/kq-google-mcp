@@ -1,12 +1,20 @@
-//! The privacy policy and the terms, served as plain HTML without a login.
+//! The public pages: what this app is, the privacy policy and the terms.
+//! Plain HTML, no login, no JavaScript.
 //!
-//! Google requires both URLs on the OAuth consent screen before an app that
-//! asks for sensitive scopes may be published. They sit here, in the server,
-//! rather than on the blog, so the pages describe what this code actually does
-//! and change with it.
+//! Google checks all three before it will publish an app that asks for
+//! sensitive scopes. It requires a home page that a signed-out visitor can
+//! read, that says what the app does, that carries the same name as the
+//! consent screen, and that links to the privacy policy. The portal itself
+//! cannot be that page: it is a JavaScript bundle behind a login. So `/about`
+//! is the home page, and it lives here rather than on a blog so that it
+//! describes what this code actually does and changes when it does.
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
+
+/// Must match the app name on the Google consent screen exactly. Google
+/// compares the two and refuses the app when they differ.
+const APP_NAME: &str = "kq Google MCP";
 
 /// Where a reader is told to write. The consent screen carries the same
 /// address, so the two never disagree.
@@ -30,12 +38,13 @@ fn page(title: &str, body: &str) -> Response {
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-            "<title>{title} — gmcp</title><style>{style}</style></head><body>",
+            "<title>{title} — {app}</title><style>{style}</style></head><body>",
             "{body}",
-            "<footer>gmcp is a private tool. It is not a product and it is not ",
+            "<footer>{app} is a private tool. It is not a product and it is not ",
             "for sale.</footer></body></html>"
         ),
         title = title,
+        app = APP_NAME,
         style = STYLE,
         body = body
     );
@@ -51,17 +60,17 @@ pub async fn privacy() -> Response {
         concat!(
             "<h1>Privacy policy</h1>",
             "<p class=\"updated\">{updated}</p>",
-            "<p>gmcp is a private tool run by one person for a small number of ",
+            "<p>{app} is a private tool run by one person for a small number of ",
             "invited people. It is not a public service. It has no customers, ",
             "no advertising and no analytics.</p>",
             "<h2>What it reaches</h2>",
-            "<p>You connect a Google account to gmcp yourself. When you do, ",
-            "Google asks you which permissions to grant. gmcp can then read ",
+            "<p>You connect a Google account to {app} yourself. When you do, ",
+            "Google asks you which permissions to grant. {app} can then read ",
             "your Gmail messages, your Google Drive files, your Google Docs ",
             "documents, your Google Sheets spreadsheets and your Google ",
             "Calendar events, but only for the permissions you granted and ",
             "only for the accounts you connected.</p>",
-            "<p>gmcp never sends email. It can write a draft, and you send it ",
+            "<p>{app} never sends email. It can write a draft, and you send it ",
             "yourself from Gmail. It never moves a message to the bin and it ",
             "never deletes one. It never invites anyone to a calendar event ",
             "and it never sends a notification about one.</p>",
@@ -70,7 +79,7 @@ pub async fn privacy() -> Response {
             "<li>Your name and email address, from the sign-in provider.</li>",
             "<li>For each connected Google account: the Google address, the ",
             "label you chose, the permissions Google granted, and the refresh ",
-            "token that lets gmcp act for you. The refresh token is encrypted ",
+            "token that lets {app} act for you. The refresh token is encrypted ",
             "before it is written to disk.</li>",
             "<li>A log of every action taken through the tools: the time, the ",
             "account, the tool and its arguments. Message bodies and document ",
@@ -78,7 +87,7 @@ pub async fn privacy() -> Response {
             "an action is never logged.</li>",
             "</ul>",
             "<p>Your mail, your files and your calendar entries are not copied ",
-            "into gmcp. They are read from Google when a tool asks for them ",
+            "into {app}. They are read from Google when a tool asks for them ",
             "and they are not kept afterwards.</p>",
             "<h2>Who else sees it</h2>",
             "<p>Nobody. Your data is not sold, not shared and not sent to any ",
@@ -86,14 +95,14 @@ pub async fn privacy() -> Response {
             "private server.</p>",
             "<p>When you ask a question through a chat client, that client ",
             "sends your question and the tool results to whichever language ",
-            "model you chose. gmcp does not choose that model for you, and ",
+            "model you chose. {app} does not choose that model for you, and ",
             "this policy does not cover it.</p>",
             "<h2>How long it is kept</h2>",
             "<p>A connection is kept until you remove it. The action log is ",
             "kept until it is pruned, which happens on a schedule set by the ",
             "operator.</p>",
             "<h2>How to end it</h2>",
-            "<p>Remove the connection in the gmcp portal. gmcp then asks ",
+            "<p>Remove the connection in the {app} portal. It then asks ",
             "Google to revoke the grant and deletes the stored token. You can ",
             "also revoke the grant yourself at <a href=\"https://myaccount.",
             "google.com/permissions\">your Google account permissions page</a>, ",
@@ -101,12 +110,13 @@ pub async fn privacy() -> Response {
             "<p>To have your account and its log removed, write to ",
             "{contact}.</p>",
             "<h2>Google user data</h2>",
-            "<p>gmcp's use of information received from Google APIs follows ",
+            "<p>{app}'s use of information received from Google APIs follows ",
             "the <a href=\"https://developers.google.com/terms/",
             "api-services-user-data-policy\">Google API Services User Data ",
             "Policy</a>, including the Limited Use requirements.</p>"
         ),
         updated = UPDATED,
+        app = APP_NAME,
         contact = CONTACT
     );
     page("Privacy", &body)
@@ -117,7 +127,7 @@ pub async fn terms() -> Response {
         concat!(
             "<h1>Terms of service</h1>",
             "<p class=\"updated\">{updated}</p>",
-            "<p>gmcp is a private tool run by one person. Access is by ",
+            "<p>{app} is a private tool run by one person. Access is by ",
             "invitation. There is no charge, and there is no contract.</p>",
             "<h2>What you agree to</h2>",
             "<ul>",
@@ -125,20 +135,20 @@ pub async fn terms() -> Response {
             "connect.</li>",
             "<li>You keep the access tokens you create private. A token acts ",
             "for you.</li>",
-            "<li>You do not use gmcp to break the law or Google's own ",
+            "<li>You do not use {app} to break the law or Google's own ",
             "terms.</li>",
             "</ul>",
             "<h2>What is not promised</h2>",
-            "<p>gmcp is provided as it is, with no warranty of any kind. It ",
+            "<p>{app} is provided as it is, with no warranty of any kind. It ",
             "may be unavailable, it may lose data, and it may stop working ",
             "when Google changes an interface. A language model decides which ",
             "tools to call, and a model can be wrong. Read what it wrote ",
             "before you act on it, and read every draft before you send ",
             "it.</p>",
             "<p>The operator is not liable for any loss that follows from ",
-            "using gmcp, as far as the law allows.</p>",
+            "using {app}, as far as the law allows.</p>",
             "<h2>Ending access</h2>",
-            "<p>You may remove your connections and stop using gmcp at any ",
+            "<p>You may remove your connections and stop using {app} at any ",
             "time. The operator may withdraw access at any time, for any ",
             "reason, without notice.</p>",
             "<h2>Changes</h2>",
@@ -147,7 +157,61 @@ pub async fn terms() -> Response {
             "<p>Questions go to {contact}.</p>"
         ),
         updated = UPDATED,
+        app = APP_NAME,
         contact = CONTACT
     );
     page("Terms", &body)
+}
+
+/// The home page Google's branding check reads: reachable without a session,
+/// named exactly as the consent screen names it, and linking to both of the
+/// documents below.
+pub async fn about() -> Response {
+    let body = format!(
+        concat!(
+            "<h1>{app}</h1>",
+            "<p class=\"updated\">A private tool for connecting Google ",
+            "accounts to chat assistants.</p>",
+            "<h2>What it does</h2>",
+            "<p>{app} lets a small number of invited people give a chat ",
+            "assistant careful access to their own Google accounts. Once you ",
+            "connect an account, an assistant can search your Gmail, read a ",
+            "thread, look at an attachment, open a Google Docs document or a ",
+            "Google Sheets spreadsheet, and read or add Google Calendar ",
+            "events. You decide which of those it may do, one permission at a ",
+            "time, and you can connect several Google accounts and keep them ",
+            "apart.</p>",
+            "<h2>What it will not do</h2>",
+            "<p>{app} never sends email. It writes drafts, and you send them ",
+            "yourself from Gmail. It never moves a message to the bin and ",
+            "never deletes one. It never invites anyone to a calendar event ",
+            "and never sends a notification about one. Google has no ",
+            "permission that means \"drafts but never send\", so this app is ",
+            "the thing that draws that line.</p>",
+            "<h2>Who it is for</h2>",
+            "<p>This is not a public service and there is nothing to sign up ",
+            "for. It runs on one private server for its operator and a few ",
+            "invited people. Access is by invitation, and there is no ",
+            "charge.</p>",
+            "<h2>Your data</h2>",
+            "<p>Your mail, files and calendar entries are never copied into ",
+            "{app}. They are read from Google when you ask for them and are ",
+            "not kept afterwards. Nothing is shared with anyone and nothing ",
+            "trains a model. The <a href=\"/privacy\">privacy policy</a> says ",
+            "exactly what is stored and for how long, and the ",
+            "<a href=\"/terms\">terms of service</a> say what is and is not ",
+            "promised.</p>",
+            "<p>You can withdraw access at any time, either in this portal or ",
+            "at <a href=\"https://myaccount.google.com/permissions\">your ",
+            "Google account permissions page</a>.</p>",
+            "<h2>Already invited?</h2>",
+            "<p><a href=\"/\">Sign in to the portal</a>. You will need an ",
+            "account on the operator's identity provider; there is no ",
+            "registration here.</p>",
+            "<p>Questions go to {contact}.</p>"
+        ),
+        app = APP_NAME,
+        contact = CONTACT
+    );
+    page("About", &body)
 }
