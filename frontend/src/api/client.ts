@@ -14,6 +14,7 @@ import type {
   ConnectionPatchInput,
   ConsentUrl,
   Me,
+  MePatch,
   ReconnectInput,
   ScopeRegistry,
   TokenCreated,
@@ -96,6 +97,7 @@ export type AuditQuery = {
 
 export const api = {
   me: () => request<Me>('GET', '/api/me'),
+  updateMe: (patch: MePatch) => request<Me>('PATCH', '/api/me', patch),
   logout: () => request<void>('POST', '/api/auth/logout'),
 
   connections: {

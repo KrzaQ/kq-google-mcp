@@ -4,6 +4,7 @@
 import { computed } from 'vue'
 import type { AuditDto } from '@/api/types'
 import { auditRow, outcomeClass, type Named } from '@/lib/audit'
+import { useSession } from '@/stores/session'
 
 const props = withDefaults(
   defineProps<{
@@ -17,9 +18,11 @@ const props = withDefaults(
   { connections: () => [], tokens: () => [], wide: false, empty: 'Nothing logged yet.' },
 )
 
+const session = useSession()
+
 const rows = computed(() =>
   props.entries.map((e) => ({
-    ...auditRow(e, props.connections, props.tokens),
+    ...auditRow(e, props.connections, props.tokens, session.zone),
     duration: e.duration_ms == null ? '' : `${e.duration_ms} ms`,
   })),
 )
@@ -30,7 +33,7 @@ const rows = computed(() =>
     <table class="w-full text-sm" data-testid="audit-table">
       <thead class="table-head">
         <tr>
-          <th class="px-3 py-2 font-medium">Time</th>
+          <th class="px-3 py-2 font-medium whitespace-nowrap">Time ({{ session.zone }})</th>
           <th class="px-3 py-2 font-medium">Kind</th>
           <th class="px-3 py-2 font-medium">Tool</th>
           <th class="px-3 py-2 font-medium">Connection</th>

@@ -13,6 +13,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
 use chrono::Utc;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -25,6 +26,7 @@ use crate::db::{ApiToken, ClientProfile, Db, DbResult, Reach, User};
 use crate::domain::limits::SESSION_DAYS;
 use crate::domain::scope::{self, Scope};
 use crate::domain::token;
+use crate::domain::zone;
 
 pub const SESSION_COOKIE: &str = "gmcp_session";
 const LOGIN_COOKIE: &str = "gmcp_login";
@@ -169,8 +171,8 @@ async fn session_user(state: &AppState, jar: &PrivateCookieJar) -> Option<User> 
 
 /// The one user `GMCP_AUTH=dev` knows. It is upserted on every login, so its
 /// `last_login_at` behaves like anyone else's.
-pub async fn dev_user(db: &Db) -> DbResult<User> {
-    db.upsert_user(DEV_SUBJECT, Some("dev@localhost"), Some("Dev"))
+pub async fn dev_user(db: &Db, house: Tz) -> DbResult<User> {
+    db.upsert_user(DEV_SUBJECT, Some("dev@localhost"), Some("Dev"), house)
         .await
 }
 
@@ -183,7 +185,7 @@ pub async fn browser_user(state: &AppState, jar: &PrivateCookieJar) -> Option<Us
         return Some(u);
     }
     match state.config.auth {
-        AuthMode::Dev => dev_user(&state.db).await.ok(),
+        AuthMode::Dev => dev_user(&state.db, state.config.timezone).await.ok(),
         AuthMode::Oidc(_) => None,
     }
 }
@@ -251,7 +253,7 @@ impl FromRequestParts<AppState> for Principal {
             return Ok(Principal::Session(u));
         }
         if let AuthMode::Dev = state.config.auth {
-            let u = dev_user(&state.db).await?;
+            let u = dev_user(&state.db, state.config.timezone).await?;
             return Ok(Principal::Session(u));
         }
         Err(ApiError::unauthorized())
@@ -275,20 +277,52 @@ pub struct Me {
     pub google_configured: bool,
 }
 
+/// What a person may change about themselves. One field so far, and the
+/// portal sends only what it is changing.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MePatch {
+    /// An IANA zone name, e.g. "Europe/Warsaw"
+    pub timezone: String,
+}
+
 #[utoipa::path(get, path = "/api/me", tag = "auth",
     responses((status = 200, body = Me), (status = 401, body = super::error::ErrorBody)))]
 pub async fn me(State(state): State<AppState>, p: Principal) -> ApiResult<axum::Json<Me>> {
-    let user = p.require_session()?;
+    let user = p.require_session()?.clone();
+    Ok(axum::Json(me_of(&state, &p, user).await?))
+}
+
+/// The person's own clock, for the portal and for every tool. The name is
+/// checked here rather than at the column: a zone the tz database does not
+/// know would render every time in the wrong place, and the message names a
+/// few that work so nobody has to guess the spelling.
+#[utoipa::path(patch, path = "/api/me", tag = "auth", request_body = MePatch,
+    responses(
+        (status = 200, body = Me),
+        (status = 400, body = super::error::ErrorBody),
+        (status = 401, body = super::error::ErrorBody)))]
+pub async fn patch_me(
+    State(state): State<AppState>,
+    p: Principal,
+    axum::Json(patch): axum::Json<MePatch>,
+) -> ApiResult<axum::Json<Me>> {
+    let user = p.require_session()?.clone();
+    let zone = zone::parse(&patch.timezone).map_err(ApiError::bad_request)?;
+    let user = state.db.set_user_timezone(user.id, zone).await?;
+    Ok(axum::Json(me_of(&state, &p, user).await?))
+}
+
+async fn me_of(state: &AppState, p: &Principal, user: User) -> ApiResult<Me> {
     let connections = state.db.visible_connections(p.reach()).await?.len();
     let tokens = state.db.list_user_tokens(user.id).await?.len();
-    Ok(axum::Json(Me {
+    Ok(Me {
         kind: p.kind().into(),
-        user: UserDto::from(user.clone()),
+        user: UserDto::from(user),
         connections,
         tokens,
         scopes: p.scopes().iter().map(ToString::to_string).collect(),
         google_configured: state.google.is_some(),
-    }))
+    })
 }
 
 #[derive(Deserialize)]
@@ -319,7 +353,7 @@ pub async fn login(
     let next = safe_next(q.next);
     match &state.oidc {
         None => {
-            let user = match dev_user(&state.db).await {
+            let user = match dev_user(&state.db, state.config.timezone).await {
                 Ok(u) => u,
                 Err(e) => return ApiError::from(e).into_response(),
             };
@@ -451,6 +485,7 @@ pub async fn callback(
             &identity.subject,
             identity.email.as_deref(),
             identity.name.as_deref(),
+            state.config.timezone,
         )
         .await
     {

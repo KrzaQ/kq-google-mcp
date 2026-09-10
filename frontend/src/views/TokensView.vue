@@ -19,7 +19,9 @@ import {
 } from '@/lib/scopes'
 import { publicOrigin, snippetsFor } from '@/lib/snippets'
 import { formatAgo, formatMinute } from '@/lib/time'
+import { useSession } from '@/stores/session'
 
+const session = useSession()
 const registry = ref<ScopeRegistry | null>(null)
 const tokens = ref<TokenDto[]>([])
 const connections = ref<ConnectionDto[]>([])
@@ -165,9 +167,11 @@ onMounted(load)
             <td class="px-3 py-2 font-mono text-xs">{{ t.scopes.join(' ') }}</td>
             <td class="px-3 py-2">{{ reach(t) }}</td>
             <td class="px-3 py-2 font-mono text-xs whitespace-nowrap">
-              {{ formatMinute(t.created_at) }}
+              {{ formatMinute(t.created_at, session.zone) }}
             </td>
-            <td class="px-3 py-2 text-xs whitespace-nowrap">{{ formatAgo(t.last_used_at) }}</td>
+            <td class="px-3 py-2 text-xs whitespace-nowrap">
+              {{ formatAgo(t.last_used_at, new Date(), session.zone) }}
+            </td>
             <td class="px-3 py-2 text-right">
               <button
                 v-if="!t.revoked_at"

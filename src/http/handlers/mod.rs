@@ -71,7 +71,7 @@ pub async fn health(
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(health))
-        .routes(routes!(auth::me))
+        .routes(routes!(auth::me, auth::patch_me))
         .routes(routes!(auth::login))
         .routes(routes!(auth::callback))
         .routes(routes!(auth::logout))

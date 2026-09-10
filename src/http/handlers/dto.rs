@@ -14,6 +14,9 @@ pub struct UserDto {
     pub id: i64,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// The IANA zone this person's times are shown in, in the portal and in
+    /// every MCP tool.
+    pub timezone: String,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
 }
@@ -24,6 +27,7 @@ impl From<User> for UserDto {
             id: u.id,
             email: u.email,
             name: u.name,
+            timezone: u.timezone,
             created_at: u.created_at,
             last_login_at: u.last_login_at,
         }

@@ -3,6 +3,7 @@ import type { components } from './schema'
 type S = components['schemas']
 
 export type Me = S['Me']
+export type MePatch = S['MePatch']
 export type UserDto = S['UserDto']
 export type Health = S['Health']
 export type ConnectionDto = S['ConnectionDto']

@@ -32,6 +32,18 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
   calls.push(`${method} ${url}`)
   if (typeof init?.body === 'string') bodies.set(`${method} ${path}`, JSON.parse(init.body))
 
+  if (path === '/api/me' && method === 'PATCH') {
+    const patch = init?.body as string
+    const timezone = JSON.parse(patch).timezone as string
+    if (!timezone.includes('/') && timezone !== 'UTC')
+      return Promise.resolve(
+        json(
+          { error: { code: 'bad_request', message: `${timezone} is not an IANA time zone` } },
+          400,
+        ),
+      )
+    return Promise.resolve(json({ ...fixtures.me, user: { ...fixtures.user, timezone } }))
+  }
   if (path === '/api/me') return Promise.resolve(json(fixtures.me))
   if (path === '/api/connections' && method === 'GET')
     return Promise.resolve(json(fixtures.connections))
@@ -113,6 +125,29 @@ describe('views', () => {
   it.each(views)('%s mounts', async (testid, component, path) => {
     const w = await render(component, path)
     expect(w.find(`[data-testid="${testid}"]`).exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('HomeView saves the time zone and shows every time on that clock', async () => {
+    const w = await render(HomeView)
+    // The log is stamped on the person's own clock, and the column says which.
+    expect(w.find('[data-testid="audit-table"]').text()).toContain('Time (Europe/Warsaw)')
+    expect(w.find('[data-testid="timezone-current"]').text()).toContain('Europe/Warsaw')
+
+    const input = w.find('[data-testid="timezone-input"]')
+    await input.setValue('America/New_York')
+    await w.find('[data-testid="timezone-save"]').trigger('submit')
+    await flushPromises()
+    expect(bodies.get('PATCH /api/me')).toEqual({ timezone: 'America/New_York' })
+    expect(w.find('[data-testid="timezone-current"]').text()).toContain('America/New_York')
+
+    // A name the server refuses is shown as it came back, and nothing else
+    // moves.
+    await input.setValue('Mars')
+    await w.find('[data-testid="timezone-save"]').trigger('submit')
+    await flushPromises()
+    expect(w.find('[data-testid="timezone-error"]').text()).toContain('not an IANA time zone')
+    expect(w.find('[data-testid="timezone-current"]').text()).toContain('America/New_York')
     expect(errors).toEqual([])
   })
 

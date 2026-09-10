@@ -8,6 +8,7 @@ export const user: UserDto = {
   id: 1,
   email: 'alice@example.com',
   name: 'Alice',
+  timezone: 'Europe/Warsaw',
   created_at: '2026-01-04T09:00:00Z',
   last_login_at: '2026-09-09T07:00:00Z',
 }

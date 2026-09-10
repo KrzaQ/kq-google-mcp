@@ -188,7 +188,13 @@ export interface paths {
     delete?: never
     options?: never
     head?: never
-    patch?: never
+    /**
+     * The person's own clock, for the portal and for every tool. The name is
+     *     checked here rather than at the column: a zone the tz database does not
+     *     know would render every time in the wrong place, and the message names a
+     *     few that work so nobody has to guess the spelling.
+     */
+    patch: operations['patch_me']
     trace?: never
   }
   '/api/scopes': {
@@ -375,6 +381,14 @@ export interface components {
       user: components['schemas']['UserDto']
     }
     /**
+     * @description What a person may change about themselves. One field so far, and the
+     *     portal sends only what it is changing.
+     */
+    MePatch: {
+      /** @description An IANA zone name, e.g. "Europe/Warsaw" */
+      timezone: string
+    }
+    /**
      * @description `POST /api/connections/{id}/reconnect`: the same account, optionally with a
      *     different set of services.
      */
@@ -454,6 +468,11 @@ export interface components {
       /** Format: date-time */
       last_login_at?: string | null
       name?: string | null
+      /**
+       * @description The IANA zone this person's times are shown in, in the portal and in
+       *     every MCP tool.
+       */
+      timezone: string
     }
   }
   responses: never
@@ -823,6 +842,45 @@ export interface operations {
         }
         content: {
           'application/json': components['schemas']['Me']
+        }
+      }
+      401: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ErrorBody']
+        }
+      }
+    }
+  }
+  patch_me: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        'application/json': components['schemas']['MePatch']
+      }
+    }
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['Me']
+        }
+      }
+      400: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ErrorBody']
         }
       }
       401: {

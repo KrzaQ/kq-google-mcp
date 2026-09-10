@@ -11,6 +11,25 @@ export function systemZone(): string {
   }
 }
 
+/**
+ * What the zone input offers before the person types. A list of every IANA
+ * name would be six hundred rows nobody reads; these are the ones this
+ * deployment's people actually live in, and any other name can still be typed
+ * by hand.
+ */
+export const COMMON_ZONES = [
+  'Europe/Warsaw',
+  'Europe/London',
+  'Europe/Berlin',
+  'Europe/Lisbon',
+  'America/New_York',
+  'America/Chicago',
+  'America/Los_Angeles',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+  'UTC',
+]
+
 const formatters = new Map<string, Intl.DateTimeFormat>()
 function formatter(zone: string): Intl.DateTimeFormat {
   let f = formatters.get(zone)

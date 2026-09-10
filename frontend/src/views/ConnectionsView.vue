@@ -216,7 +216,9 @@ onMounted(async () => {
             />
             <span class="text-muted">Gateway may reach it</span>
           </label>
-          <span class="text-xs text-muted">Last use {{ formatAgo(c.last_used_at) }}</span>
+          <span class="text-xs text-muted">
+            Last use {{ formatAgo(c.last_used_at, new Date(), session.zone) }}
+          </span>
           <span class="flex-1"></span>
           <button class="link text-xs" data-testid="reconnect" @click="reconnect(c)">
             Reconnect

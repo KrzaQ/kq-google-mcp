@@ -8,9 +8,11 @@ import type { AuditDto, ConnectionDto, TokenDto } from '@/api/types'
 import AuditTable from '@/components/AuditTable.vue'
 import { AUDIT_KINDS, kindLabel } from '@/lib/audit'
 import { dayBoundary } from '@/lib/time'
+import { useSession } from '@/stores/session'
 
 const PAGE = 100
 
+const session = useSession()
 const entries = ref<AuditDto[]>([])
 const next = ref<string | null>(null)
 const connections = ref<ConnectionDto[]>([])
@@ -37,8 +39,8 @@ const query = computed<AuditQuery>(() => ({
   token: filters.token ? Number(filters.token) : undefined,
   kind: filters.kind || undefined,
   tool: filters.tool.trim() || undefined,
-  from: filters.from ? dayBoundary(filters.from, false) : undefined,
-  to: filters.to ? dayBoundary(filters.to, true) : undefined,
+  from: filters.from ? dayBoundary(filters.from, false, session.zone) : undefined,
+  to: filters.to ? dayBoundary(filters.to, true, session.zone) : undefined,
   limit: PAGE,
 }))
 

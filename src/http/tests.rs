@@ -26,6 +26,8 @@ use crate::domain::{link as domain_link, seal, token as domain_token};
 use crate::http::auth::{DEV_SUBJECT, Principal};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef";
+/// What `GMCP_TIMEZONE` says in these tests, and so the zone a new user gets.
+const HOUSE: chrono_tz::Tz = chrono_tz::Europe::Warsaw;
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/google/");
 
 fn fixture(name: &str) -> Value {
@@ -66,6 +68,7 @@ fn config(auth: AuthMode, public_url: &str, google: GoogleConfig) -> Config {
         auth,
         google,
         auto_migrate: false,
+        timezone: HOUSE,
     }
 }
 
@@ -183,7 +186,7 @@ fn cookie_header(headers: &HeaderMap) -> String {
 }
 
 async fn user(db: &Db, subject: &str, email: &str) -> User {
-    db.upsert_user(subject, Some(email), Some(subject))
+    db.upsert_user(subject, Some(email), Some(subject), HOUSE)
         .await
         .unwrap()
 }
@@ -299,6 +302,7 @@ async fn dev_mode_is_one_session_that_manages_its_own_tokens() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["kind"], "session");
     assert_eq!(b["user"]["email"], "dev@localhost");
+    assert_eq!(b["user"]["timezone"], "Europe/Warsaw");
     assert_eq!(b["connections"], 0);
     assert_eq!(b["google_configured"], false);
     // A session is the person, so it carries every service scope and not
@@ -1030,7 +1034,7 @@ async fn a_link_hit_shows_up_on_the_owners_activity_page() {
         .mount(&server)
         .await;
     // Dev mode is the person behind the browser, so the log has to name them.
-    let me = auth::dev_user(&db).await.unwrap();
+    let me = auth::dev_user(&db, HOUSE).await.unwrap();
     let c = connection(&db, &me, "work", "dev@example.test").await;
     let (t, _) = token_for(&db, "claude", &["drive:read"], Some(&me), me.id).await;
     let state = state_of(
@@ -1552,4 +1556,47 @@ async fn the_legal_pages_are_public_and_say_what_the_server_does() {
     ] {
         assert!(about.contains(needed), "the home page must carry {needed}");
     }
+}
+
+#[tokio::test]
+async fn a_person_moves_their_own_clock_and_a_name_that_is_no_zone_is_refused() {
+    let db = Db::open_memory().await.unwrap();
+    let app = dev_app(&db);
+
+    let (s, b, _) = call(
+        &app,
+        req(
+            "PATCH",
+            "/api/me",
+            None,
+            Some(json!({"timezone": "America/New_York"})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["user"]["timezone"], "America/New_York");
+
+    // And it stays there.
+    let (_, b, _) = call(&app, req("GET", "/api/me", None, None)).await;
+    assert_eq!(b["user"]["timezone"], "America/New_York");
+
+    // A name the tz database does not know is refused, with names that work.
+    let (s, b, _) = call(
+        &app,
+        req(
+            "PATCH",
+            "/api/me",
+            None,
+            Some(json!({"timezone": "Europe/Warszawa"})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let message = b["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Europe/Warszawa"), "{message}");
+    assert!(message.contains("Europe/Warsaw"), "{message}");
+
+    // The refused name changed nothing.
+    let (_, b, _) = call(&app, req("GET", "/api/me", None, None)).await;
+    assert_eq!(b["user"]["timezone"], "America/New_York");
 }
