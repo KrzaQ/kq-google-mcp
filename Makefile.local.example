@@ -11,8 +11,10 @@
 # copied on every deploy so the two never drift.
 RUN_DIR ?= /storage/encrypted/gmcp
 
+# One remote today. A second one is added to this line, not to the committed
+# Makefile, so a fresh clone never tries to push somewhere it cannot reach.
 push: ## Push to every configured remote
-	git push origin main && git push gh main
+	git push origin main
 
 deploy: image ## Build the image here, then restart the stack in $(RUN_DIR)
 	install -m 644 docker-compose.yml $(RUN_DIR)/docker-compose.yml
