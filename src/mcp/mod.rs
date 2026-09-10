@@ -78,6 +78,9 @@ fn instructions(portal: &str) -> String {
          confirmed=false: nothing is written and you get back exactly what would change. Show that \
          to the person, and pass confirmed=true only after they agree. Gmail drafts need no \
          confirmation, because the draft is itself the thing being confirmed.\n\
+         A Gmail draft is written as the account's default address unless you pass `from`, which \
+         must be one of the account's verified send-as addresses; gmail_list_send_as reports \
+         them, and a reply comes from the address the original was delivered to.\n\
          Calendar events here never notify anyone and never carry attendees; an event that \
          already has attendees can be read but not changed or deleted through these tools.\n\
          Times are the person's own, not UTC: every instant comes back on their clock with the \

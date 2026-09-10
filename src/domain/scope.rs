@@ -325,6 +325,7 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("gmail_get_thread", needs(Service::Gmail, Level::Read)),
     ("gmail_get_message", needs(Service::Gmail, Level::Read)),
     ("gmail_list_labels", needs(Service::Gmail, Level::Read)),
+    ("gmail_list_send_as", needs(Service::Gmail, Level::Read)),
     ("gmail_attachment_link", needs(Service::Gmail, Level::Read)),
     ("gmail_attachment_text", needs(Service::Gmail, Level::Read)),
     ("gmail_view_image", needs(Service::Gmail, Level::Read)),
@@ -539,6 +540,7 @@ mod tests {
                 "gmail_get_thread",
                 "gmail_get_message",
                 "gmail_list_labels",
+                "gmail_list_send_as",
                 "gmail_attachment_link",
                 "gmail_attachment_text",
                 "gmail_view_image",
@@ -553,10 +555,10 @@ mod tests {
         assert!(none.contains(&"calendar_get_event"));
         assert!(!none.contains(&"calendar_create_event"));
 
-        assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 8);
+        assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 36);
+        assert_eq!(TOOLS.len(), 37);
     }
 
     #[test]
@@ -570,8 +572,11 @@ mod tests {
         assert!(is_tool("list_accounts"));
         assert!(!is_tool("gmail_send"));
         // Nothing that sends, trashes or deletes a message is in the table.
+        // `send_as` is Google's own word for the addresses a draft may be
+        // written as, and reading them sends nothing; every other `send` in a
+        // tool name would be a tool this server must never have.
         for (name, _) in TOOLS {
-            assert!(!name.contains("send"), "{name}");
+            assert!(!name.replace("send_as", "").contains("send"), "{name}");
             assert!(!name.contains("trash"), "{name}");
         }
         assert!(TOOLS.iter().filter(|(_, s)| s.is_none()).count() == 1);

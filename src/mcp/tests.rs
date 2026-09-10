@@ -457,6 +457,7 @@ async fn a_gmail_read_token_lists_the_gmail_read_tools_and_nothing_else() {
             "gmail_get_message",
             "gmail_get_thread",
             "gmail_list_labels",
+            "gmail_list_send_as",
             "gmail_search",
             "gmail_view_image",
             "list_accounts",
@@ -803,6 +804,7 @@ async fn writing_a_draft_never_touches_a_send_endpoint() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_draft.json")))
         .mount(&server)
         .await;
+    mount_send_as(&server).await;
     let (_, _, secret) =
         one_of_everything(&db, &["gmail:read", "gmail:draft"], ClientProfile::Generic).await;
     let mut c = Client::new(app(&db, Some(&server)).await, secret);
@@ -828,6 +830,247 @@ async fn writing_a_draft_never_touches_a_send_endpoint() {
         .await;
     assert_eq!(reply["thread_id"], "18f0a1b2c3d4e5f0");
     // The mocks with expect(0) are verified when the server is dropped.
+    drop(server);
+}
+
+// ----- which address a draft is written as ------------------------------------
+
+/// The account's send-as addresses: its own, one verified alias with a display
+/// name, and one Google has not verified.
+async fn mount_send_as(server: &MockServer) {
+    mount(
+        server,
+        "GET",
+        "/gmail/v1/users/me/settings/sendAs",
+        fixture("gmail_send_as.json"),
+    )
+    .await;
+}
+
+/// The RFC 2822 message inside the last draft written to the mock server.
+async fn draft_mime(server: &MockServer) -> String {
+    use base64::Engine;
+    let request = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/drafts"))
+        .expect("a draft was written");
+    let body: Value = serde_json::from_slice(&request.body).expect("the draft request is JSON");
+    let raw = body["message"]["raw"].as_str().expect("a raw message");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim_end_matches('='))
+        .expect("the raw message is base64url");
+    String::from_utf8(bytes).expect("the message is UTF-8")
+}
+
+#[tokio::test]
+async fn gmail_list_send_as_says_which_addresses_may_be_written_as() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    // A read token sees the tool, because choosing a From is reading a setting.
+    assert!(c.names().await.contains(&"gmail_list_send_as".to_string()));
+
+    let out = c.ok("gmail_list_send_as", json!({"account": "work"})).await;
+    assert_eq!(out["count"], 3);
+    let addresses = out["addresses"].as_array().unwrap();
+    assert_eq!(addresses[0]["address"], "anna@example.test");
+    assert_eq!(addresses[0]["is_default"], true);
+    assert_eq!(addresses[0]["is_primary"], true);
+    assert_eq!(addresses[0]["usable_as_from"], true);
+    assert_eq!(addresses[1]["address"], "sales@example.test");
+    assert_eq!(
+        addresses[1]["from"],
+        "\"Anna at Sales\" <sales@example.test>"
+    );
+    assert_eq!(addresses[1]["usable_as_from"], true);
+    assert_eq!(addresses[1]["verification_status"], "accepted");
+    // Listed, but Gmail would rewrite it, so it may not be written as.
+    assert_eq!(addresses[2]["address"], "old@example.test");
+    assert_eq!(addresses[2]["usable_as_from"], false);
+    assert_eq!(addresses[2]["verification_status"], "pending");
+    assert!(
+        out["note"].as_str().unwrap().contains("anna@example.test"),
+        "{out}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_draft_is_written_as_the_address_that_was_chosen_for_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    // A bare address gains the alias's own display name, so the draft reads
+    // like one written by hand.
+    let out = c
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Order 4471",
+                   "body": "confirmed", "from": "sales@example.test"}),
+        )
+        .await;
+    assert_eq!(out["from"], "\"Anna at Sales\" <sales@example.test>");
+    assert!(
+        out["from_reason"].as_str().unwrap().contains("`from`"),
+        "{out}"
+    );
+    let mime = draft_mime(&server).await;
+    assert!(
+        mime.contains("From: \"Anna at Sales\" <sales@example.test>"),
+        "{mime}"
+    );
+
+    // Nothing chosen is the account's default address, which is what Gmail
+    // itself composes with.
+    let out = c
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Order 4471",
+                   "body": "confirmed"}),
+        )
+        .await;
+    assert_eq!(out["from"], "\"Anna Kowalska\" <anna@example.test>");
+    assert!(
+        draft_mime(&server)
+            .await
+            .contains("From: \"Anna Kowalska\" <anna@example.test>")
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn an_address_gmail_would_rewrite_is_refused_rather_than_written() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    // Nothing may be written at all in this test: both calls are refused
+    // before Gmail is asked to make a draft.
+    server
+        .register(
+            Mock::given(http_method("POST"))
+                .and(path("/gmail/v1/users/me/drafts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_draft.json")))
+                .expect(0)
+                .named("a From Gmail would rewrite is never drafted"),
+        )
+        .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let unknown = c
+        .refused(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "hello",
+                   "body": "hello", "from": "someone@elsewhere.test"}),
+        )
+        .await;
+    assert!(unknown.contains("someone@elsewhere.test"), "{unknown}");
+    // The refusal names the addresses that would have worked, and not the one
+    // Google has not verified.
+    assert!(unknown.contains("anna@example.test"), "{unknown}");
+    assert!(unknown.contains("sales@example.test"), "{unknown}");
+    assert!(!unknown.contains("old@example.test"), "{unknown}");
+
+    let unverified = c
+        .refused(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "hello",
+                   "body": "hello", "from": "old@example.test"}),
+        )
+        .await;
+    assert!(unverified.contains("old@example.test"), "{unverified}");
+    assert!(unverified.contains("not verified"), "{unverified}");
+    assert!(unverified.contains("pending"), "{unverified}");
+    assert!(unverified.contains("sales@example.test"), "{unverified}");
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_reply_comes_from_the_address_the_message_was_delivered_to() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f7",
+        fixture("gmail_message_to_alias.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6",
+        fixture("gmail_message_full.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    // Mail that arrived at the alias is answered from the alias, which is what
+    // Gmail's own web UI does.
+    let out = c
+        .ok(
+            "gmail_reply_draft",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f7",
+                   "body": "Confirmed, thank you."}),
+        )
+        .await;
+    assert_eq!(out["from"], "\"Anna at Sales\" <sales@example.test>");
+    assert!(
+        out["from_reason"].as_str().unwrap().contains("delivered"),
+        "{out}"
+    );
+    let mime = draft_mime(&server).await;
+    assert!(
+        mime.contains("From: \"Anna at Sales\" <sales@example.test>"),
+        "{mime}"
+    );
+    // The alias is the sender, so it is not also a recipient of its own reply.
+    assert!(!mime.contains("To: \"Anna at Sales\""), "{mime}");
+
+    // Mail that arrived at the account's own address is answered from it.
+    let out = c
+        .ok(
+            "gmail_reply_draft",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6", "body": "thanks"}),
+        )
+        .await;
+    assert_eq!(out["from"], "\"Anna Kowalska\" <anna@example.test>");
+    assert!(
+        draft_mime(&server)
+            .await
+            .contains("From: \"Anna Kowalska\" <anna@example.test>")
+    );
+
+    // And a named address still wins over the guess.
+    let out = c
+        .ok(
+            "gmail_reply_draft",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6", "body": "thanks",
+                   "from": "Sales desk <sales@example.test>"}),
+        )
+        .await;
+    assert_eq!(out["from"], "Sales desk <sales@example.test>");
     drop(server);
 }
 
@@ -1678,6 +1921,7 @@ async fn gmail_update_draft_replaces_the_message_and_still_sends_nothing() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_send_as(&server).await;
     let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
 
     let out = c

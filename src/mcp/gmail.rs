@@ -16,6 +16,7 @@ use serde::Deserialize;
 use super::dto;
 use super::images::{self, Kind, Source};
 use super::{Call, Gmcp, api_err, bad, cap_text, capped, refuse};
+use crate::db::Connection;
 use crate::domain::scope::Service;
 use crate::google::{gmail, text};
 use crate::http::links::{self, NewDownload, Target};
@@ -88,6 +89,11 @@ pub struct CreateDraftParam {
     pub bcc: Option<Vec<String>>,
     /// An HTML alternative of the same message; the plain text stays required
     pub html: Option<String>,
+    /// Which address to write as: a verified send-as address of this account,
+    /// as "sales@example.test" or "Sales <sales@example.test>".
+    /// gmail_list_send_as reports the ones that work. Defaults to the
+    /// account's default address
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -99,6 +105,11 @@ pub struct ReplyDraftParam {
     /// Copy everyone the original went to, not only its sender
     pub reply_all: Option<bool>,
     pub html: Option<String>,
+    /// Which address to write as: a verified send-as address of this account,
+    /// as "sales@example.test" or "Sales <sales@example.test>".
+    /// gmail_list_send_as reports the ones that work. Left out, the reply
+    /// comes from the address the original was delivered to
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -111,6 +122,11 @@ pub struct UpdateDraftParam {
     pub cc: Option<Vec<String>>,
     pub bcc: Option<Vec<String>>,
     pub html: Option<String>,
+    /// Which address to write as: a verified send-as address of this account,
+    /// as "sales@example.test" or "Sales <sales@example.test>".
+    /// gmail_list_send_as reports the ones that work. Defaults to the
+    /// account's default address
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -254,6 +270,37 @@ impl Gmcp {
     }
 
     #[tool(
+        description = "The addresses this account may write mail as: its own Google address and \
+                       every alias on it, with the display name each one writes under, which is \
+                       the default and which may be used. Only an address marked usable_as_from \
+                       can be passed as `from` to the draft tools — Gmail rewrites a From it has \
+                       not verified, so one that is not verified is refused rather than sent \
+                       under the wrong name."
+    )]
+    async fn gmail_list_send_as(
+        &self,
+        Parameters(p): Parameters<super::AccountParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::SendAsOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Gmail).await?;
+        let addresses = self.send_as(&connection).await?;
+        let default = gmail::default_send_as(&addresses).map(|a| a.email.clone());
+        let note = match default {
+            Some(address) => format!(
+                "a draft with no `from` is written as {address}; \
+                 pass one of the usable_as_from addresses to write as another"
+            ),
+            None => "this account reports no send-as address at all".to_string(),
+        };
+        Ok(Json(dto::SendAsOut {
+            account: connection.label,
+            count: addresses.len(),
+            addresses: addresses.into_iter().map(Into::into).collect(),
+            note,
+        }))
+    }
+
+    #[tool(
         description = "A download URL for one attachment. The link lives 15 minutes and may be \
                        fetched a few times; give it to the person or curl it. For something you \
                        want to read yourself, use gmail_attachment_text instead."
@@ -362,7 +409,9 @@ impl Gmcp {
         description = "Write a new draft in the account's Gmail and return its id and URL. \
                        Nothing is sent: the person opens the draft and presses send themselves, \
                        so say that rather than claiming the mail went out. No confirmation \
-                       argument, because the draft is the confirmation."
+                       argument, because the draft is the confirmation. `from` must be one of \
+                       the account's verified send-as addresses, which gmail_list_send_as \
+                       reports; left out, the draft comes from the account's default address."
     )]
     async fn gmail_create_draft(
         &self,
@@ -370,8 +419,9 @@ impl Gmcp {
         Extension(call): Extension<Call>,
     ) -> Result<Json<dto::DraftOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Gmail).await?;
+        let from = self.draft_from(&connection, p.from.as_deref()).await?;
         let content = gmail::DraftContent {
-            from: connection.google_email.clone(),
+            from: from.header.clone(),
             to: addresses(p.to, "to")?,
             cc: p
                 .cc
@@ -391,13 +441,18 @@ impl Gmcp {
         let draft = gmail::create_draft(&self.google()?.client, connection.id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft)))
+        Ok(Json(draft_out(connection.label, draft, from)))
     }
 
     #[tool(
         description = "Write a reply to a message as a draft, threaded properly: In-Reply-To, \
                        References and the thread id come from the message being replied to, and \
-                       the subject keeps one Re:. Nothing is sent; the person sends it from Gmail."
+                       the subject keeps one Re:. The reply comes from the address the original \
+                       was delivered to, which is what Gmail itself does; pass `from` to write as \
+                       another of the account's verified send-as addresses, which \
+                       gmail_list_send_as reports. The result says which address was chosen and \
+                       why — tell the person, so a wrong guess is caught before they send. \
+                       Nothing is sent; the person sends it from Gmail."
     )]
     async fn gmail_reply_draft(
         &self,
@@ -409,9 +464,12 @@ impl Gmcp {
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
+        let from = self
+            .reply_from(&connection, &message, p.from.as_deref())
+            .await?;
         let mut content = gmail::DraftContent::reply_to(
             &message,
-            &connection.google_email,
+            &from.header,
             &p.body,
             p.reply_all.unwrap_or(false),
         );
@@ -419,14 +477,16 @@ impl Gmcp {
         let draft = gmail::create_draft(client, connection.id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft)))
+        Ok(Json(draft_out(connection.label, draft, from)))
     }
 
     #[tool(
         description = "Replace an existing draft's whole message: recipients, subject and body \
                        are written as given, and anything left out is dropped. Read the draft \
-                       with gmail_list_drafts first if you mean to keep part of it. Still nothing \
-                       is sent."
+                       with gmail_list_drafts first if you mean to keep part of it. `from` must \
+                       be one of the account's verified send-as addresses, which \
+                       gmail_list_send_as reports; left out, the draft comes from the account's \
+                       default address. Still nothing is sent."
     )]
     async fn gmail_update_draft(
         &self,
@@ -434,8 +494,9 @@ impl Gmcp {
         Extension(call): Extension<Call>,
     ) -> Result<Json<dto::DraftOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Gmail).await?;
+        let from = self.draft_from(&connection, p.from.as_deref()).await?;
         let content = gmail::DraftContent {
-            from: connection.google_email.clone(),
+            from: from.header.clone(),
             to: addresses(p.to, "to")?,
             cc: p
                 .cc
@@ -460,7 +521,7 @@ impl Gmcp {
         )
         .await
         .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft)))
+        Ok(Json(draft_out(connection.label, draft, from)))
     }
 
     #[tool(description = "The account's drafts, newest first, with their ids and Gmail URLs.")]
@@ -506,6 +567,8 @@ impl Gmcp {
             url: String::new(),
             message_id: String::new(),
             thread_id: String::new(),
+            from: None,
+            from_reason: None,
             draft_id,
             note: "the draft is gone".into(),
         }))
@@ -612,6 +675,173 @@ impl Gmcp {
             messages,
             failed,
         }))
+    }
+}
+
+/// Which address a draft is written as, and why that one. A reply chooses on
+/// its own, so the reason travels back to the model and from there to the
+/// person: a wrong guess should be visible rather than silent.
+struct ChosenFrom {
+    /// The `From` header the draft carries.
+    header: String,
+    reason: String,
+}
+
+impl Gmcp {
+    /// The account's send-as addresses. The Google client keeps them for a few
+    /// minutes per connection, so drafting several replies asks Gmail once.
+    async fn send_as(&self, connection: &Connection) -> Result<Vec<gmail::SendAs>, ErrorData> {
+        gmail::send_as(&self.google()?.client, connection.id)
+            .await
+            .map_err(|e| self.google_err_for(connection, e))
+    }
+
+    /// The `From` a new or replaced draft carries: the address the caller
+    /// named, or the account's default one.
+    async fn draft_from(
+        &self,
+        connection: &Connection,
+        wanted: Option<&str>,
+    ) -> Result<ChosenFrom, ErrorData> {
+        match named(wanted) {
+            Some(wanted) => choose(&self.send_as(connection).await?, wanted),
+            None => Ok(self.default_from(connection).await),
+        }
+    }
+
+    /// The `From` a reply carries, which is what the Gmail web UI does: the
+    /// address the original was delivered to. `Delivered-To` says it outright;
+    /// without one, an address of this account in `To` and then in `Cc` says
+    /// it well enough. A named `from` wins over all of that.
+    async fn reply_from(
+        &self,
+        connection: &Connection,
+        message: &gmail::Message,
+        wanted: Option<&str>,
+    ) -> Result<ChosenFrom, ErrorData> {
+        if let Some(wanted) = named(wanted) {
+            return choose(&self.send_as(connection).await?, wanted);
+        }
+        let Ok(addresses) = gmail::send_as(&self.google()?.client, connection.id).await else {
+            return Ok(self.default_from(connection).await);
+        };
+        let alias_for = |value: &String| {
+            gmail::find_send_as(&addresses, value)
+                .filter(|alias| alias.usable())
+                .map(|alias| ChosenFrom {
+                    header: alias.header(),
+                    reason: String::new(),
+                })
+        };
+        if let Some(mut chosen) = message.delivered_to.iter().find_map(alias_for) {
+            chosen.reason = "the message was delivered to it".into();
+            return Ok(chosen);
+        }
+        for (field, values) in [("To", &message.to), ("Cc", &message.cc)] {
+            if let Some(mut chosen) = values.iter().find_map(alias_for) {
+                chosen.reason = format!("the original's {field} names it");
+                return Ok(chosen);
+            }
+        }
+        let mut chosen = default_of(&addresses, connection);
+        chosen.reason = format!(
+            "{}; the original named no verified address of this account",
+            chosen.reason
+        );
+        Ok(chosen)
+    }
+
+    /// The account's default alias. When Gmail will not say what it is — the
+    /// settings call failed, or the account reports nothing — the connection's
+    /// own Google address stands in, because that is the one address Gmail
+    /// never rewrites. This is the only place an address is chosen without
+    /// checking the list, and it says so in the reason it hands back.
+    async fn default_from(&self, connection: &Connection) -> ChosenFrom {
+        let Ok(google) = self.google() else {
+            return own_address(connection);
+        };
+        match gmail::send_as(&google.client, connection.id).await {
+            Ok(addresses) => default_of(&addresses, connection),
+            Err(e) => {
+                tracing::warn!("connection {}: send-as addresses: {e}", connection.id);
+                own_address(connection)
+            }
+        }
+    }
+}
+
+/// The account's default address, out of a list already in hand.
+fn default_of(addresses: &[gmail::SendAs], connection: &Connection) -> ChosenFrom {
+    match gmail::default_send_as(addresses) {
+        Some(alias) => ChosenFrom {
+            header: alias.header(),
+            reason: "it is the account's default send-as address".into(),
+        },
+        None => own_address(connection),
+    }
+}
+
+/// The connection's own Google address, which Gmail never rewrites.
+fn own_address(connection: &Connection) -> ChosenFrom {
+    ChosenFrom {
+        header: connection.google_email.clone(),
+        reason: "the account's own Google address, because Gmail did not report its send-as \
+                 addresses"
+            .into(),
+    }
+}
+
+/// A `from` argument that says something.
+fn named(wanted: Option<&str>) -> Option<&str> {
+    wanted.map(str::trim).filter(|w| !w.is_empty())
+}
+
+/// The address a `from` argument names, checked against the send-as list.
+/// Gmail rewrites a `From` it has not verified, so an address that is not on
+/// the list, and one on it that Google has not verified, are both refused with
+/// the addresses that would have worked. Nothing falls back to the primary.
+fn choose(addresses: &[gmail::SendAs], wanted: &str) -> Result<ChosenFrom, ErrorData> {
+    let Some(alias) = gmail::find_send_as(addresses, wanted) else {
+        return Err(bad(format!(
+            "this account cannot write mail as {wanted:?}, and Gmail would replace it with the \
+             account's own address. It can write as {}. gmail_list_send_as reports them in full",
+            usable(addresses)
+        )));
+    };
+    if !alias.usable() {
+        return Err(refuse(format!(
+            "{} is a send-as address of this account but Google has not verified it (Gmail says \
+             {:?}), so Gmail would replace it on send. The person verifies it in Gmail's \
+             settings. The addresses that work today are {}",
+            alias.email,
+            alias.verification_status.as_deref().unwrap_or("unverified"),
+            usable(addresses)
+        )));
+    }
+    // A caller who wrote a display name keeps it; a bare address gains the
+    // alias's own, so the draft reads like one written by hand.
+    let header = if wanted.contains('<') {
+        wanted.to_string()
+    } else {
+        alias.header()
+    };
+    Ok(ChosenFrom {
+        header,
+        reason: "the `from` argument named it".into(),
+    })
+}
+
+/// The addresses a draft may be written as, for a refusal to name.
+fn usable(addresses: &[gmail::SendAs]) -> String {
+    let usable: Vec<&str> = addresses
+        .iter()
+        .filter(|a| a.usable())
+        .map(|a| a.email.as_str())
+        .collect();
+    if usable.is_empty() {
+        "no address at all".to_string()
+    } else {
+        usable.join(", ")
     }
 }
 
@@ -757,13 +987,15 @@ fn addresses(values: Vec<String>, field: &str) -> Result<Vec<String>, ErrorData>
     Ok(out)
 }
 
-fn draft_out(account: String, draft: gmail::DraftRef) -> dto::DraftOut {
+fn draft_out(account: String, draft: gmail::DraftRef, from: ChosenFrom) -> dto::DraftOut {
     dto::DraftOut {
         account,
         url: draft.url(),
         draft_id: draft.id,
         message_id: draft.message_id,
         thread_id: draft.thread_id,
+        from: Some(from.header),
+        from_reason: Some(from.reason),
         note: "nothing was sent; the person opens this draft in Gmail and sends it themselves"
             .into(),
     }

@@ -241,10 +241,58 @@ pub struct DraftOut {
     pub draft_id: String,
     pub message_id: String,
     pub thread_id: String,
+    /// The `From` the draft carries, and why that address was chosen. A reply
+    /// picks one on its own, so a wrong guess is visible here rather than
+    /// silent; tell the person which address the draft is from.
+    pub from: Option<String>,
+    pub from_reason: Option<String>,
     /// Where the person opens the draft and presses send. This server never
     /// sends anything itself.
     pub url: String,
     pub note: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendAsOut {
+    pub account: String,
+    pub count: usize,
+    pub addresses: Vec<SendAsAddressOut>,
+    pub note: String,
+}
+
+/// One address the account may write mail as.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendAsAddressOut {
+    /// The bare address, which is what the draft tools' `from` takes.
+    pub address: String,
+    /// The header a draft carries when this address is chosen.
+    pub from: String,
+    pub display_name: Option<String>,
+    /// True for the address Gmail composes with when nobody chooses.
+    pub is_default: bool,
+    /// True for the Google account's own address.
+    pub is_primary: bool,
+    /// False when Google has not verified the alias. Gmail would rewrite the
+    /// `From` on send, so the draft tools refuse it.
+    pub usable_as_from: bool,
+    /// Google's own word: "accepted" or "pending".
+    pub verification_status: Option<String>,
+    pub reply_to: Option<String>,
+}
+
+impl From<gmail::SendAs> for SendAsAddressOut {
+    fn from(s: gmail::SendAs) -> Self {
+        Self {
+            from: s.header(),
+            usable_as_from: s.usable(),
+            address: s.email,
+            display_name: s.display_name,
+            is_default: s.is_default,
+            is_primary: s.is_primary,
+            verification_status: s.verification_status,
+            reply_to: s.reply_to,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
