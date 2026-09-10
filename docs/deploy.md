@@ -270,13 +270,20 @@ export MAX_MCP_OUTPUT_TOKENS=50000
 ```
 
 **Open WebUI:** register `https://google-mcp.int.krzaq.cc/mcp` as an MCP
-(streamable HTTP) tool server with two headers, the same way the support
-server's `X-Support-User` and koryto's `X-Koryto-User` are wired:
+(streamable HTTP) tool server, the same way the support server's
+`X-Support-User` and koryto's `X-Koryto-User` are wired. Its form takes one
+value per field, and the header box is parsed as JSON:
 
 ```
-Authorization: Bearer gg_...
-X-Gmcp-User: {{USER_EMAIL}}
+URL             https://google-mcp.int.krzaq.cc/mcp
+Auth            Bearer
+Bearer token    gg_...
+Extra headers   {"X-Gmcp-User": "{{USER_EMAIL}}"}
 ```
+
+Open WebUI expands the template once per request, so the one gateway token acts
+as whoever is chatting. The token page prints these four values in the same
+shape when the token is created.
 
 The delegate token acts only for someone who logged into the portal through the
 browser in the last 30 days, so removing a person in authentik ends their Open

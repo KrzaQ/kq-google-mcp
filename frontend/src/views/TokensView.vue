@@ -119,8 +119,21 @@ onMounted(load)
       <div v-for="s in snippets" :key="s.id" class="space-y-1" :data-testid="`snippet-${s.id}`">
         <p class="text-xs font-medium text-fg">{{ s.title }}</p>
         <pre
+          v-if="s.body"
           class="overflow-x-auto rounded bg-surface px-3 py-2 font-mono text-xs text-fg select-all"
           >{{ s.body }}</pre>
+        <!-- One box per value: these go into separate inputs, so selecting
+             them all together would be the wrong thing to copy. -->
+        <dl v-if="s.fields" class="space-y-1">
+          <div v-for="f in s.fields" :key="f.label" class="flex items-baseline gap-2">
+            <dt class="w-28 shrink-0 text-xs text-muted">{{ f.label }}</dt>
+            <dd
+              class="min-w-0 flex-1 rounded bg-surface px-3 py-1.5 font-mono text-xs break-all text-fg select-all"
+            >
+              {{ f.value }}
+            </dd>
+          </div>
+        </dl>
         <p v-if="s.note" class="text-xs text-muted">{{ s.note }}</p>
       </div>
       <button class="btn-secondary" data-testid="secret-done" @click="created = null">Done</button>

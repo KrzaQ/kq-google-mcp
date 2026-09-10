@@ -350,11 +350,12 @@ fn snippets(public_url: Option<String>, secret: &str, gateway: bool) {
     println!("    }}");
     println!("  }}");
     println!();
-    println!("Open WebUI, as an MCP tool server:");
-    println!("  URL     {url}");
-    println!("  Header  Authorization: Bearer {secret}");
+    println!("Open WebUI, as an MCP tool server (its header box is parsed as JSON):");
+    println!("  URL            {url}");
+    println!("  Auth           Bearer");
+    println!("  Bearer token   {secret}");
     println!(
-        "  Header  X-Gmcp-User: {{{{USER_EMAIL}}}}{}",
+        "  Extra headers  {{\"X-Gmcp-User\": \"{{{{USER_EMAIL}}}}\"}}{}",
         if gateway {
             ""
         } else {

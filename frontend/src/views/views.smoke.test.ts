@@ -244,9 +244,10 @@ describe('views', () => {
       'claude mcp add --transport http gmcp https://gmcp.example/mcp',
     )
     expect(w.find('[data-testid="snippet-opencode"]').text()).toContain('"type": "remote"')
-    expect(w.find('[data-testid="snippet-openwebui"]').text()).toContain(
-      'X-Gmcp-User: {{USER_EMAIL}}',
-    )
+    const openwebui = w.find('[data-testid="snippet-openwebui"]').text()
+    // Its header box is parsed as JSON, and each value goes into its own input.
+    expect(openwebui).toContain('{"X-Gmcp-User": "{{USER_EMAIL}}"}')
+    expect(openwebui).toContain('Extra headers')
     await w.find('[data-testid="secret-done"]').trigger('click')
     expect(w.find('[data-testid="token-secret"]').exists()).toBe(false)
     expect(errors).toEqual([])

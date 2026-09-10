@@ -1,11 +1,23 @@
-// The three clients, each with the one line or block a person pastes.
+// The clients, each with the one line, block or set of fields a person pastes.
 //
 // The secret is shown once, so this is the moment the registration has to be
 // complete: the URL, the bearer header, and for the gateway the header that
 // names the acting person. Everything else about a client belongs in its own
 // documentation, not here.
+//
+// A snippet is either a `body`, one blob that goes somewhere whole, or
+// `fields`, when the client asks for the same values in separate inputs and a
+// single select-all block would be the wrong shape to copy from.
 
-export type Snippet = { id: string; title: string; language: string; body: string; note?: string }
+export type SnippetField = { label: string; value: string }
+export type Snippet = {
+  id: string
+  title: string
+  language: string
+  body?: string
+  fields?: SnippetField[]
+  note?: string
+}
 
 /** The server this portal is served from, which is the one the clients call. */
 export function publicOrigin(): string {
@@ -89,12 +101,14 @@ export function openWebUiSnippet(origin: string, secret: string): Snippet {
     id: 'openwebui',
     title: 'Open WebUI',
     language: 'text',
-    body: [
-      `URL          ${mcpUrl(origin)}`,
-      `Auth         Bearer`,
-      `Bearer token ${secret}`,
-      `Extra header X-Gmcp-User: {{USER_EMAIL}}`,
-    ].join('\n'),
+    fields: [
+      { label: 'URL', value: mcpUrl(origin) },
+      { label: 'Auth', value: 'Bearer' },
+      { label: 'Bearer token', value: secret },
+      // Open WebUI parses this box as JSON, and expands the template once per
+      // request, so the gateway token acts as whoever is chatting.
+      { label: 'Extra headers', value: '{"X-Gmcp-User": "{{USER_EMAIL}}"}' },
+    ],
     note: "Set the model's Function Calling to Native, or it never sees the images.",
   }
 }

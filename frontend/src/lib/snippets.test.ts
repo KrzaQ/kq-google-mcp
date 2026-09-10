@@ -46,10 +46,18 @@ describe('the client snippets', () => {
     })
   })
 
-  it('tell Open WebUI the acting-user header and the Native requirement', () => {
-    expect(openwebui!.body).toContain('https://google-mcp.int.krzaq.cc/mcp')
-    expect(openwebui!.body).toContain('Bearer')
-    expect(openwebui!.body).toContain('X-Gmcp-User: {{USER_EMAIL}}')
+  it('give Open WebUI one box per input rather than one block', () => {
+    // Its form has separate fields, so a single select-all body would be the
+    // wrong shape to copy from.
+    expect(openwebui!.body).toBeUndefined()
+    const byLabel = Object.fromEntries(openwebui!.fields!.map((f) => [f.label, f.value]))
+    expect(byLabel['URL']).toBe('https://google-mcp.int.krzaq.cc/mcp')
+    expect(byLabel['Bearer token']).toBe('gg_secret')
     expect(openwebui!.note).toContain('Native')
+  })
+
+  it('write the acting-user header as the JSON Open WebUI parses', () => {
+    const headers = openwebui!.fields!.find((f) => f.label === 'Extra headers')!.value
+    expect(JSON.parse(headers)).toEqual({ 'X-Gmcp-User': '{{USER_EMAIL}}' })
   })
 })
