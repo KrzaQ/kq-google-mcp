@@ -8,21 +8,42 @@
 //! Instants are RFC 3339 strings rather than `DateTime`, because these types
 //! carry a JSON schema to the client and the schema generator has no opinion
 //! about chrono.
+//!
+//! Every one of them is written on the acting person's clock, with the offset
+//! that was in force at that instant: `2026-09-10T13:35:28+02:00` for a
+//! September morning in Warsaw and `+01:00` for a January one. A model that
+//! reads `11:35Z` tells the person their mail arrived two hours before it did,
+//! so nothing here renders UTC unless the person's zone is UTC. The zone
+//! arrives as an argument from the call rather than from a global, because two
+//! people on one server have two different clocks.
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use rmcp::schemars;
 use serde::Serialize;
 
 use crate::db::Connection;
 use crate::google::{calendar, docs, drive, gmail, sheets};
 
-pub fn instant(at: Option<DateTime<Utc>>) -> Option<String> {
-    at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+/// One instant, on `tz`'s clock and with `tz`'s offset for that day.
+pub fn instant(at: Option<DateTime<Utc>>, tz: Tz) -> Option<String> {
+    at.map(|at| at_zone(at, tz))
+}
+
+pub fn at_zone(at: DateTime<Utc>, tz: Tz) -> String {
+    at.with_timezone(&tz)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountsOut {
     pub accounts: Vec<AccountOut>,
+    /// The IANA zone every time in every tool is shown in and read on, for
+    /// this person.
+    pub timezone: String,
+    /// What time it is on that clock right now, so "today" and "this
+    /// afternoon" need no guessing.
+    pub now: String,
     /// What to do when the list is empty or an account needs attention.
     pub note: String,
 }
@@ -42,15 +63,15 @@ pub struct AccountOut {
     pub last_used_at: Option<String>,
 }
 
-impl From<&Connection> for AccountOut {
-    fn from(c: &Connection) -> Self {
+impl AccountOut {
+    pub fn new(c: &Connection, tz: Tz) -> Self {
         Self {
             label: c.label.clone(),
             google_email: c.google_email.clone(),
             services: c.services.clone(),
             status: c.status.to_string(),
             needs_reauth: c.status == crate::db::ConnectionStatus::NeedsReauth,
-            last_used_at: instant(c.last_used_at),
+            last_used_at: instant(c.last_used_at, tz),
         }
     }
 }
@@ -77,12 +98,12 @@ pub struct MessageBriefOut {
     pub attachments: usize,
 }
 
-impl From<gmail::MessageSummary> for MessageBriefOut {
-    fn from(m: gmail::MessageSummary) -> Self {
+impl MessageBriefOut {
+    pub fn new(m: gmail::MessageSummary, tz: Tz) -> Self {
         Self {
             message_id: m.id,
             thread_id: m.thread_id,
-            date: instant(m.date),
+            date: instant(m.date, tz),
             from: m.from,
             to: m.to,
             subject: m.subject,
@@ -124,12 +145,12 @@ pub struct MessageOut {
     pub inline_images: Vec<InlineImageOut>,
 }
 
-impl From<gmail::Message> for MessageOut {
-    fn from(m: gmail::Message) -> Self {
+impl MessageOut {
+    pub fn new(m: gmail::Message, tz: Tz) -> Self {
         Self {
             message_id: m.id,
             thread_id: m.thread_id,
-            date: instant(m.date),
+            date: instant(m.date, tz),
             from: m.from,
             to: m.to,
             cc: m.cc,
@@ -240,12 +261,12 @@ pub struct DraftBriefOut {
     pub message: MessageBriefOut,
 }
 
-impl From<gmail::DraftSummary> for DraftBriefOut {
-    fn from(d: gmail::DraftSummary) -> Self {
+impl DraftBriefOut {
+    pub fn new(d: gmail::DraftSummary, tz: Tz) -> Self {
         Self {
             url: format!("https://mail.google.com/mail/u/0/#drafts?compose={}", d.id),
             draft_id: d.id,
-            message: d.message.into(),
+            message: MessageBriefOut::new(d.message, tz),
         }
     }
 }
@@ -299,6 +320,10 @@ pub struct FilesOut {
     pub account: String,
     pub count: usize,
     pub files: Vec<FileOut>,
+    /// Present only when `modified_after` had to be decided, such as an hour
+    /// the clock change made happen twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -312,13 +337,13 @@ pub struct FileOut {
     pub web_view_link: Option<String>,
 }
 
-impl From<drive::FileMeta> for FileOut {
-    fn from(f: drive::FileMeta) -> Self {
+impl FileOut {
+    pub fn new(f: drive::FileMeta, tz: Tz) -> Self {
         Self {
             file_id: f.id,
             name: f.name,
             mime_type: f.mime_type,
-            modified_time: instant(f.modified_time),
+            modified_time: instant(f.modified_time, tz),
             size: f.size,
             owners: f.owners,
             web_view_link: f.web_view_link,
@@ -457,6 +482,10 @@ pub struct EventsOut {
     pub to: String,
     pub count: usize,
     pub events: Vec<EventOut>,
+    /// Present only when a time given for the window had to be decided, such
+    /// as an hour the clock change made happen twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -477,16 +506,16 @@ pub struct EventOut {
     pub attendees: usize,
 }
 
-impl From<calendar::Event> for EventOut {
-    fn from(e: calendar::Event) -> Self {
+impl EventOut {
+    pub fn new(e: calendar::Event, tz: Tz) -> Self {
         let all_day = e.start.date.is_some();
         Self {
             event_id: e.id,
             title: e.summary,
             description: e.description,
             location: e.location,
-            start: when(&e.start),
-            end: when(&e.end),
+            start: when(&e.start, tz),
+            end: when(&e.end, tz),
             all_day,
             status: e.status,
             url: e.html_link,
@@ -496,8 +525,10 @@ impl From<calendar::Event> for EventOut {
     }
 }
 
-fn when(w: &calendar::When) -> Option<String> {
-    w.date.clone().or_else(|| instant(w.date_time))
+fn when(w: &calendar::When, tz: Tz) -> Option<String> {
+    w.date
+        .clone()
+        .or_else(|| instant(w.date_time.map(|d| d.with_timezone(&Utc)), tz))
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]

@@ -12,7 +12,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -31,6 +32,8 @@ use crate::http::{AppState, router};
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/google/");
 const HOST: &str = "gmcp.example";
+/// What `GMCP_TIMEZONE` says, and so the zone every test user starts in.
+const HOUSE: Tz = chrono_tz::Europe::Warsaw;
 
 fn fixture(name: &str) -> Value {
     let raw = std::fs::read_to_string(format!("{FIXTURES}{name}"))
@@ -63,6 +66,7 @@ async fn app(db: &Db, server: Option<&MockServer>) -> Router {
         auth: AuthMode::Dev,
         google: google_config(server),
         auto_migrate: false,
+        timezone: HOUSE,
     };
     let state = AppState::new(config, db.clone()).await.unwrap();
     router(state)
@@ -243,8 +247,14 @@ fn error_text(v: &Value) -> String {
 // ----- fixtures --------------------------------------------------------------
 
 async fn user(db: &Db, subject: &str, email: &str) -> User {
+    user_in(db, subject, email, HOUSE).await
+}
+
+/// The same, for somebody who keeps another clock. Two people on one server
+/// see the same stored instant in two different zones, and the tests say so.
+async fn user_in(db: &Db, subject: &str, email: &str, zone: Tz) -> User {
     let u = db
-        .upsert_user(subject, Some(email), Some(subject))
+        .upsert_user(subject, Some(email), Some(subject), zone)
         .await
         .unwrap();
     db.touch_last_login(u.id).await.unwrap();
@@ -1821,14 +1831,16 @@ async fn drive_search_answers_the_files_it_found_and_never_the_bin() {
     );
     assert_eq!(query["pageSize"], "5");
 
-    // A date that is not an instant is refused by name.
+    // Something that is no kind of time is refused, and the refusal says which
+    // shapes work and on whose clock they are read.
     let bad = c
         .refused(
             "drive_search",
             json!({"account": "work", "modified_after": "last tuesday"}),
         )
         .await;
-    assert!(bad.contains("RFC 3339"), "{bad}");
+    assert!(bad.contains("last tuesday"), "{bad}");
+    assert!(bad.contains("Europe/Warsaw"), "{bad}");
 }
 
 #[tokio::test]
@@ -1851,7 +1863,8 @@ async fn drive_get_file_answers_the_metadata_and_nothing_more() {
     assert_eq!(out["name"], "q3-figures.pdf");
     assert_eq!(out["mime_type"], "application/pdf");
     assert_eq!(out["size"], 26112);
-    assert_eq!(out["modified_time"], "2026-09-03T09:12:00Z");
+    // Stored as UTC, shown on the person's clock: September in Warsaw is +02:00.
+    assert_eq!(out["modified_time"], "2026-09-03T11:12:00+02:00");
 }
 
 #[tokio::test]
@@ -2415,5 +2428,186 @@ async fn sheets_create_previews_the_spreadsheet_and_writes_nothing() {
         "1 rows on the first tab, plus empty tabs October, November"
     );
     assert_eq!(out["details"][1], "Date | Customer | Hours");
+    drop(server);
+}
+
+// ----- clocks -----------------------------------------------------------------
+//
+// Every instant a tool emits is the acting person's own wall-clock time with
+// the offset in force that day, and every time an argument carries without an
+// offset is read on that same clock. A model that was told "11:35Z" would tell
+// the person their mail arrived two hours before it did, and one that booked
+// "3pm" as 15:00Z would put the meeting an hour off; these say so.
+
+#[test]
+fn an_instant_carries_the_offset_that_was_in_force_that_day() {
+    let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+    let january = super::dto::instant(Some(at("2026-01-15T12:00:00Z")), HOUSE);
+    assert_eq!(january.as_deref(), Some("2026-01-15T13:00:00+01:00"));
+    let july = super::dto::instant(Some(at("2026-07-15T12:00:00Z")), HOUSE);
+    assert_eq!(july.as_deref(), Some("2026-07-15T14:00:00+02:00"));
+    // Nothing is invented for an absent instant.
+    assert_eq!(super::dto::instant(None, HOUSE), None);
+}
+
+#[tokio::test]
+async fn one_stored_instant_is_shown_on_each_person_s_own_clock() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{PDF}"),
+        fixture("drive_file.json"),
+    )
+    .await;
+
+    let anna = user_in(&db, "anna", "anna@example.test", HOUSE).await;
+    connect(&db, &anna, "work", &["drive"], false).await;
+    let (_, for_anna) = token(&db, &["drive:read"], Some(&anna), ClientProfile::Generic).await;
+    let bruno = user_in(
+        &db,
+        "bruno",
+        "bruno@example.test",
+        chrono_tz::America::New_York,
+    )
+    .await;
+    connect(&db, &bruno, "work", &["drive"], false).await;
+    let (_, for_bruno) = token(&db, &["drive:read"], Some(&bruno), ClientProfile::Generic).await;
+
+    let ask = json!({"account": "work", "file_id": PDF});
+    let mut a = Client::new(app(&db, Some(&server)).await, for_anna);
+    a.initialize().await;
+    let mut b = Client::new(app(&db, Some(&server)).await, for_bruno);
+    b.initialize().await;
+    let anna_saw = a.ok("drive_get_file", ask.clone()).await;
+    let bruno_saw = b.ok("drive_get_file", ask).await;
+
+    // One row in Drive, one instant, two clocks.
+    assert_eq!(anna_saw["modified_time"], "2026-09-03T11:12:00+02:00");
+    assert_eq!(bruno_saw["modified_time"], "2026-09-03T05:12:00-04:00");
+    drop(server);
+}
+
+#[tokio::test]
+async fn list_accounts_says_which_clock_and_what_time_it_is_on_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+    let out = c.ok("list_accounts", json!({})).await;
+    assert_eq!(out["timezone"], "Europe/Warsaw");
+    let now = out["now"].as_str().expect("the time where the person is");
+    let now = DateTime::parse_from_rfc3339(now).expect("an RFC 3339 instant");
+    assert!(!now.to_rfc3339().ends_with('Z'), "{now}");
+    assert!((Utc::now() - now.with_timezone(&Utc)).num_seconds().abs() < 60);
+    drop(server);
+}
+
+#[test]
+fn a_time_without_an_offset_is_read_on_the_person_s_clock_in_both_seasons() {
+    let read = |s: &str| super::drive::instant(s, HOUSE).unwrap();
+    // Warsaw is +01:00 in January and +02:00 in July, so the same wall-clock
+    // time is two different instants.
+    assert_eq!(
+        read("2026-01-15T14:00").at.to_rfc3339(),
+        "2026-01-15T13:00:00+00:00"
+    );
+    assert_eq!(
+        read("2026-07-15T14:00").at.to_rfc3339(),
+        "2026-07-15T12:00:00+00:00"
+    );
+    // Seconds, and a space in place of the T, are the same time.
+    assert_eq!(read("2026-07-15 14:00:00").at, read("2026-07-15T14:00").at);
+    // A bare date is the start of that day where the person is.
+    assert_eq!(
+        read("2026-07-15").at.to_rfc3339(),
+        "2026-07-14T22:00:00+00:00"
+    );
+    assert!(read("2026-07-15T14:00").note.is_none());
+}
+
+#[test]
+fn an_explicit_offset_is_honoured_rather_than_reinterpreted() {
+    let read = |s: &str| super::drive::instant(s, HOUSE).unwrap().at.to_rfc3339();
+    // 15:00 in London is 16:00 in Warsaw, and what was written is what is meant.
+    assert_eq!(
+        read("2026-07-15T15:00:00+01:00"),
+        "2026-07-15T14:00:00+00:00"
+    );
+    assert_eq!(read("2026-07-15T14:00:00Z"), "2026-07-15T14:00:00+00:00");
+    // Not the same instant as the bare wall-clock time, which is the point.
+    assert_ne!(read("2026-07-15T15:00:00+01:00"), read("2026-07-15T15:00"));
+}
+
+#[test]
+fn the_hour_the_clock_skips_is_refused_by_name() {
+    // In Warsaw the night of 2026-03-29 has no 02:30: the clock goes straight
+    // from 02:00 to 03:00. Booking it would silently become another hour.
+    let refused = super::drive::instant("2026-03-29T02:30", HOUSE).unwrap_err();
+    let message = refused.message.to_string();
+    assert!(message.contains("2026-03-29T02:30"), "{message}");
+    assert!(message.contains("Europe/Warsaw"), "{message}");
+    assert!(message.contains("02:00"), "{message}");
+    assert!(message.contains("03:00"), "{message}");
+    assert!(message.contains("2026-03-29"), "{message}");
+    // The hour either side of the gap is an ordinary time.
+    assert!(super::drive::instant("2026-03-29T01:30", HOUSE).is_ok());
+    assert!(super::drive::instant("2026-03-29T03:30", HOUSE).is_ok());
+}
+
+#[test]
+fn the_hour_the_clock_repeats_takes_the_earlier_of_the_two_and_says_so() {
+    // 2026-10-25 02:30 happens twice in Warsaw. The first one — still summer
+    // time, +02:00 — is the one taken.
+    let twice = super::drive::instant("2026-10-25T02:30", HOUSE).unwrap();
+    assert_eq!(twice.at.to_rfc3339(), "2026-10-25T00:30:00+00:00");
+    let note = twice.note.expect("the reply says which of the two it took");
+    assert!(note.contains("twice"), "{note}");
+    assert!(note.contains("2026-10-25T02:30:00+02:00"), "{note}");
+}
+
+#[tokio::test]
+async fn a_calendar_write_carries_the_person_s_zone_beside_the_time() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(http_method("POST"))
+        .and(path("/calendar/v3/calendars/primary/events"))
+        .and(query_param("sendUpdates", "none"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture("calendar_event_created.json")),
+        )
+        .mount(&server)
+        .await;
+    let (_, _, secret) = one_of_everything(
+        &db,
+        &["calendar:read", "calendar:write"],
+        ClientProfile::Generic,
+    )
+    .await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    // "three in the afternoon", with no offset anywhere.
+    c.ok(
+        "calendar_create_event",
+        json!({"account": "work", "title": "Deep work", "start": "2026-09-11T15:00",
+               "end": "2026-09-11T16:00", "confirmed": true}),
+    )
+    .await;
+
+    let asked = server.received_requests().await.unwrap();
+    let write = asked
+        .iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/events"))
+        .expect("the events.insert call");
+    let body: Value = serde_json::from_slice(&write.body).unwrap();
+    // The pair says what the person meant, so Calendar stores the intent
+    // rather than a time converted into somebody else's zone.
+    assert_eq!(body["start"]["dateTime"], "2026-09-11T15:00:00+02:00");
+    assert_eq!(body["start"]["timeZone"], "Europe/Warsaw");
+    assert_eq!(body["end"]["dateTime"], "2026-09-11T16:00:00+02:00");
+    assert_eq!(body["end"]["timeZone"], "Europe/Warsaw");
+    assert!(!String::from_utf8_lossy(&write.body).contains("attendees"));
     drop(server);
 }

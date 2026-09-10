@@ -6,6 +6,7 @@
 //! argument — the draft *is* the confirmation — and the results carry the
 //! Gmail URL rather than a promise that something went out.
 
+use chrono_tz::Tz;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData};
@@ -181,7 +182,10 @@ impl Gmcp {
         Ok(Json(dto::MessagesOut {
             account: connection.label,
             count: found.len(),
-            messages: found.into_iter().map(Into::into).collect(),
+            messages: found
+                .into_iter()
+                .map(|m| dto::MessageBriefOut::new(m, call.tz))
+                .collect(),
         }))
     }
 
@@ -207,7 +211,11 @@ impl Gmcp {
         Ok(Json(dto::ThreadOut {
             account: connection.label,
             thread_id: thread.id,
-            messages: thread.messages.into_iter().map(Into::into).collect(),
+            messages: thread
+                .messages
+                .into_iter()
+                .map(|m| dto::MessageOut::new(m, call.tz))
+                .collect(),
         }))
     }
 
@@ -226,7 +234,7 @@ impl Gmcp {
             gmail::get_message(&self.google()?.client, connection.id, p.message_id.trim())
                 .await
                 .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(message.into()))
+        Ok(Json(dto::MessageOut::new(message, call.tz)))
     }
 
     #[tool(description = "The account's labels, with their ids and message counts.")]
@@ -278,7 +286,7 @@ impl Gmcp {
         )
         .await
         .map_err(api_err)?;
-        Ok(Json(link_out(minted)))
+        Ok(Json(link_out(minted, call.tz)))
     }
 
     #[tool(
@@ -472,7 +480,10 @@ impl Gmcp {
         Ok(Json(dto::DraftsOut {
             account: connection.label,
             count: drafts.len(),
-            drafts: drafts.into_iter().map(Into::into).collect(),
+            drafts: drafts
+                .into_iter()
+                .map(|d| dto::DraftBriefOut::new(d, call.tz))
+                .collect(),
         }))
     }
 
@@ -572,7 +583,7 @@ impl Gmcp {
                 Ok(message) => messages.push(dto::MessageBriefOut {
                     message_id: message.id,
                     thread_id: message.thread_id,
-                    date: dto::instant(message.date),
+                    date: dto::instant(message.date, call.tz),
                     from: message.from,
                     to: message.to,
                     subject: message.subject,
@@ -758,15 +769,13 @@ fn draft_out(account: String, draft: gmail::DraftRef) -> dto::DraftOut {
     }
 }
 
-pub(super) fn link_out(minted: links::Minted) -> dto::LinkOut {
+pub(super) fn link_out(minted: links::Minted, tz: Tz) -> dto::LinkOut {
     dto::LinkOut {
         url: minted.url,
         filename: minted.filename,
         mime_type: minted.mime_type,
         size: minted.size,
-        expires_at: minted
-            .expires_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        expires_at: dto::at_zone(minted.expires_at, tz),
         note: "the link expires in 15 minutes and may be fetched a few times; mint a new one \
                afterwards"
             .into(),

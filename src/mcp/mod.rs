@@ -38,6 +38,7 @@ use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
+use chrono_tz::Tz;
 use rmcp::ServerHandler;
 use rmcp::handler::server::tool::{Extension, ToolRouter};
 use rmcp::handler::server::wrapper::Json;
@@ -79,6 +80,11 @@ fn instructions(portal: &str) -> String {
          confirmation, because the draft is itself the thing being confirmed.\n\
          Calendar events here never notify anyone and never carry attendees; an event that \
          already has attendees can be read but not changed or deleted through these tools.\n\
+         Times are the person's own, not UTC: every instant comes back on their clock with the \
+         offset in force that day, and a time you pass without an offset is read on that same \
+         clock. list_accounts says which zone that is and what time it is there. Pass an \
+         explicit offset when you have one and it is honoured as written; a bare 2026-09-11T15:00 \
+         or 2026-09-11 means that wall-clock time where the person is.\n\
          Files leave through short-lived download links: the *_link tools mint a URL that lives \
          15 minutes and may be fetched a few times. Give it to the person, or curl it. For text \
          there is no need for a link at all: gmail_attachment_text and drive_read_text extract it \
@@ -93,15 +99,23 @@ fn instructions(portal: &str) -> String {
 /// What one tool call knows about who is calling. It travels in the call's
 /// extensions, so a tool takes it as an argument and the surrounding
 /// [`Gmcp::call_tool`] reads back which connection was resolved for the log.
+///
+/// The zone is resolved once here, from the acting person's row with the house
+/// zone behind it, and every tool takes it from the call. Reaching for a
+/// global instead would give two people on one server the same clock.
 #[derive(Clone)]
 pub struct Call {
     pub principal: Principal,
+    /// The acting person's clock: what every instant is rendered in and what
+    /// a time without an offset is read on.
+    pub tz: Tz,
     connection: Arc<Mutex<Option<i64>>>,
 }
 
 impl Call {
-    fn new(principal: Principal) -> Self {
+    fn new(principal: Principal, house: Tz) -> Self {
         Self {
+            tz: principal.user().zone(house),
             principal,
             connection: Arc::new(Mutex::new(None)),
         }
@@ -282,10 +296,13 @@ impl Gmcp {
     #[tool(
         description = "The Google accounts this token can reach: the label every other tool's \
                        `account` argument takes, the Google address behind it, which services it \
-                       was connected with, and whether it is healthy. Call this first. An account \
-                       marked needs_reauth is refused by every other tool until the person \
-                       reconnects it in the portal — retrying does not help. Images come back \
-                       downscaled and, in Claude Code, count against MAX_MCP_OUTPUT_TOKENS."
+                       was connected with, and whether it is healthy. Call this first. It also \
+                       reports the person's own time zone and what time it is there, which is the \
+                       clock every other tool shows times on and reads times against — use it \
+                       rather than guessing what \"today\" means. An account marked needs_reauth \
+                       is refused by every other tool until the person reconnects it in the \
+                       portal — retrying does not help. Images come back downscaled and, in \
+                       Claude Code, count against MAX_MCP_OUTPUT_TOKENS."
     )]
     async fn list_accounts(
         &self,
@@ -297,8 +314,10 @@ impl Gmcp {
             .visible_connections(call.principal.reach())
             .await
             .map_err(db_err)?;
-        let accounts: Vec<dto::AccountOut> =
-            connections.iter().map(dto::AccountOut::from).collect();
+        let accounts: Vec<dto::AccountOut> = connections
+            .iter()
+            .map(|c| dto::AccountOut::new(c, call.tz))
+            .collect();
         let note = if accounts.is_empty() {
             format!(
                 "This token can reach no Google account. The person connects one at {}",
@@ -313,7 +332,12 @@ impl Gmcp {
         } else {
             "Pass one of these labels as `account` to every other tool".into()
         };
-        Ok(Json(dto::AccountsOut { accounts, note }))
+        Ok(Json(dto::AccountsOut {
+            accounts,
+            timezone: call.tz.name().to_string(),
+            now: dto::at_zone(Utc::now(), call.tz),
+            note,
+        }))
     }
 }
 
@@ -445,7 +469,7 @@ impl ServerHandler for Gmcp {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Null);
-        let call = Call::new(principal.clone());
+        let call = Call::new(principal.clone(), self.state.config.timezone);
         let result = match self.authorise(&name, &principal) {
             Err(e) => Err(e),
             Ok(()) => {
