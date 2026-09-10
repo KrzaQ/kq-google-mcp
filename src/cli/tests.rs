@@ -8,9 +8,11 @@ use crate::db::{ClientProfile, Connection, Db, NewConnection, User};
 use crate::domain::seal;
 
 const SECRET: &[u8] = b"a development secret of thirty-two bytes";
+/// The house zone a new user gets, as `GMCP_TIMEZONE` gives it.
+const HOUSE: chrono_tz::Tz = chrono_tz::Europe::Warsaw;
 
 async fn user(db: &Db, subject: &str, email: &str) -> User {
-    db.upsert_user(subject, Some(email), Some(subject))
+    db.upsert_user(subject, Some(email), Some(subject), HOUSE)
         .await
         .unwrap()
 }
@@ -218,4 +220,52 @@ async fn nothing_is_written_when_the_request_is_refused() {
     .await;
     assert!(error.contains("emacs"), "{error}");
     assert!(error.contains("claude-code"), "the valid list: {error}");
+}
+
+#[tokio::test]
+async fn set_timezone_moves_the_person_and_refuses_a_name_that_is_no_zone() {
+    let db = Db::open_memory().await.unwrap();
+    let anna = user(&db, "anna", "anna@example.test").await;
+    assert_eq!(anna.timezone, "Europe/Warsaw");
+
+    super::user::run(
+        &db,
+        super::user::UserCommand::SetTimezone {
+            email: "anna@example.test".into(),
+            timezone: "America/New_York".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_user(anna.id).await.unwrap().timezone,
+        "America/New_York"
+    );
+
+    // The terminal refuses what the portal refuses, in the same words.
+    let error = super::user::run(
+        &db,
+        super::user::UserCommand::SetTimezone {
+            email: "anna@example.test".into(),
+            timezone: "Europe/Warszawa".into(),
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("Europe/Warszawa"), "{error}");
+    assert!(error.contains("Europe/Warsaw"), "{error}");
+
+    // Nobody who has not logged in can be moved, as everywhere else.
+    let error = super::user::run(
+        &db,
+        super::user::UserCommand::SetTimezone {
+            email: "nobody@example.test".into(),
+            timezone: "UTC".into(),
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("never logged in"), "{error}");
 }
