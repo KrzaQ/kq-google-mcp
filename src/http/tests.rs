@@ -1504,3 +1504,38 @@ mod oidc_flow {
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 }
+
+/// Google's consent screen links to both pages, and a person weighing up a
+/// connection must be able to read them without an account here.
+#[tokio::test]
+async fn the_legal_pages_are_public_and_say_what_the_server_does() {
+    let db = Db::open_memory().await.unwrap();
+    let app = strict_app(&db);
+
+    for path in ["/privacy", "/terms"] {
+        let (status, body, headers) = call_bytes(&app, req("GET", path, None, None)).await;
+        assert_eq!(status, StatusCode::OK, "{path} must not need a session");
+        let html = String::from_utf8(body).unwrap();
+        assert!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{path} is a page a person reads"
+        );
+        assert!(html.contains("<h1>"), "{path} has a heading");
+    }
+
+    let (_, body, _) = call_bytes(&app, req("GET", "/privacy", None, None)).await;
+    let privacy = String::from_utf8(body).unwrap();
+    assert!(
+        privacy.contains("never sends email"),
+        "the promise the whole server is built around belongs in the policy"
+    );
+    assert!(
+        privacy.contains("api-services-user-data-policy"),
+        "Google asks that the Limited Use terms be referenced"
+    );
+}

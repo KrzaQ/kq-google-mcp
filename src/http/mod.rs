@@ -11,6 +11,7 @@ pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod handlers;
+pub mod legal;
 pub mod links;
 pub mod oidc;
 mod r#static;
@@ -140,6 +141,11 @@ pub fn router(state: AppState) -> Router {
         // Bearer only, and its own transport: the MCP endpoint shares this
         // state and nothing else with the API.
         .merge(crate::mcp::router(state.clone()))
+        // Public and unauthenticated: Google's consent screen links to both,
+        // and a person deciding whether to connect an account must be able to
+        // read them without one.
+        .route("/privacy", axum::routing::get(legal::privacy))
+        .route("/terms", axum::routing::get(legal::terms))
         .route(
             "/api/openapi.json",
             axum::routing::get(move || async move { openapi_json.clone() }),
