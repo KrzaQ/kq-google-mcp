@@ -25,10 +25,41 @@ const STYLE: &str = concat!(
     "body { margin: 0 auto; padding: 2rem 1.25rem 4rem; max-width: 42rem;",
     " font: 16px/1.6 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }",
     "h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }",
+    "body > svg { width: 132px; height: auto; display: block; margin-bottom: 1rem; }",
     "h2 { font-size: 1.1rem; margin-top: 2rem; }",
     "p, li { margin: 0.6rem 0; }",
     ".updated { color: #6b7280; font-size: 0.9rem; margin-top: 0; }",
     "footer { margin-top: 3rem; font-size: 0.9rem; color: #6b7280; }"
+);
+
+/// The house mark, with the Q repainted in Google's four colours. Inline so
+/// the page needs no second request and no asset pipeline.
+const LOGO: &str = concat!(
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 -6 2481 1628\" fill-rule=\"evenodd",
+    "\" clip-rule=\"evenodd\"><defs><linearGradient id=\"kqk\" gradientUnits=\"userSpaceOnUse",
+    "\" gradientTransform=\"matrix(17.6586,61.4782,-61.4782,17.6586,1168.04,1339.44)\" x1=\"0",
+    "\" y1=\"0\" x2=\"1\" y2=\"0\"><stop offset=\"0\" stop-color=\"#EF7625\"/><stop offset=\"",
+    "1\" stop-color=\"#ED2222\"/></linearGradient><clipPath id=\"qt\"><path d=\"M1187.19,1376",
+    ".08 L1045.77,1234.66 L1328.61,1234.66 Z\"/></clipPath><clipPath id=\"qr\"><path d=\"M118",
+    "7.19,1376.08 L1328.61,1234.66 L1328.61,1517.50 Z\"/></clipPath><clipPath id=\"qb\"><path",
+    " d=\"M1187.19,1376.08 L1328.61,1517.50 L1045.77,1517.50 Z\"/></clipPath><clipPath id=\"q",
+    "l\"><path d=\"M1187.19,1376.08 L1045.77,1517.50 L1045.77,1234.66 Z\"/></clipPath></defs>",
+    "<g transform=\"translate(0,-738.189)\"><g transform=\"matrix(20.8175,0,0,20.8175,-22865,",
+    "-27101.3)\"><path d=\"m 1098.35,1337.31 h 12.35 v 63.61 h -12.35 z\" fill=\"url(#kqk)\"/",
+    "><path d=\"m 1110.7,1369.12 27.36,-31.81 h 15.83 l -27.36,31.81 27.36,31.8 h -15.83 z\" ",
+    "fill=\"url(#kqk)\"/></g><g transform=\"matrix(20.8175,0,0,20.8175,-22896.2,-27101.3)\"><",
+    "g clip-path=\"url(#qt)\"><path d=\"M1155.39,1337.31L1219,1337.31L1219,1414.85L1187.19,14",
+    "00.92L1155.39,1400.92L1155.39,1337.31ZM1167.73,1349.65L1206.66,1349.65L1206.66,1397.11L1",
+    "187.19,1388.59L1167.73,1388.59L1167.73,1349.65Z\" fill=\"#4285F4\"/></g><g clip-path=\"u",
+    "rl(#qr)\"><path d=\"M1155.39,1337.31L1219,1337.31L1219,1414.85L1187.19,1400.92L1155.39,1",
+    "400.92L1155.39,1337.31ZM1167.73,1349.65L1206.66,1349.65L1206.66,1397.11L1187.19,1388.59L",
+    "1167.73,1388.59L1167.73,1349.65Z\" fill=\"#EA4335\"/></g><g clip-path=\"url(#qb)\"><path",
+    " d=\"M1155.39,1337.31L1219,1337.31L1219,1414.85L1187.19,1400.92L1155.39,1400.92L1155.39,",
+    "1337.31ZM1167.73,1349.65L1206.66,1349.65L1206.66,1397.11L1187.19,1388.59L1167.73,1388.59",
+    "L1167.73,1349.65Z\" fill=\"#FBBC05\"/></g><g clip-path=\"url(#ql)\"><path d=\"M1155.39,1",
+    "337.31L1219,1337.31L1219,1414.85L1187.19,1400.92L1155.39,1400.92L1155.39,1337.31ZM1167.7",
+    "3,1349.65L1206.66,1349.65L1206.66,1397.11L1187.19,1388.59L1167.73,1388.59L1167.73,1349.6",
+    "5Z\" fill=\"#34A853\"/></g></g></g></svg>",
 );
 
 const UPDATED: &str = "Last updated 10 September 2026.";
@@ -169,7 +200,7 @@ pub async fn terms() -> Response {
 pub async fn about() -> Response {
     let body = format!(
         concat!(
-            "<h1>{app}</h1>",
+            "{logo}<h1>{app}</h1>",
             "<p class=\"updated\">A private tool for connecting Google ",
             "accounts to chat assistants.</p>",
             "<h2>What it does</h2>",
@@ -211,6 +242,7 @@ pub async fn about() -> Response {
             "<p>Questions go to {contact}.</p>"
         ),
         app = APP_NAME,
+        logo = LOGO,
         contact = CONTACT
     );
     page("About", &body)

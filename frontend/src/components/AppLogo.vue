@@ -1,8 +1,26 @@
 <script setup lang="ts">
-// The mark: a rounded tile with a locked door, which is what the portal is —
-// the way in to accounts it keeps the keys to. Same drawing as
-// public/favicon.svg.
+// The kq mark with its Q repainted in Google's four colours, one to a side.
+// The silhouette is the house logo, untouched; only the Q's fill says which
+// of the house tools this one is. Same drawing as public/favicon.svg.
+//
+// Each instance needs its own clip-path ids, because ids are global to the
+// document and a second copy would otherwise clip against the first one's.
+let seq = 0
+const uid = `kq${(seq += 1)}`
 withDefaults(defineProps<{ size?: number; wordmark?: boolean }>(), { size: 28, wordmark: true })
+
+const Q =
+  'M1155.39,1337.31L1219,1337.31L1219,1414.85L1187.19,1400.92L1155.39,1400.92L1155.39,1337.31Z' +
+  'M1167.73,1349.65L1206.66,1349.65L1206.66,1397.11L1187.19,1388.59L1167.73,1388.59L1167.73,1349.65Z'
+
+// Quarter wedges from the middle of the Q, so every side of the ring is one
+// flat colour and the seams fall on the corner diagonals.
+const sides = [
+  { id: 'qt', wedge: 'M1187.19,1376.08 L1045.77,1234.66 L1328.61,1234.66 Z', fill: '#4285F4' },
+  { id: 'qr', wedge: 'M1187.19,1376.08 L1328.61,1234.66 L1328.61,1517.50 Z', fill: '#EA4335' },
+  { id: 'qb', wedge: 'M1187.19,1376.08 L1328.61,1517.50 L1045.77,1517.50 Z', fill: '#FBBC05' },
+  { id: 'ql', wedge: 'M1187.19,1376.08 L1045.77,1517.50 L1045.77,1234.66 Z', fill: '#34A853' },
+]
 </script>
 
 <template>
@@ -10,22 +28,23 @@ withDefaults(defineProps<{ size?: number; wordmark?: boolean }>(), { size: 28, w
     <svg
       :width="size"
       :height="size"
-      viewBox="0 0 64 64"
+      viewBox="911.7 -99.2 1812.4 1812.4"
       xmlns="http://www.w3.org/2000/svg"
+      style="fill-rule: evenodd; clip-rule: evenodd"
       aria-hidden="true"
     >
       <defs>
-        <linearGradient id="gmcp-tile" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#3a8ee0" />
-          <stop offset="1" stop-color="#1b4f9c" />
-        </linearGradient>
+        <clipPath v-for="s in sides" :id="`${uid}-${s.id}`" :key="s.id">
+          <path :d="s.wedge" />
+        </clipPath>
       </defs>
-      <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#gmcp-tile)" />
-      <path
-        fill="#ffffff"
-        fill-rule="evenodd"
-        d="M32 11c-7.7 0-14 6.3-14 14v28h28V25c0-7.7-6.3-14-14-14Zm0 19a4.5 4.5 0 0 0-2.5 8.2V44h5v-6.8A4.5 4.5 0 0 0 32 30Z"
-      />
+      <g transform="translate(0,-738.189)">
+        <g transform="matrix(20.8175,0,0,20.8175,-22896.2,-27101.3)">
+          <g v-for="s in sides" :key="s.id" :clip-path="`url(#${uid}-${s.id})`">
+            <path :d="Q" :fill="s.fill" />
+          </g>
+        </g>
+      </g>
     </svg>
     <span v-if="wordmark" class="text-lg font-semibold tracking-tight text-fg">gmcp</span>
   </span>
