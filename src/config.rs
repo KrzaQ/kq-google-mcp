@@ -15,6 +15,9 @@ const DEFAULT_DATABASE: &str = "./data/gmcp.db";
 const DEFAULT_API_BASE: &str = "https://www.googleapis.com";
 const DEFAULT_OAUTH_BASE: &str = "https://oauth2.googleapis.com";
 const DEFAULT_ACCOUNTS_BASE: &str = "https://accounts.google.com";
+/// The zone a deployment works in when `GMCP_TIMEZONE` is unset: what a new
+/// user gets, and what stands in for a user whose own zone no longer parses.
+const DEFAULT_TIMEZONE: &str = "Europe/Warsaw";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,6 +31,10 @@ pub struct Config {
     pub auth: AuthMode,
     pub google: GoogleConfig,
     pub auto_migrate: bool,
+    /// The house zone. Every user starts here, and a user whose own zone is
+    /// missing falls back to it; nothing is ever rendered in UTC because it
+    /// happened to be stored that way.
+    pub timezone: chrono_tz::Tz,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +114,16 @@ fn base(vars: Vars, name: &str, default: &str) -> Result<url::Url> {
         .with_context(|| format!("{name} must be an absolute URL"))
 }
 
+/// `GMCP_TIMEZONE`, an IANA name, `Europe/Warsaw` when unset. A typo stops
+/// the boot rather than the first tool call: a server that renders times in
+/// the wrong zone is worse than one that does not start.
+fn timezone(vars: Vars) -> Result<chrono_tz::Tz> {
+    let name = vars("GMCP_TIMEZONE").unwrap_or_else(|| DEFAULT_TIMEZONE.into());
+    name.trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GMCP_TIMEZONE: {e}"))
+}
+
 /// `GMCP_DATABASE`, the path every subcommand opens.
 pub fn database_from_env() -> PathBuf {
     database(&var)
@@ -167,6 +184,7 @@ impl Config {
             auth,
             google: GoogleConfig::from_vars(vars)?,
             auto_migrate: vars("GMCP_AUTO_MIGRATE").as_deref() != Some("0"),
+            timezone: timezone(vars)?,
         })
     }
 
@@ -188,13 +206,15 @@ impl Config {
             ),
         };
         format!(
-            "bind {}, public url {}, database {}, auth {auth}, {}, session secret {} bytes, auto-migrate {}",
+            "bind {}, public url {}, database {}, auth {auth}, {}, session secret {} bytes, \
+             auto-migrate {}, timezone {}",
             self.bind,
             self.public_url,
             self.database.display(),
             self.google.describe(),
             self.secret.len(),
             self.auto_migrate,
+            self.timezone,
         )
     }
 }
@@ -279,6 +299,22 @@ mod tests {
     }
 
     #[test]
+    fn the_house_zone_defaults_to_warsaw_and_a_typo_stops_the_boot() {
+        assert_eq!(timezone(&vars(&[])).unwrap(), chrono_tz::Europe::Warsaw);
+        assert_eq!(
+            timezone(&vars(&[("GMCP_TIMEZONE", " America/New_York ")])).unwrap(),
+            chrono_tz::America::New_York
+        );
+        // A name the tz database does not know would render every time in the
+        // wrong place, so the process refuses to start rather than finding out
+        // on the first tool call.
+        let error = timezone(&vars(&[("GMCP_TIMEZONE", "Europe/Warszawa")]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GMCP_TIMEZONE"), "{error}");
+    }
+
+    #[test]
     fn dev_mode_will_not_start_on_the_default_bind() {
         let dev = [
             ("GMCP_AUTH", "dev"),
@@ -296,5 +332,12 @@ mod tests {
         assert!(config.auto_migrate);
         // Dev mode with no GMCP_SECRET gets a random one, per process.
         assert_eq!(config.secret.len(), 64);
+        // The startup line says which clock the deployment keeps.
+        assert_eq!(config.timezone, chrono_tz::Europe::Warsaw);
+        assert!(
+            config.summary().contains("timezone Europe/Warsaw"),
+            "{}",
+            config.summary()
+        );
     }
 }

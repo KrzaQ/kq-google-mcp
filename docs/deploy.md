@@ -205,7 +205,11 @@ place, with `.env` and `data/` next to it.
 ## 5. First login and connecting accounts
 
 Open `https://google-mcp.int.krzaq.cc` and log in through authentik. The first
-login creates the user row that `X-Gmcp-User` later names.
+login creates the user row that `X-Gmcp-User` later names, with the house time
+zone from `GMCP_TIMEZONE` (`Europe/Warsaw` unless `.env` says otherwise). The
+home page shows that zone and lets the person change it; every time the portal
+and the MCP tools show is on that clock, and a time given to a tool without an
+offset is read on it.
 
 On **Connections** → *Connect account*:
 
@@ -333,7 +337,8 @@ docker compose logs -f gmcp                    # the log; tracing on stderr, RUS
 docker compose ps                              # health from the container's own /api/health probe
 docker compose exec gmcp gmcp token list       # tokens, their scopes and last use
 docker compose exec gmcp gmcp connection list  # every connection, its services and health
-docker compose exec gmcp gmcp user list        # who has logged in, and when last
+docker compose exec gmcp gmcp user list        # who has logged in, when last, and in which zone
+docker compose exec gmcp gmcp user set-timezone someone@example.com Europe/London
 ```
 
 **Pruning.** Expired download links and old audit rows:

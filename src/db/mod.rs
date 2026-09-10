@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult,
@@ -183,16 +184,21 @@ impl Db {
 
     /// Login: the row is keyed by the OIDC subject, and email and name are
     /// refreshed from the token when the provider offers them.
+    ///
+    /// `house` is the deployment's zone, and it is written on insert only: a
+    /// person who has chosen their own zone keeps it across every later login,
+    /// however the house zone changes.
     pub async fn upsert_user(
         &self,
         subject: &str,
         email: Option<&str>,
         name: Option<&str>,
+        house: Tz,
     ) -> DbResult<User> {
         let now = Utc::now();
         sqlx::query_as(
-            "INSERT INTO users (subject, email, name, created_at, last_login_at) \
-             VALUES (?, ?, ?, ?, ?) \
+            "INSERT INTO users (subject, email, name, timezone, created_at, last_login_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT (subject) DO UPDATE SET \
                email = COALESCE(excluded.email, users.email), \
                name = COALESCE(excluded.name, users.name), \
@@ -202,11 +208,24 @@ impl Db {
         .bind(subject.trim())
         .bind(email.map(str::trim))
         .bind(name.map(str::trim))
+        .bind(house.name())
         .bind(now)
         .bind(now)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| conflict_or(e, || "that email already belongs to another account".into()))
+    }
+
+    /// The person's own clock, as the portal and the CLI set it. The name is
+    /// a parsed `Tz` rather than a string, so nothing that cannot be resolved
+    /// ever reaches the column.
+    pub async fn set_user_timezone(&self, id: i64, timezone: Tz) -> DbResult<User> {
+        sqlx::query_as("UPDATE users SET timezone = ? WHERE id = ? RETURNING *")
+            .bind(timezone.name())
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(not_found_or)
     }
 
     pub async fn get_user(&self, id: i64) -> DbResult<User> {

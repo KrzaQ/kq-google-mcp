@@ -48,7 +48,12 @@ mod tests {
     async fn a_row_carries_the_person_and_the_stripped_arguments() {
         let db = Db::open_memory().await.unwrap();
         let user = db
-            .upsert_user("subject", Some("anna@example.test"), None)
+            .upsert_user(
+                "subject",
+                Some("anna@example.test"),
+                None,
+                chrono_tz::Europe::Warsaw,
+            )
             .await
             .unwrap();
         record(

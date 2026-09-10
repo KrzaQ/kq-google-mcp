@@ -5,6 +5,7 @@
 //! `Vec<String>` behind `#[sqlx(json)]`, stored as JSON arrays.
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -118,6 +119,9 @@ pub struct User {
     pub subject: String,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// An IANA name. Every time this person is shown is rendered on this
+    /// clock, and every time they type without an offset is read on it.
+    pub timezone: String,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
 }
@@ -129,6 +133,13 @@ impl User {
             .as_deref()
             .or(self.email.as_deref())
             .unwrap_or(&self.subject)
+    }
+
+    /// The person's clock. A name the tz database no longer knows falls back
+    /// to the house zone: a stale row must not fail every call this person
+    /// makes.
+    pub fn zone(&self, house: Tz) -> Tz {
+        self.timezone.parse().unwrap_or(house)
     }
 }
 

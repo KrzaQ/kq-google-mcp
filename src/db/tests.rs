@@ -3,8 +3,12 @@
 //! real thing is cheaper than pretending.
 
 use chrono::{DateTime, Duration, Utc};
+use chrono_tz::Tz;
 
 use super::*;
+
+/// The house zone every test user starts in, as `GMCP_TIMEZONE` gives it.
+const HOUSE: Tz = chrono_tz::Europe::Warsaw;
 
 fn utc(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -40,11 +44,11 @@ struct World {
 async fn world() -> World {
     let db = Db::open_memory().await.unwrap();
     let alice = db
-        .upsert_user("sub-alice", Some("alice@example.com"), Some("Alice"))
+        .upsert_user("sub-alice", Some("alice@example.com"), Some("Alice"), HOUSE)
         .await
         .unwrap();
     let bob = db
-        .upsert_user("sub-bob", Some("bob@example.com"), Some("Bob"))
+        .upsert_user("sub-bob", Some("bob@example.com"), Some("Bob"), HOUSE)
         .await
         .unwrap();
 
@@ -189,7 +193,10 @@ async fn users_are_keyed_by_subject_and_found_by_email() {
     let db = &w.db;
 
     // A second login refreshes what the provider knows and keeps the rest.
-    let again = db.upsert_user("sub-alice", None, None).await.unwrap();
+    let again = db
+        .upsert_user("sub-alice", None, None, HOUSE)
+        .await
+        .unwrap();
     assert_eq!(again.id, w.alice.id);
     assert_eq!(again.email.as_deref(), Some("alice@example.com"));
     assert_eq!(again.name.as_deref(), Some("Alice"));
@@ -969,4 +976,42 @@ async fn prune_removes_expired_links_and_old_log_rows_and_nothing_else() {
         db.prune(now, Duration::days(180)).await.unwrap(),
         Pruned::default()
     );
+}
+
+#[tokio::test]
+async fn a_person_starts_in_the_house_zone_and_keeps_the_one_they_chose() {
+    let w = world().await;
+    let db = &w.db;
+    assert_eq!(w.alice.timezone, "Europe/Warsaw");
+    assert_eq!(w.alice.zone(HOUSE), HOUSE);
+
+    let moved = db
+        .set_user_timezone(w.alice.id, chrono_tz::America::New_York)
+        .await
+        .unwrap();
+    assert_eq!(moved.timezone, "America/New_York");
+
+    // Logging in again must not undo the choice, whatever the house zone is,
+    // or every login would drag the person back to Warsaw.
+    let again = db
+        .upsert_user("sub-alice", None, None, chrono_tz::Europe::Lisbon)
+        .await
+        .unwrap();
+    assert_eq!(again.timezone, "America/New_York");
+    assert_eq!(again.zone(HOUSE), chrono_tz::America::New_York);
+
+    // Somebody new gets whatever the house zone is at the time.
+    let fresh = db
+        .upsert_user("sub-carol", Some("carol@example.com"), None, chrono_tz::UTC)
+        .await
+        .unwrap();
+    assert_eq!(fresh.timezone, "UTC");
+
+    // A row whose zone the tz database no longer knows falls back rather than
+    // failing every call that person makes.
+    let stale = User {
+        timezone: "Mars/Olympus".into(),
+        ..fresh
+    };
+    assert_eq!(stale.zone(HOUSE), HOUSE);
 }

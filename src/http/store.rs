@@ -64,7 +64,7 @@ mod tests {
     async fn the_store_hands_out_the_sealed_blob_and_records_a_dead_grant() {
         let db = Db::open_memory().await.unwrap();
         let user = db
-            .upsert_user("s", Some("a@example.test"), None)
+            .upsert_user("s", Some("a@example.test"), None, chrono_tz::Europe::Warsaw)
             .await
             .unwrap();
         let connection = db
