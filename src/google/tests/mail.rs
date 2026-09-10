@@ -590,13 +590,18 @@ fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
         .collect();
     assert!(endpoints.len() >= 10, "{endpoints:?}");
     for endpoint in &endpoints {
-        // A send endpoint spells `send` as a whole path segment: Google has
-        // `messages/send` and `drafts/send` and nothing else. `settings/sendAs`
-        // reads which addresses the account may write as and sends nothing.
-        assert!(
-            !endpoint.contains("/send\"") && !endpoint.contains("/send/"),
-            "{endpoint}"
-        );
+        // `send` as a path segment is Gmail's send: `messages/send` and
+        // `drafts/send`, and with an upload it carries a query string
+        // (`/send?uploadType=multipart`), so matching a trailing quote is not
+        // enough. The only thing allowed to follow `/send` is `As`, which is
+        // `settings/sendAs`, a read of which addresses the account may write
+        // as. It sends nothing.
+        let mut rest = *endpoint;
+        while let Some(i) = rest.find("/send") {
+            let after = &rest[i + "/send".len()..];
+            assert!(after.starts_with("As"), "{endpoint}");
+            rest = after;
+        }
         assert!(!endpoint.contains("trash"), "{endpoint}");
         assert!(!endpoint.contains("batchDelete"), "{endpoint}");
         // The one delete in the whole server is the undo for a draft.
