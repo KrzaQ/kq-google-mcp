@@ -26,6 +26,44 @@ export function claudeCodeSnippet(origin: string, secret: string): Snippet {
   }
 }
 
+/**
+ * The name sub rosa knows the secret by. Named after the service rather than
+ * the token, as `KQ_SUPPORT_TOKEN` is, so one machine has one name for it
+ * however many tokens get minted over the years.
+ */
+export const ROSA_SECRET = 'KQ_GMCP_TOKEN'
+
+/**
+ * The same registration, with the token held by sub rosa instead of written
+ * into `~/.claude.json`. `rosa exec` puts the secret in the environment of the
+ * bridge process and nowhere else.
+ */
+export function subRosaSnippet(origin: string): Snippet {
+  const entry = {
+    type: 'stdio',
+    command: 'rosa',
+    args: [
+      'exec',
+      ROSA_SECRET,
+      '--',
+      'sh',
+      '-c',
+      `exec npx -y mcp-remote ${mcpUrl(origin)} --header "Authorization: Bearer $${ROSA_SECRET}"`,
+    ],
+  }
+  return {
+    id: 'claude-code-rosa',
+    title: 'Claude Code, token held by sub rosa',
+    language: 'sh',
+    body: [
+      `rosa add ${ROSA_SECRET} --policy auto   # paste the token above when it asks`,
+      '',
+      `claude mcp add-json --scope user gmcp '${JSON.stringify(entry)}'`,
+    ].join('\n'),
+    note: 'Keeps the token out of the config file. Needs a running rosa serve.',
+  }
+}
+
 export function openCodeSnippet(origin: string, secret: string): Snippet {
   const config = {
     mcp: {
@@ -64,6 +102,7 @@ export function openWebUiSnippet(origin: string, secret: string): Snippet {
 export function snippetsFor(origin: string, secret: string): Snippet[] {
   return [
     claudeCodeSnippet(origin, secret),
+    subRosaSnippet(origin),
     openCodeSnippet(origin, secret),
     openWebUiSnippet(origin, secret),
   ]
