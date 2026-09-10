@@ -3,7 +3,8 @@
 //! can click. Nothing here writes to Drive; the two tools that create files
 //! live in `docs` and `sheets`, where they need confirmation.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData};
@@ -31,7 +32,9 @@ pub struct DriveSearchParam {
     /// An exact MIME type, e.g. "application/pdf" or
     /// "application/vnd.google-apps.spreadsheet"
     pub mime_type: Option<String>,
-    /// Only files changed after this instant, RFC 3339
+    /// Only files changed after this time. An RFC 3339 instant with an
+    /// offset, or a plain 2026-09-08T14:00 or 2026-09-08 on the person's own
+    /// clock
     pub modified_after: Option<String>,
     /// How many files to return; default 20, at most 100
     pub max: Option<u32>,
@@ -72,11 +75,16 @@ impl Gmcp {
         Extension(call): Extension<Call>,
     ) -> Result<Json<dto::FilesOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Drive).await?;
+        let after = p
+            .modified_after
+            .as_deref()
+            .map(|a| instant(a, call.tz))
+            .transpose()?;
         let search = drive::Search {
             query: p.query,
             name_contains: p.name_contains,
             mime_type: p.mime_type,
-            modified_after: p.modified_after.as_deref().map(instant).transpose()?,
+            modified_after: after.as_ref().map(|m| m.at),
             max: Some(capped(p.max, 20, 100)),
         };
         let files = drive::list(&self.google()?.client, connection.id, &search)
@@ -85,7 +93,11 @@ impl Gmcp {
         Ok(Json(dto::FilesOut {
             account: connection.label,
             count: files.len(),
-            files: files.into_iter().map(Into::into).collect(),
+            files: files
+                .into_iter()
+                .map(|f| dto::FileOut::new(f, call.tz))
+                .collect(),
+            note: after.and_then(|m| m.note),
         }))
     }
 
@@ -99,7 +111,7 @@ impl Gmcp {
         let file = drive::get(&self.google()?.client, connection.id, p.file_id.trim())
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(file.into()))
+        Ok(Json(dto::FileOut::new(file, call.tz)))
     }
 
     #[tool(
@@ -140,7 +152,7 @@ impl Gmcp {
         )
         .await
         .map_err(api_err)?;
-        Ok(Json(link_out(minted)))
+        Ok(Json(link_out(minted, call.tz)))
     }
 
     #[tool(
@@ -182,7 +194,7 @@ impl Gmcp {
         )
         .await
         .map_err(api_err)?;
-        Ok(Json(link_out(minted)))
+        Ok(Json(link_out(minted, call.tz)))
     }
 
     #[tool(
@@ -256,14 +268,116 @@ impl Gmcp {
     }
 }
 
-/// An RFC 3339 instant from an argument, refused by name rather than by
-/// whatever chrono says.
-pub(super) fn instant(value: &str) -> Result<DateTime<Utc>, ErrorData> {
-    DateTime::parse_from_rfc3339(value.trim())
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|_| {
-            bad(format!(
-                "{value:?} is not an RFC 3339 instant; write it as 2026-09-08T14:00:00Z"
-            ))
-        })
+/// A time argument, once it has been read, and the one thing the tool's reply
+/// has to say about how it was read.
+#[derive(Debug)]
+pub(super) struct Moment {
+    pub at: DateTime<Utc>,
+    /// Set only when the wall-clock time given happens twice, because the
+    /// clock went back that night. The earlier of the two was taken, and the
+    /// tool says so rather than leaving the person to wonder which hour it
+    /// booked.
+    pub note: Option<String>,
+}
+
+/// A time from an argument, read on the acting person's clock. Three shapes,
+/// tried in this order:
+///
+/// * RFC 3339 with an explicit offset (`2026-09-11T15:00:00+02:00`, `...Z`),
+///   which is honoured exactly as written;
+/// * a wall-clock time with no offset (`2026-09-11T15:00:00`,
+///   `2026-09-11T15:00`, a space in place of the `T`), read on `tz`;
+/// * a bare date (`2026-09-11`), which is the start of that day on `tz`.
+///
+/// The two clock changes are decided here, once, for every tool. A time that
+/// the spring-forward skipped never happened, so it is refused and the gap is
+/// named: booking an hour that does not exist would silently become a
+/// different hour. A time the autumn fold repeats happened twice, so the
+/// earlier of the two is taken and [`Moment::note`] says so.
+pub(super) fn instant(value: &str, tz: Tz) -> Result<Moment, ErrorData> {
+    let value = value.trim();
+    if let Ok(d) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Moment {
+            at: d.with_timezone(&Utc),
+            note: None,
+        });
+    }
+    let wall = wall_clock(value).ok_or_else(|| {
+        bad(format!(
+            "{value:?} is not a time. Write it on the person's own clock as \
+             2026-09-08T14:00, 2026-09-08 14:00 or 2026-09-08 (which is the start of that day in \
+             {tz}), or with an explicit offset — 2026-09-08T14:00:00+02:00 — which is used exactly \
+             as written"
+        ))
+    })?;
+    match tz.from_local_datetime(&wall) {
+        LocalResult::Single(at) => Ok(Moment {
+            at: at.with_timezone(&Utc),
+            note: None,
+        }),
+        LocalResult::Ambiguous(earlier, _) => Ok(Moment {
+            at: earlier.with_timezone(&Utc),
+            note: Some(format!(
+                "{value} happens twice in {tz} that night, because the clock goes back an hour; \
+                 the earlier of the two, {}, was used",
+                earlier.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+            )),
+        }),
+        LocalResult::None => Err(bad(match gap(wall, tz) {
+            Some((from, to)) => format!(
+                "{value:?} never happens in {tz}: the clock jumps from {} to {} on {}, so that \
+                 hour does not exist. Give a time outside the gap, or write it with an explicit \
+                 offset",
+                from.format("%H:%M"),
+                to.format("%H:%M"),
+                to.format("%Y-%m-%d"),
+            ),
+            None => format!("{value:?} never happens in {tz}: the clock skips it"),
+        })),
+    }
+}
+
+/// A wall-clock time with no offset, in the shapes a model writes it.
+fn wall_clock(value: &str) -> Option<NaiveDateTime> {
+    for shape in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(d) = NaiveDateTime::parse_from_str(value, shape) {
+            return Some(d);
+        }
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)
+}
+
+/// The local times a spring-forward skipped, so the refusal can name them.
+/// The transition is somewhere within a day of a time that does not exist, and
+/// the offset before it differs from the offset after: a bisection on that
+/// difference finds the second it happens.
+fn gap(wall: NaiveDateTime, tz: Tz) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let offset = |at: DateTime<Utc>| tz.offset_from_utc_datetime(&at.naive_utc()).fix();
+    let mut before = Utc.from_utc_datetime(&(wall - Duration::days(1)));
+    let mut after = Utc.from_utc_datetime(&(wall + Duration::days(1)));
+    if offset(before) == offset(after) {
+        return None;
+    }
+    while after - before > Duration::seconds(1) {
+        let middle = before + (after - before) / 2;
+        if offset(middle) == offset(before) {
+            before = middle;
+        } else {
+            after = middle;
+        }
+    }
+    // `before` is the last second of the old offset, so the gap starts one
+    // second after it *on the old clock*; converting it first would show the
+    // new offset and name the same time twice.
+    Some((
+        before.with_timezone(&tz).naive_local() + Duration::seconds(1),
+        after.with_timezone(&tz).naive_local(),
+    ))
 }
