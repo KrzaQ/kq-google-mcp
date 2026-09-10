@@ -9,13 +9,14 @@
 //! would change something on other people's calendars.
 
 use chrono::{Duration, NaiveDate, Utc};
+use chrono_tz::Tz;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::ErrorData;
 use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
-use super::drive::instant;
+use super::drive::{Moment, instant};
 use super::dto::{self, Confirmable, PreviewOut};
 use super::{Call, Gmcp, bad, capped, refuse};
 use crate::domain::scope::Service;
@@ -28,9 +29,11 @@ const DEFAULT_DAYS: i64 = 7;
 pub struct ListEventsParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
-    /// Start of the window, RFC 3339; now by default
+    /// Start of the window; now by default. RFC 3339 with an offset, or a
+    /// plain 2026-09-11T09:00 or 2026-09-11 on the person's own clock
     pub from: Option<String>,
-    /// End of the window, RFC 3339; seven days after `from` by default
+    /// End of the window; seven days after `from` by default. Same shapes as
+    /// `from`
     pub to: Option<String>,
     /// The calendar's id, as calendar_list reports it; the primary one by default
     pub calendar_id: Option<String>,
@@ -53,10 +56,12 @@ pub struct CreateEventParam {
     pub account: String,
     /// What the event is called
     pub title: String,
-    /// RFC 3339, or YYYY-MM-DD when all_day is true
+    /// When it starts, on the person's own clock: 2026-09-11T15:00, or RFC
+    /// 3339 with an offset to say exactly which instant. YYYY-MM-DD when
+    /// all_day is true
     pub start: String,
-    /// RFC 3339, or YYYY-MM-DD when all_day is true — and then it is the day
-    /// *after* the last one, as Calendar counts it
+    /// When it ends, in the same shapes as `start`. With all_day it is a date,
+    /// and then it is the day *after* the last one, as Calendar counts it
     pub end: String,
     /// The calendar's id; the primary one by default
     pub calendar_id: Option<String>,
@@ -120,8 +125,10 @@ impl Gmcp {
 
     #[tool(
         description = "Events in a window, earliest first, with recurring ones expanded into \
-                       their occurrences. Instants are RFC 3339; leaving the window out means the \
-                       next seven days on the primary calendar."
+                       their occurrences. Times come back on the person's own clock, with the \
+                       offset in force that day, and a window given without an offset is read on \
+                       that same clock; leaving the window out means the next seven days on the \
+                       primary calendar."
     )]
     async fn calendar_list_events(
         &self,
@@ -129,12 +136,13 @@ impl Gmcp {
         Extension(call): Extension<Call>,
     ) -> Result<Json<dto::EventsOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Calendar).await?;
+        let mut notes = Vec::new();
         let from = match p.from.as_deref() {
-            Some(f) => instant(f)?,
+            Some(f) => noted(instant(f, call.tz)?, &mut notes),
             None => Utc::now(),
         };
         let to = match p.to.as_deref() {
-            Some(t) => instant(t)?,
+            Some(t) => noted(instant(t, call.tz)?, &mut notes),
             None => from + Duration::days(DEFAULT_DAYS),
         };
         if to < from {
@@ -157,10 +165,14 @@ impl Gmcp {
         Ok(Json(dto::EventsOut {
             account: connection.label,
             calendar_id,
-            from: from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            to: to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            from: dto::at_zone(from, call.tz),
+            to: dto::at_zone(to, call.tz),
             count: events.len(),
-            events: events.into_iter().map(Into::into).collect(),
+            events: events
+                .into_iter()
+                .map(|e| dto::EventOut::new(e, call.tz))
+                .collect(),
+            note: note(notes),
         }))
     }
 
@@ -180,7 +192,7 @@ impl Gmcp {
         )
         .await
         .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(event.into()))
+        Ok(Json(dto::EventOut::new(event, call.tz)))
     }
 
     #[tool(
@@ -202,14 +214,16 @@ impl Gmcp {
             return Err(bad("an event needs a title"));
         }
         let all_day = p.all_day.unwrap_or(false);
-        let start = moment(&p.start, all_day, "start")?;
-        let end = moment(&p.end, all_day, "end")?;
+        let mut notes = Vec::new();
+        let start = moment(&p.start, all_day, "start", call.tz, &mut notes)?;
+        let end = moment(&p.end, all_day, "end", call.tz, &mut notes)?;
         if !p.confirmed {
             let mut details = vec![
                 format!("title: {title}"),
-                format!("from {} to {}", p.start.trim(), p.end.trim()),
+                format!("from {} to {}", said(&start, &p.start), said(&end, &p.end)),
                 format!("calendar: {calendar_id}"),
             ];
+            details.extend(notes.iter().cloned());
             if all_day {
                 details
                     .push("all day; Calendar treats the end date as the day after the last".into());
@@ -245,6 +259,8 @@ impl Gmcp {
             calendar_id,
             "created",
             Some(event),
+            call.tz,
+            notes,
         ))))
     }
 
@@ -269,6 +285,7 @@ impl Gmcp {
             .map_err(|e| self.google_err_for(&connection, e))?;
         refuse_attendees(&existing, "change")?;
         let all_day = p.all_day.unwrap_or(existing.start.date.is_some());
+        let mut notes = Vec::new();
         let draft = EventDraft {
             summary: clean(p.title.clone()),
             description: clean(p.description.clone()),
@@ -276,12 +293,12 @@ impl Gmcp {
             start: p
                 .start
                 .as_deref()
-                .map(|s| moment(s, all_day, "start"))
+                .map(|s| moment(s, all_day, "start", call.tz, &mut notes))
                 .transpose()?,
             end: p
                 .end
                 .as_deref()
-                .map(|s| moment(s, all_day, "end"))
+                .map(|s| moment(s, all_day, "end", call.tz, &mut notes))
                 .transpose()?,
         };
         if draft == EventDraft::default() {
@@ -301,11 +318,15 @@ impl Gmcp {
                 details.push(format!("title becomes {t:?}"));
             }
             if let Some(s) = p.start.as_deref() {
-                details.push(format!("start becomes {}", s.trim()));
+                details.push(format!(
+                    "start becomes {}",
+                    said_opt(draft.start.as_ref(), s)
+                ));
             }
             if let Some(e) = p.end.as_deref() {
-                details.push(format!("end becomes {}", e.trim()));
+                details.push(format!("end becomes {}", said_opt(draft.end.as_ref(), e)));
             }
+            details.extend(notes.iter().cloned());
             if let Some(l) = &draft.location {
                 details.push(format!("location becomes {l:?}"));
             }
@@ -326,6 +347,8 @@ impl Gmcp {
             calendar_id,
             "changed",
             Some(event),
+            call.tz,
+            notes,
         ))))
     }
 
@@ -372,6 +395,8 @@ impl Gmcp {
             calendar_id,
             "deleted",
             None,
+            call.tz,
+            Vec::new(),
         ))))
     }
 }
@@ -399,9 +424,16 @@ fn calendar_id(given: Option<&str>) -> String {
         .to_string()
 }
 
-/// A start or an end, as the two shapes Calendar has: an instant, or a date
-/// for a whole-day event.
-fn moment(value: &str, all_day: bool, field: &str) -> Result<When, ErrorData> {
+/// A start or an end, as the two shapes Calendar has: an instant on the
+/// person's clock, or a date for a whole-day event. Anything the reading of a
+/// time had to decide is added to `notes`, which the reply carries back.
+fn moment(
+    value: &str,
+    all_day: bool,
+    field: &str,
+    tz: Tz,
+    notes: &mut Vec<String>,
+) -> Result<When, ErrorData> {
     let value = value.trim();
     if all_day {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
@@ -411,7 +443,37 @@ fn moment(value: &str, all_day: bool, field: &str) -> Result<When, ErrorData> {
         })?;
         return Ok(When::all_day(value));
     }
-    Ok(When::at(instant(value)?))
+    Ok(When::at(noted(instant(value, tz)?, notes), tz))
+}
+
+/// The instant a time argument named, with whatever the reading had to decide
+/// kept for the reply.
+fn noted(moment: Moment, notes: &mut Vec<String>) -> chrono::DateTime<Utc> {
+    if let Some(n) = moment.note {
+        notes.push(n);
+    }
+    moment.at
+}
+
+fn note(notes: Vec<String>) -> Option<String> {
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// What a preview calls a time: the instant the write will use, spelled out
+/// with its offset, so the person confirms the time the server understood
+/// rather than the string the model typed.
+fn said(when: &When, given: &str) -> String {
+    match &when.date_time {
+        Some(at) => at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        None => given.trim().to_string(),
+    }
+}
+
+fn said_opt(when: Option<&When>, given: &str) -> String {
+    match when {
+        Some(w) => said(w, given),
+        None => given.trim().to_string(),
+    }
 }
 
 fn clean(value: Option<String>) -> Option<String> {
@@ -425,12 +487,15 @@ fn written(
     calendar_id: String,
     what: &str,
     event: Option<calendar::Event>,
+    tz: Tz,
+    mut notes: Vec<String>,
 ) -> dto::EventWriteOut {
+    notes.push("nobody was invited and nobody was notified".into());
     dto::EventWriteOut {
         account,
         calendar_id,
         written: format!("the event was {what}"),
-        event: event.map(Into::into),
-        note: "nobody was invited and nobody was notified".into(),
+        event: event.map(|e| dto::EventOut::new(e, tz)),
+        note: notes.join(" "),
     }
 }

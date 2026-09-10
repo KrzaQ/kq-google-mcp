@@ -10,7 +10,8 @@
 //! attendees an event has, which is what lets a tool refuse to touch a
 //! meeting that has them.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Result, urlencode};
@@ -55,29 +56,39 @@ impl Event {
 }
 
 /// An instant, or a whole day. Calendar uses one of the two and never both.
+///
+/// The instant keeps the offset it was written with rather than being
+/// normalised to UTC, because that offset is half of what `{dateTime,
+/// timeZone}` tells Calendar: the pair says "three in the afternoon in
+/// Warsaw", and Calendar stores that intent. A bare UTC instant with no zone
+/// would come back as a converted time on somebody else's clock.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct When {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_time: Option<DateTime<Utc>>,
+    pub date_time: Option<DateTime<FixedOffset>>,
     /// `YYYY-MM-DD` for an all-day event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
+    /// The IANA name of the zone the time is meant in, sent on every write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_zone: Option<String>,
 }
 
 impl When {
-    pub fn at(instant: DateTime<Utc>) -> Self {
+    /// One instant as the person's own clock shows it: the wall-clock time
+    /// with the offset in force that day, and the zone it belongs to.
+    pub fn at(instant: DateTime<Utc>, tz: Tz) -> Self {
         When {
-            date_time: Some(instant),
+            date_time: Some(instant.with_timezone(&tz).fixed_offset()),
             date: None,
-            time_zone: Some("UTC".to_string()),
+            time_zone: Some(tz.name().to_string()),
         }
     }
 
     /// An all-day event. Calendar's end date is exclusive, which the caller
-    /// has to know; the tool description says so.
+    /// has to know; the tool description says so. A whole day has no zone: it
+    /// is that date wherever the calendar is read.
     pub fn all_day(date: impl Into<String>) -> Self {
         When {
             date_time: None,

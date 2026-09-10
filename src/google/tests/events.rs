@@ -99,11 +99,13 @@ async fn every_event_mutation_notifies_nobody_and_names_no_attendees() {
             chrono::DateTime::parse_from_rfc3339("2026-09-11T08:00:00Z")
                 .unwrap()
                 .into(),
+            chrono_tz::Europe::Warsaw,
         )),
         end: Some(calendar::When::at(
             chrono::DateTime::parse_from_rfc3339("2026-09-11T09:00:00Z")
                 .unwrap()
                 .into(),
+            chrono_tz::Europe::Warsaw,
         )),
         ..Default::default()
     };
