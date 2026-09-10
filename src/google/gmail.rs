@@ -2,7 +2,9 @@
 //! surface, and what is missing is missing on purpose — there is no `send`,
 //! no `trash` and no `delete` on a message anywhere in this file, and the
 //! module's tests grep it to keep it that way. A draft is the deliverable and
-//! the person sends it from Gmail.
+//! the person sends it from Gmail. `settings/sendAs` is the one endpoint here
+//! whose name reads like sending: it lists the addresses the account may write
+//! mail as, and reading it sends nothing.
 //!
 //! Messages come back from Google in `format=full`, which is already
 //! decomposed into MIME parts with an `attachmentId` per attachment — the id
@@ -57,6 +59,9 @@ pub struct Message {
     pub from: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// The `Delivered-To` header, which says which of the account's own
+    /// addresses the mail arrived at. A reply is written from that one.
+    pub delivered_to: Vec<String>,
     pub subject: Option<String>,
     pub snippet: Option<String>,
     pub labels: Vec<String>,
@@ -90,6 +95,51 @@ pub struct InlineImage {
     pub filename: String,
     pub mime_type: String,
     pub size: u64,
+}
+
+/// One address the account may write mail as, as `users.settings.sendAs`
+/// reports it. Gmail rewrites a `From` that is not one of these, so this list
+/// is what the draft tools check an argument against.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SendAs {
+    pub email: String,
+    pub display_name: Option<String>,
+    /// The address Gmail composes with when the person does not choose.
+    pub is_default: bool,
+    /// The Google account's own address, which needs no verification.
+    pub is_primary: bool,
+    /// Google's own word: `accepted`, `pending`, and empty on the primary.
+    pub verification_status: Option<String>,
+    pub reply_to: Option<String>,
+}
+
+/// The verification state Google accepts mail from.
+const VERIFIED: &str = "accepted";
+
+impl SendAs {
+    /// True when Gmail will keep a draft's `From` as written. An alias Google
+    /// has not verified is rewritten to the primary address on send, so the
+    /// draft tools refuse it rather than let that happen quietly.
+    pub fn usable(&self) -> bool {
+        self.is_primary
+            || self
+                .verification_status
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(VERIFIED))
+    }
+
+    /// The header a draft carries: `"Display Name" <address>` when the alias
+    /// has a display name, so the draft reads like one written by hand, and
+    /// the bare address when it does not.
+    pub fn header(&self) -> String {
+        match self.display_name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => {
+                let escaped = name.replace('\\', r"\\").replace('"', "\\\"");
+                format!("\"{escaped}\" <{}>", self.email)
+            }
+            _ => self.email.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -138,7 +188,9 @@ impl DraftRef {
 /// deliberately out of this release.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftContent {
-    /// The connected account; Gmail rewrites it, but RFC 2822 needs it.
+    /// Which of the account's send-as addresses the draft is written as.
+    /// Gmail rewrites anything else, so the MCP layer resolves it against
+    /// [`send_as`] before it gets here.
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -215,7 +267,9 @@ fn same_address(a: &str, b: &str) -> bool {
     bare_address(a).eq_ignore_ascii_case(&bare_address(b))
 }
 
-fn bare_address(value: &str) -> String {
+/// The address inside a header value, with any display name dropped: both
+/// `Sales <sales@example.test>` and `sales@example.test` come out the same.
+pub fn bare_address(value: &str) -> String {
     match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if close > open => value[open + 1..close].trim().to_string(),
         _ => value.trim().to_string(),
@@ -308,6 +362,55 @@ pub async fn get_attachment(
     ))?;
     let wire: WireBody = client.json(connection_id, request).await?;
     decode_body(wire.data.as_deref().unwrap_or_default())
+}
+
+/// The alias an address names, matched on the address alone and without
+/// regard to case, so a bare address and a `Name <address>` form both find it.
+pub fn find_send_as<'a>(list: &'a [SendAs], wanted: &str) -> Option<&'a SendAs> {
+    let wanted = bare_address(wanted);
+    list.iter().find(|s| s.email.eq_ignore_ascii_case(&wanted))
+}
+
+/// What Gmail composes with when nobody chooses: the default alias, the
+/// primary address behind it, and the first entry behind that.
+pub fn default_send_as(list: &[SendAs]) -> Option<&SendAs> {
+    list.iter()
+        .find(|s| s.is_default)
+        .or_else(|| list.iter().find(|s| s.is_primary))
+        .or_else(|| list.first())
+}
+
+/// The account's send-as addresses, read at most once every few minutes per
+/// connection. Drafting a handful of replies must not ask Google for the same
+/// list each time; the cache lives on the client and holds no lock across the
+/// fetch.
+pub async fn send_as(client: &Client, connection_id: i64) -> Result<Vec<SendAs>> {
+    client
+        .send_as_cache()
+        .get_or_fetch(connection_id, list_send_as(client, connection_id))
+        .await
+}
+
+/// `users.settings.sendAs.list`, the addresses this account may write mail as.
+/// `gmail.modify` already grants it, so no connection has to be made again for
+/// this. It is not a way to send anything: the endpoint reads settings.
+pub async fn list_send_as(client: &Client, connection_id: i64) -> Result<Vec<SendAs>> {
+    let request = client
+        .service(GMAIL)
+        .get(&format!("gmail/v1/users/{USER}/settings/sendAs"))?;
+    let wire: WireSendAsList = client.json(connection_id, request).await?;
+    Ok(wire
+        .send_as
+        .into_iter()
+        .map(|s| SendAs {
+            email: s.send_as_email,
+            display_name: s.display_name.filter(|n| !n.trim().is_empty()),
+            is_default: s.is_default,
+            is_primary: s.is_primary,
+            verification_status: s.verification_status.filter(|v| !v.trim().is_empty()),
+            reply_to: s.reply_to_address.filter(|r| !r.trim().is_empty()),
+        })
+        .collect())
 }
 
 /// `users.labels.list`.
@@ -592,6 +695,23 @@ struct WireBody {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+struct WireSendAsList {
+    send_as: Vec<WireSendAs>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireSendAs {
+    send_as_email: String,
+    display_name: Option<String>,
+    is_default: bool,
+    is_primary: bool,
+    verification_status: Option<String>,
+    reply_to_address: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct WireLabelList {
     labels: Vec<WireLabel>,
 }
@@ -641,6 +761,12 @@ impl WireMessage {
         self.payload.as_ref().and_then(|p| p.header(name))
     }
 
+    /// Every value of a header that may appear more than once. `Delivered-To`
+    /// is written once per hop, so the first one is not always the only one.
+    fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.payload.iter().flat_map(move |p| p.header_values(name))
+    }
+
     fn date(&self) -> Option<DateTime<Utc>> {
         let millis: i64 = self.internal_date.as_ref()?.parse().ok()?;
         Utc.timestamp_millis_opt(millis).single()
@@ -682,6 +808,10 @@ impl WireMessage {
             from: self.header("From").map(text_header),
             to: self.header("To").map(address_header).unwrap_or_default(),
             cc: self.header("Cc").map(address_header).unwrap_or_default(),
+            delivered_to: self
+                .header_values("Delivered-To")
+                .flat_map(address_header)
+                .collect(),
             subject: self.header("Subject").map(text_header),
             snippet: self.snippet.clone(),
             labels: self.label_ids.clone(),
@@ -701,6 +831,13 @@ impl WirePart {
         self.headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.headers
+            .iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
             .map(|h| h.value.as_str())
     }
 

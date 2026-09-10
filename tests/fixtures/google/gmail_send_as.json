@@ -1,0 +1,31 @@
+{
+  "sendAs": [
+    {
+      "sendAsEmail": "anna@example.test",
+      "displayName": "Anna Kowalska",
+      "replyToAddress": "",
+      "signature": "",
+      "isPrimary": true,
+      "isDefault": true,
+      "treatAsAlias": false
+    },
+    {
+      "sendAsEmail": "sales@example.test",
+      "displayName": "Anna at Sales",
+      "replyToAddress": "sales@example.test",
+      "signature": "<div>Anna, sales desk</div>",
+      "isDefault": false,
+      "treatAsAlias": true,
+      "verificationStatus": "accepted"
+    },
+    {
+      "sendAsEmail": "old@example.test",
+      "displayName": "Anna (old address)",
+      "replyToAddress": "",
+      "signature": "",
+      "isDefault": false,
+      "treatAsAlias": true,
+      "verificationStatus": "pending"
+    }
+  ]
+}

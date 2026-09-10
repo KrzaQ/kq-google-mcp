@@ -159,7 +159,7 @@ pub async fn delete_connection(
             }
             Err(e) => tracing::warn!("connection {id} cannot be opened to revoke it: {e}"),
         }
-        google.client.tokens().forget(id);
+        google.client.forget(id);
     }
     state.db.delete_connection(id).await?;
     audit::record(
@@ -300,7 +300,7 @@ async fn connect(
                     tracing::error!("storing the reconnected grant: {e}");
                     "not_stored"
                 })?;
-            google.client.tokens().forget(id);
+            google.client.forget(id);
             (updated, AuditKind::Reconnect)
         }
         None => {

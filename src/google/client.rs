@@ -34,6 +34,10 @@ const EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEFAULT_TOKEN_LIFETIME_SECONDS: i64 = 3000;
 /// Neither Google nor a wiremock server should ever need longer than this.
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+/// How long a connection's send-as list is trusted before Google is asked
+/// again. Drafting three replies in a row must not fetch it three times, and
+/// an alias added in Gmail is picked up within this many seconds.
+const SEND_AS_TTL_SECONDS: i64 = 300;
 /// How much of an error response is read before the message is truncated.
 const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 
@@ -285,12 +289,85 @@ struct RefreshResponse {
     expires_in: Option<i64>,
 }
 
+/// One thing Google is asked for per connection, kept for a while.
+///
+/// The lock shape is the token cache's, for the same reason: a
+/// `std::sync::Mutex` guards the map and is held only long enough to clone one
+/// `Arc`, never across an await, and each entry is a `tokio::sync::Mutex` held
+/// across the fetch, so a burst of calls on one connection produces one
+/// request rather than one each. Nothing invalidates an entry; the time to
+/// live is short enough that a change made in Google shows up on its own.
+pub struct Cache<T> {
+    ttl: Duration,
+    entries: SyncMutex<HashMap<i64, Entry<T>>>,
+}
+
+/// One connection's slot, shared by every caller that wants what is in it.
+type Entry<T> = Arc<tokio::sync::Mutex<Option<Fresh<T>>>>;
+
+struct Fresh<T> {
+    value: T,
+    until: DateTime<Utc>,
+}
+
+impl<T: Clone> Cache<T> {
+    pub fn new(ttl_seconds: i64) -> Self {
+        Self {
+            ttl: Duration::seconds(ttl_seconds),
+            entries: SyncMutex::new(HashMap::new()),
+        }
+    }
+
+    fn entry(&self, connection_id: i64) -> Entry<T> {
+        self.entries
+            .lock()
+            .expect("the cache lock is never held across a panic")
+            .entry(connection_id)
+            .or_default()
+            .clone()
+    }
+
+    /// The cached value, or `fetch` awaited and remembered. The future is
+    /// built by the caller and awaited only when the entry is cold.
+    pub async fn get_or_fetch(
+        &self,
+        connection_id: i64,
+        fetch: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let entry = self.entry(connection_id);
+        let mut cached = entry.lock().await;
+        if let Some(fresh) = cached.as_ref()
+            && fresh.until > Utc::now()
+        {
+            return Ok(fresh.value.clone());
+        }
+        let value = fetch.await?;
+        *cached = Some(Fresh {
+            value: value.clone(),
+            until: Utc::now() + self.ttl,
+        });
+        Ok(value)
+    }
+
+    /// Forget a connection, for when it is disconnected.
+    pub fn forget(&self, connection_id: i64) {
+        self.entries
+            .lock()
+            .expect("the cache lock is never held across a panic")
+            .remove(&connection_id);
+    }
+}
+
 /// The Google REST client. Cheap to clone; the token cache is shared.
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     api_base: Url,
     tokens: Arc<TokenSource>,
+    /// The account's send-as addresses, which every draft needs and which
+    /// change about once a year. It is held here, beside the token cache,
+    /// because every clone of the client must share the one copy.
+    send_as: Arc<Cache<Vec<super::gmail::SendAs>>>,
 }
 
 impl Client {
@@ -299,6 +376,7 @@ impl Client {
             http,
             api_base,
             tokens,
+            send_as: Arc::new(Cache::new(SEND_AS_TTL_SECONDS)),
         }
     }
 
@@ -315,6 +393,19 @@ impl Client {
 
     pub fn tokens(&self) -> &Arc<TokenSource> {
         &self.tokens
+    }
+
+    /// Where [`super::gmail::send_as`] keeps what it read.
+    pub fn send_as_cache(&self) -> &Cache<Vec<super::gmail::SendAs>> {
+        &self.send_as
+    }
+
+    /// Forget everything held for a connection: its access token and its
+    /// send-as list. The portal calls this when an account is disconnected or
+    /// connected again.
+    pub fn forget(&self, connection_id: i64) {
+        self.tokens.forget(connection_id);
+        self.send_as.forget(connection_id);
     }
 
     /// An absolute URL for an API path, against the configured base.

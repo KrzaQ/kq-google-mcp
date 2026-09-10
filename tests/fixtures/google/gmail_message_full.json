@@ -15,6 +15,10 @@
     "filename": "",
     "headers": [
       {
+        "name": "Delivered-To",
+        "value": "anna@example.test"
+      },
+      {
         "name": "Message-ID",
         "value": "<CAF7n2sabc123@mail.example.test>"
       },

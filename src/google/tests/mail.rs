@@ -484,6 +484,103 @@ async fn drafts_are_listed_updated_and_deleted_and_nothing_is_ever_sent() {
     }
 }
 
+#[tokio::test]
+async fn the_send_as_list_says_which_addresses_a_draft_may_be_written_as() {
+    let h = harness().await;
+    h.mount_json(
+        "GET",
+        "/gmail/v1/users/me/settings/sendAs",
+        fixture("gmail_send_as.json"),
+    )
+    .await;
+
+    let addresses = gmail::list_send_as(&h.client, CONNECTION).await.unwrap();
+    assert_eq!(addresses.len(), 3);
+
+    let primary = &addresses[0];
+    assert_eq!(primary.email, "anna@example.test");
+    assert!(primary.is_primary && primary.is_default);
+    // The primary needs no verification and is always usable.
+    assert_eq!(primary.verification_status, None);
+    assert!(primary.usable());
+    assert_eq!(primary.header(), "\"Anna Kowalska\" <anna@example.test>");
+
+    let alias = &addresses[1];
+    assert_eq!(alias.email, "sales@example.test");
+    assert!(!alias.is_default);
+    assert_eq!(alias.verification_status.as_deref(), Some("accepted"));
+    assert_eq!(alias.reply_to.as_deref(), Some("sales@example.test"));
+    assert!(alias.usable());
+    assert_eq!(alias.header(), "\"Anna at Sales\" <sales@example.test>");
+
+    // Gmail would rewrite a From Google has not verified, so this one is
+    // listed and refused rather than written.
+    let pending = &addresses[2];
+    assert_eq!(pending.email, "old@example.test");
+    assert_eq!(pending.verification_status.as_deref(), Some("pending"));
+    assert!(!pending.usable());
+
+    assert_eq!(
+        gmail::default_send_as(&addresses).map(|a| a.email.as_str()),
+        Some("anna@example.test")
+    );
+    // An argument finds its alias by address alone, whatever the case and
+    // whether or not it carries a display name.
+    for wanted in [
+        "sales@example.test",
+        "SALES@Example.Test",
+        "Whoever <sales@example.test>",
+    ] {
+        assert_eq!(
+            gmail::find_send_as(&addresses, wanted).map(|a| a.email.as_str()),
+            Some("sales@example.test"),
+            "{wanted}"
+        );
+    }
+    assert!(gmail::find_send_as(&addresses, "nobody@example.test").is_none());
+}
+
+/// Drafting three replies in a row must not ask Gmail for the same settings
+/// three times, so the list is cached per connection.
+#[tokio::test]
+async fn the_send_as_list_is_read_once_per_connection() {
+    let h = harness().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/settings/sendAs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_send_as.json")))
+        .expect(1)
+        .named("the send-as list is read once")
+        .mount(&h.server)
+        .await;
+
+    for _ in 0..3 {
+        let addresses = gmail::send_as(&h.client, CONNECTION).await.unwrap();
+        assert_eq!(addresses.len(), 3);
+    }
+    // Disconnecting an account forgets what was held for it.
+    h.client.forget(CONNECTION);
+}
+
+/// A reply is written as the address the mail arrived at, so the header that
+/// says which one that was has to survive the parse.
+#[tokio::test]
+async fn a_message_carries_the_address_it_was_delivered_to() {
+    let h = harness().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5f7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture("gmail_message_to_alias.json")),
+        )
+        .mount(&h.server)
+        .await;
+
+    let message = gmail::get_message(&h.client, CONNECTION, "18f0a1b2c3d4e5f7")
+        .await
+        .unwrap();
+    assert_eq!(message.delivered_to, ["sales@example.test"]);
+    assert_eq!(message.to, ["Anna at Sales <sales@example.test>"]);
+}
+
 #[test]
 fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
     let source = include_str!("../gmail.rs");
@@ -493,7 +590,13 @@ fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
         .collect();
     assert!(endpoints.len() >= 10, "{endpoints:?}");
     for endpoint in &endpoints {
-        assert!(!endpoint.contains("send"), "{endpoint}");
+        // A send endpoint spells `send` as a whole path segment: Google has
+        // `messages/send` and `drafts/send` and nothing else. `settings/sendAs`
+        // reads which addresses the account may write as and sends nothing.
+        assert!(
+            !endpoint.contains("/send\"") && !endpoint.contains("/send/"),
+            "{endpoint}"
+        );
         assert!(!endpoint.contains("trash"), "{endpoint}");
         assert!(!endpoint.contains("batchDelete"), "{endpoint}");
         // The one delete in the whole server is the undo for a draft.
@@ -519,6 +622,7 @@ fn a_reply_keeps_one_re_and_drops_the_replying_account_from_the_recipients() {
             "bob@example.test".into(),
         ],
         cc: vec!["team@example.test".into()],
+        delivered_to: vec!["anna@example.test".into()],
         subject: Some("RE: budget".into()),
         snippet: None,
         labels: vec![],
