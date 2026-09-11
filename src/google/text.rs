@@ -267,12 +267,20 @@ pub async fn google_sheet(client: &Client, connection_id: i64, file_id: &str) ->
     let spreadsheet = sheets::get(client, connection_id, file_id).await?;
     let mut out = String::new();
     for tab in &spreadsheet.tabs {
-        let rows = sheets::values_get(client, connection_id, file_id, &tab.title, None).await?;
+        let read = sheets::values_get(
+            client,
+            connection_id,
+            file_id,
+            &tab.title,
+            sheets::Render::Formatted,
+            None,
+        )
+        .await?;
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str(&format!("## {}\n\n", tab.title));
-        out.push_str(&to_csv(&rows)?);
+        out.push_str(&to_csv(&read.rows)?);
     }
     Ok(out)
 }

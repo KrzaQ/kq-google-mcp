@@ -476,6 +476,10 @@ pub struct RangeOut {
     pub account: String,
     pub spreadsheet_id: String,
     pub range: String,
+    /// How the cells were read: `formatted`, `formula` or `unformatted`. A
+    /// model that asked for one and reads another would draw the wrong
+    /// conclusion from the same digits.
+    pub render: String,
     pub row_count: usize,
     /// True when `max_rows` cut the answer short.
     pub truncated: bool,

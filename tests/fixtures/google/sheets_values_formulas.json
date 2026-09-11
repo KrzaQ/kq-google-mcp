@@ -1,0 +1,18 @@
+{
+  "range": "September!C2:D4",
+  "majorDimension": "ROWS",
+  "values": [
+    [
+      "=SUM(C10:C20)",
+      "1.5"
+    ],
+    [
+      "2",
+      "=C3*1.23"
+    ],
+    [
+      "0.5",
+      "Follow-up"
+    ]
+  ]
+}

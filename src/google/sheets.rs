@@ -17,6 +17,40 @@ const SHEETS: &str = "sheets";
 /// which is what someone asking a model to add rows means.
 const USER_ENTERED: &str = "USER_ENTERED";
 
+/// How a cell comes back from a read. `Formatted` is what the sheet shows and
+/// what a person reading the answer would see, so it stays the default.
+///
+/// `Formula` is the one that prevents a quiet loss: a model that reads a
+/// column as display strings and writes them back replaces `=SUM(C2:C10)`
+/// with a fixed number, and the sheet keeps looking right while being wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Render {
+    #[default]
+    Formatted,
+    Formula,
+    Unformatted,
+}
+
+impl Render {
+    /// Google's own word for this mode, as `valueRenderOption` takes it.
+    pub fn as_option(self) -> &'static str {
+        match self {
+            Render::Formatted => "FORMATTED_VALUE",
+            Render::Formula => "FORMULA",
+            Render::Unformatted => "UNFORMATTED_VALUE",
+        }
+    }
+}
+
+/// What a read answered: the range Google resolved the request to, and the
+/// rows. The range is not decoration — it names the top left cell, which is
+/// how a caller turns a row and column index back into an A1 reference.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RangeValues {
+    pub range: String,
+    pub rows: Vec<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Spreadsheet {
     pub spreadsheet_id: String,
@@ -59,16 +93,21 @@ pub async fn get(client: &Client, connection_id: i64, spreadsheet_id: &str) -> R
     Ok(wire.into())
 }
 
-/// `spreadsheets.values.get`, in A1 notation. Values come back formatted as
-/// the sheet shows them, because that is what a person reading the answer
-/// would see.
+/// `spreadsheets.values.get`, in A1 notation. [`Render`] decides what a cell
+/// is: what the sheet shows, the formula behind it, or the raw value.
+///
+/// Every mode answers with rows of strings. `UNFORMATTED_VALUE` sends numbers
+/// and booleans as JSON scalars rather than strings, so the cells are read as
+/// [`serde_json::Value`] and rendered here; a caller's shape does not change
+/// with the mode it asked for.
 pub async fn values_get(
     client: &Client,
     connection_id: i64,
     spreadsheet_id: &str,
     range: &str,
+    render: Render,
     max_rows: Option<usize>,
-) -> Result<Vec<Vec<String>>> {
+) -> Result<RangeValues> {
     let request = client
         .service(SHEETS)
         .get(&format!(
@@ -77,15 +116,34 @@ pub async fn values_get(
             urlencode(range)
         ))?
         .query(&[
-            ("valueRenderOption", "FORMATTED_VALUE"),
+            ("valueRenderOption", render.as_option()),
             ("majorDimension", "ROWS"),
         ]);
     let wire: WireValueRange = client.json(connection_id, request).await?;
-    let mut rows = wire.values;
+    let mut rows: Vec<Vec<String>> = wire
+        .values
+        .into_iter()
+        .map(|row| row.into_iter().map(cell).collect())
+        .collect();
     if let Some(max) = max_rows {
         rows.truncate(max);
     }
-    Ok(rows)
+    Ok(RangeValues {
+        range: wire.range,
+        rows,
+    })
+}
+
+/// One cell as a string. A boolean is spelled the way the grid spells it, an
+/// empty cell is an empty string, and a number keeps the digits Google sent.
+fn cell(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Bool(true) => "TRUE".to_string(),
+        serde_json::Value::Bool(false) => "FALSE".to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// `spreadsheets.values.append`, which adds rows after the last used one.
@@ -213,7 +271,11 @@ struct WireGridProperties {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireValueRange {
-    values: Vec<Vec<String>>,
+    /// The range Google resolved the request to, such as `September!A2:D5`.
+    range: String,
+    /// Cells arrive as JSON scalars under `UNFORMATTED_VALUE`, so they are
+    /// taken as they come and rendered by [`cell`].
+    values: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Deserialize)]

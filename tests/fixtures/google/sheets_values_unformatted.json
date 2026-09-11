@@ -1,0 +1,18 @@
+{
+  "range": "September!A1:D2",
+  "majorDimension": "ROWS",
+  "values": [
+    [
+      "Date",
+      "Customer",
+      "Hours",
+      "Paid"
+    ],
+    [
+      46266,
+      "Phoenix",
+      1.5,
+      true
+    ]
+  ]
+}

@@ -1,10 +1,17 @@
-//! The Sheets tools. Reads are ranges in A1 notation with the values
-//! formatted as the sheet shows them; writes are append, overwrite, a new tab
-//! and a new spreadsheet, and all four take `confirmed`.
+//! The Sheets tools. Reads are ranges in A1 notation, as the sheet shows
+//! them or as the formulas behind them; writes are append, overwrite, a new
+//! tab and a new spreadsheet, and all four take `confirmed`.
 //!
 //! A spreadsheet is the one place where a wrong write is quietly destructive —
 //! `sheets_update_range` overwrites whatever is in the range — so the preview
 //! spells out the range and the rows before anything happens.
+//!
+//! The quietest loss of all is a formula. A model that reads a column as the
+//! numbers it displays and writes those numbers back replaces `=SUM(C2:C10)`
+//! with a frozen total, and the sheet keeps looking correct while it has
+//! stopped adding up. So `sheets_read_range` can read the formulas
+//! themselves, and the preview of an overwrite says which cells in the target
+//! range hold one today.
 
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -20,12 +27,54 @@ use crate::google::{drive, sheets, text};
 /// How many rows a preview prints before it starts counting instead.
 const PREVIEW_ROWS: usize = 10;
 
+/// How many of the formulas an overwrite would replace the preview names
+/// before it starts counting instead.
+const PREVIEW_FORMULAS: usize = 5;
+
+/// How long a formula is allowed to be in a preview line.
+const FORMULA_CHARS: usize = 60;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SpreadsheetParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
     /// The spreadsheet id, the long string in its Sheets URL
     pub spreadsheet_id: String,
+}
+
+/// What a cell should be read as. The default shows what the sheet shows.
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderParam {
+    /// What the sheet displays: "1 234,50 zł", "8 Sep 2026"
+    #[default]
+    Formatted,
+    /// The formula behind the cell, "=SUM(C2:C10)", or the literal value
+    /// where there is no formula
+    Formula,
+    /// The underlying value, unformatted: 1234.5, and a date as its serial
+    /// number
+    Unformatted,
+}
+
+impl From<RenderParam> for sheets::Render {
+    fn from(r: RenderParam) -> Self {
+        match r {
+            RenderParam::Formatted => sheets::Render::Formatted,
+            RenderParam::Formula => sheets::Render::Formula,
+            RenderParam::Unformatted => sheets::Render::Unformatted,
+        }
+    }
+}
+
+impl RenderParam {
+    fn as_str(self) -> &'static str {
+        match self {
+            RenderParam::Formatted => "formatted",
+            RenderParam::Formula => "formula",
+            RenderParam::Unformatted => "unformatted",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -36,6 +85,9 @@ pub struct ReadRangeParam {
     pub range: String,
     /// Stop after this many rows; default 200, at most 2000
     pub max_rows: Option<u32>,
+    /// How to read each cell: "formatted" (the default), "formula" or
+    /// "unformatted". Read with "formula" before you copy cells anywhere.
+    pub render: Option<RenderParam>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -115,9 +167,13 @@ impl Gmcp {
     }
 
     #[tool(
-        description = "Read a range in A1 notation and get the rows back as lists of strings, \
-                       formatted the way the sheet shows them. Trailing empty cells are not \
-                       padded, so rows can differ in length."
+        description = "Read a range in A1 notation and get the rows back as lists of strings. \
+                       `render` decides what a cell is: \"formatted\" (the default) is what the \
+                       sheet displays, \"formula\" is the formula behind it, \"unformatted\" is \
+                       the raw value. Read with render=\"formula\" whenever you are about to \
+                       copy, move or rewrite cells: a cell that displays a number may hold a \
+                       formula, and writing the number back freezes it. Trailing empty cells are \
+                       not padded, so rows can differ in length."
     )]
     async fn sheets_read_range(
         &self,
@@ -126,23 +182,26 @@ impl Gmcp {
     ) -> Result<Json<dto::RangeOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Sheets).await?;
         let max = capped(p.max_rows, 200, 2000) as usize;
+        let render = p.render.unwrap_or_default();
         // One more than asked for, so "there is more" is a fact and not a guess.
-        let rows = sheets::values_get(
+        let read = sheets::values_get(
             &self.google()?.client,
             connection.id,
             p.spreadsheet_id.trim(),
             p.range.trim(),
+            render.into(),
             Some(max + 1),
         )
         .await
         .map_err(|e| self.google_err_for(&connection, e))?;
+        let mut rows = read.rows;
         let truncated = rows.len() > max;
-        let mut rows = rows;
         rows.truncate(max);
         Ok(Json(dto::RangeOut {
             account: connection.label,
             spreadsheet_id: p.spreadsheet_id.trim().to_string(),
             range: p.range.trim().to_string(),
+            render: render.as_str().to_string(),
             row_count: rows.len(),
             truncated,
             rows,
@@ -152,7 +211,9 @@ impl Gmcp {
     #[tool(
         description = "Add rows after the last used row of a tab. Needs confirmed=true: call \
                        once with confirmed=false, show the person the rows exactly as they will \
-                       be written, and write only after they say yes."
+                       be written, and write only after they say yes. A write carries values \
+                       and no formatting: rows appended under a formatted table arrive plain, so \
+                       currency, dates and borders do not follow. Say so before you append."
     )]
     async fn sheets_append_rows(
         &self,
@@ -195,7 +256,11 @@ impl Gmcp {
     #[tool(
         description = "Write rows over exactly the given range, replacing whatever is there. \
                        Needs confirmed=true, and the preview is worth showing in full: this \
-                       overwrites cells and there is no undo here."
+                       overwrites cells and there is no undo here. The preview also reads the \
+                       range as formulas and says which cells hold one today, because writing a \
+                       displayed value over a formula replaces the formula with a fixed number \
+                       and the sheet goes on looking right. A write carries values and no \
+                       formatting; the cells keep the formatting they already had."
     )]
     async fn sheets_update_range(
         &self,
@@ -209,9 +274,23 @@ impl Gmcp {
             return Err(bad("there is nothing to write: rows is empty"));
         }
         if !p.confirmed {
-            let mut details = vec![format!(
-                "everything currently in {range} is overwritten; there is no undo here"
-            )];
+            // What is there now, as formulas rather than as the numbers they
+            // show. Only as many rows as are being written are read, because
+            // those are the only cells an update touches.
+            let current = sheets::values_get(
+                &self.google()?.client,
+                connection.id,
+                &spreadsheet_id,
+                &range,
+                sheets::Render::Formula,
+                Some(p.rows.len()),
+            )
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+            let mut details = vec![
+                format!("everything currently in {range} is overwritten; there is no undo here"),
+                formula_warning(&formulas_overwritten(&current, &p.rows)),
+            ];
             details.extend(preview_rows(&p.rows));
             return Ok(Json(Confirmable::Preview(PreviewOut::new(
                 format!(
@@ -416,6 +495,94 @@ fn write_out(
         updated_cells: Some(written.updated_cells),
         written: summary,
     }
+}
+
+/// The cells an update would overwrite that hold a formula today, as
+/// `C2 =SUM(C2:C10)` lines. Only the cells actually being written are
+/// considered: a formula one column to the right of the new values survives
+/// the write and does not belong in the warning.
+fn formulas_overwritten(current: &sheets::RangeValues, writing: &[Vec<String>]) -> Vec<String> {
+    let anchor = anchor(&current.range);
+    let mut found = Vec::new();
+    for (r, row) in current.rows.iter().enumerate() {
+        let width = writing.get(r).map(Vec::len).unwrap_or(0);
+        for (c, value) in row.iter().take(width).enumerate() {
+            if !value.starts_with('=') {
+                continue;
+            }
+            let reference = match anchor {
+                Some((column, row_one)) => a1_cell(column + c, row_one + r as u32),
+                None => format!("row {} cell {}", r + 1, c + 1),
+            };
+            found.push(format!("{reference} {}", shorten(value)));
+        }
+    }
+    found
+}
+
+/// The preview line about formulas. It says the good news too: a model that
+/// is told nothing would have to guess whether the check happened.
+fn formula_warning(found: &[String]) -> String {
+    if found.is_empty() {
+        return "no cell being written over holds a formula today".to_string();
+    }
+    let shown = found.len().min(PREVIEW_FORMULAS);
+    let mut line = format!(
+        "{} of the cells being written over hold a formula today, and writing a value there \
+         replaces the formula with a fixed number that stops recalculating: {}",
+        found.len(),
+        found[..shown].join(", ")
+    );
+    if found.len() > shown {
+        line.push_str(&format!(", and {} more", found.len() - shown));
+    }
+    line.push_str(
+        ". Read them with sheets_read_range render=\"formula\" and keep the formulas \
+         unless the person asked for fixed values",
+    );
+    line
+}
+
+/// The top left cell of a range Google resolved, as a 0-based column and a
+/// 1-based row: `September!B2:D5` is `(1, 2)`. `None` when the range is not
+/// in that shape, which is why the caller has a fallback.
+fn anchor(range: &str) -> Option<(usize, u32)> {
+    let cell = range.rsplit('!').next()?.split(':').next()?;
+    let letters: String = cell
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .flat_map(char::to_uppercase)
+        .collect();
+    let digits = &cell[letters.len()..];
+    if letters.is_empty() || digits.is_empty() {
+        return None;
+    }
+    let mut column: usize = 0;
+    for letter in letters.bytes() {
+        column = column * 26 + (letter - b'A') as usize + 1;
+    }
+    Some((column - 1, digits.parse().ok()?))
+}
+
+/// A cell's A1 reference from a 0-based column and a 1-based row.
+fn a1_cell(column: usize, row: u32) -> String {
+    let mut letters = String::new();
+    let mut left = column + 1;
+    while left > 0 {
+        let digit = (left - 1) % 26;
+        letters.insert(0, (b'A' + digit as u8) as char);
+        left = (left - 1) / 26;
+    }
+    format!("{letters}{row}")
+}
+
+/// A formula short enough to read in a preview line.
+fn shorten(formula: &str) -> String {
+    if formula.chars().count() <= FORMULA_CHARS {
+        return formula.to_string();
+    }
+    let kept: String = formula.chars().take(FORMULA_CHARS).collect();
+    format!("{kept}…")
 }
 
 /// The rows a preview prints, as the person would read them.

@@ -30,18 +30,33 @@ async fn a_range_is_read_written_and_appended() {
         fixture("sheets_values.json"),
     )
     .await;
-    let rows = sheets::values_get(&h.client, CONNECTION, SHEET, "September!A1:D4", None)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 4);
+    let read = sheets::values_get(
+        &h.client,
+        CONNECTION,
+        SHEET,
+        "September!A1:D4",
+        sheets::Render::Formatted,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.rows.len(), 4);
+    assert_eq!(read.range, "September!A1:D4");
     assert_eq!(
-        rows[1],
+        read.rows[1],
         ["2026-09-01", "Phoenix", "1.5", "Restarted the exporter"]
     );
-    let capped = sheets::values_get(&h.client, CONNECTION, SHEET, "September!A1:D4", Some(2))
-        .await
-        .unwrap();
-    assert_eq!(capped.len(), 2);
+    let capped = sheets::values_get(
+        &h.client,
+        CONNECTION,
+        SHEET,
+        "September!A1:D4",
+        sheets::Render::Formatted,
+        Some(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(capped.rows.len(), 2);
 
     h.mount_json(
         "POST",
@@ -121,4 +136,54 @@ async fn a_tab_is_added() {
         body,
         json!({"requests": [{"addSheet": {"properties": {"title": "October"}}}]})
     );
+}
+
+#[tokio::test]
+async fn each_render_mode_asks_google_for_it_and_answers_strings() {
+    let h = harness().await;
+    let at = format!("/v4/spreadsheets/{SHEET}/values/September%21A1%3AD2");
+    h.mount_json("GET", &at, fixture("sheets_values_unformatted.json"))
+        .await;
+
+    for (render, option) in [
+        (sheets::Render::Formatted, "FORMATTED_VALUE"),
+        (sheets::Render::Formula, "FORMULA"),
+        (sheets::Render::Unformatted, "UNFORMATTED_VALUE"),
+    ] {
+        let read = sheets::values_get(
+            &h.client,
+            CONNECTION,
+            SHEET,
+            "September!A1:D2",
+            render,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.rows.len(), 2);
+        let query: std::collections::HashMap<_, _> = h
+            .last("GET", &at)
+            .await
+            .url
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(query["valueRenderOption"], option);
+        assert_eq!(query["majorDimension"], "ROWS");
+    }
+
+    // UNFORMATTED_VALUE sends numbers and booleans as JSON scalars. Every
+    // mode still answers rows of strings, so a caller's shape does not change
+    // with the mode it asked for.
+    let read = sheets::values_get(
+        &h.client,
+        CONNECTION,
+        SHEET,
+        "September!A1:D2",
+        sheets::Render::Unformatted,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.rows[1], ["46266", "Phoenix", "1.5", "TRUE"]);
 }

@@ -439,6 +439,7 @@ async fn a_gmail_read_token_lists_the_gmail_read_tools_and_nothing_else() {
         "NEVER SENDS MAIL",
         "list_accounts first",
         "confirmed=true",
+        "render=\"formula\"",
         "15 minutes",
         "MAX_MCP_OUTPUT_TOKENS",
         "https://gmcp.example/connections",
@@ -2570,6 +2571,12 @@ async fn sheets_update_range_previews_first_and_then_writes_once() {
         .named("values.update, exactly once")
         .mount(&server)
         .await;
+    // The preview reads the range as formulas before it says anything.
+    Mock::given(http_method("GET"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_values.json")))
+        .mount(&server)
+        .await;
     let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
 
     let args = json!({"account": "work", "spreadsheet_id": SHEET,
@@ -2672,6 +2679,101 @@ async fn sheets_create_previews_the_spreadsheet_and_writes_nothing() {
         "1 rows on the first tab, plus empty tabs October, November"
     );
     assert_eq!(out["details"][1], "Date | Customer | Hours");
+    drop(server);
+}
+
+#[tokio::test]
+async fn sheets_read_range_reads_each_mode_and_answers_strings_in_all_of_them() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    for (option, body) in [
+        ("FORMATTED_VALUE", "sheets_values.json"),
+        ("FORMULA", "sheets_values_formulas.json"),
+        ("UNFORMATTED_VALUE", "sheets_values_unformatted.json"),
+    ] {
+        Mock::given(http_method("GET"))
+            .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+            .and(query_param("valueRenderOption", option))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture(body)))
+            .mount(&server)
+            .await;
+    }
+    let mut c = client(&db, &server, &["sheets:read"]).await;
+    let args = |render: Value| {
+        json!({"account": "work", "spreadsheet_id": SHEET,
+               "range": "September!A1:D4", "render": render})
+    };
+
+    // The default is what the sheet shows, and it says which mode it read in.
+    let formatted = c.ok("sheets_read_range", args(Value::Null)).await;
+    assert_eq!(formatted["render"], "formatted");
+    assert_eq!(formatted["rows"][1][2], "1.5");
+
+    let formula = c.ok("sheets_read_range", args(json!("formula"))).await;
+    assert_eq!(formula["render"], "formula");
+    assert_eq!(formula["rows"][0][0], "=SUM(C10:C20)");
+
+    // UNFORMATTED_VALUE answers JSON numbers and booleans; the tool's rows
+    // are strings whatever the mode, so nothing downstream changes shape.
+    let raw = c.ok("sheets_read_range", args(json!("unformatted"))).await;
+    assert_eq!(raw["render"], "unformatted");
+    assert_eq!(raw["rows"][1][0], "46266");
+    assert_eq!(raw["rows"][1][2], "1.5");
+    assert_eq!(raw["rows"][1][3], "TRUE");
+
+    // A mode that does not exist is refused with the modes that do, rather
+    // than quietly read as the default.
+    let bad = c.refused("sheets_read_range", args(json!("raw"))).await;
+    assert!(bad.contains("formatted"), "{bad}");
+    assert!(bad.contains("unformatted"), "{bad}");
+}
+
+#[tokio::test]
+async fn an_unconfirmed_update_names_the_formulas_it_would_overwrite() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+        .and(query_param("valueRenderOption", "FORMULA"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture("sheets_values_formulas.json")),
+        )
+        .mount(&server)
+        .await;
+    server
+        .register(
+            Mock::given(http_method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("an unconfirmed update writes nothing"),
+        )
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+
+    let shown = c
+        .ok(
+            "sheets_update_range",
+            json!({"account": "work", "spreadsheet_id": SHEET,
+                   "range": "September!C2:D4",
+                   "rows": [["10", "20"], ["11", "21"], ["12", "22"]],
+                   "confirmed": false}),
+        )
+        .await;
+    assert_eq!(shown["written"], false);
+    let warning = shown["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .find(|d| d.contains("formula"))
+        .unwrap_or_else(|| panic!("no formula warning in {shown}"))
+        .to_string();
+    // Two of the six cells hold a formula, and the preview says which, by
+    // the reference the person reads off the sheet.
+    assert!(warning.starts_with("2 of the cells"), "{warning}");
+    assert!(warning.contains("C2 =SUM(C10:C20)"), "{warning}");
+    assert!(warning.contains("D3 =C3*1.23"), "{warning}");
+    assert!(warning.contains("render=\"formula\""), "{warning}");
     drop(server);
 }
 
