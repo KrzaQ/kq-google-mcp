@@ -1,6 +1,6 @@
 //! Sheets: the tabs of a spreadsheet, a range read, two range writes and the
-//! structural changes this release makes — adding a tab and inserting or
-//! deleting whole rows.
+//! structural changes this release makes — adding a tab, inserting and
+//! deleting whole rows, and copying the formatting of one row onto others.
 //!
 //! Creating a whole spreadsheet is not here on purpose: a new Sheet is made
 //! through Drive, by uploading CSV and letting Drive convert it, which fills
@@ -20,6 +20,9 @@ const USER_ENTERED: &str = "USER_ENTERED";
 
 /// The only dimension this module changes. Columns are out of scope.
 const ROWS: &str = "ROWS";
+
+/// Formatting and nothing else: no values, no formulas, no notes.
+const PASTE_FORMAT: &str = "PASTE_FORMAT";
 
 /// How a cell comes back from a read. `Formatted` is what the sheet shows and
 /// what a person reading the answer would see, so it stays the default.
@@ -286,6 +289,43 @@ pub async fn delete_rows(
     Ok(())
 }
 
+/// `copyPaste` with `PASTE_FORMAT`: the formatting of one whole row onto
+/// `count` whole rows starting at `to_row`. Values, formulas and notes stay
+/// where they are; only the way the cells look travels.
+pub async fn copy_row_format(
+    client: &Client,
+    connection_id: i64,
+    spreadsheet_id: &str,
+    sheet_id: i64,
+    from_row: u32,
+    to_row: u32,
+    count: u32,
+) -> Result<()> {
+    let source = from_row.saturating_sub(1);
+    let destination = to_row.saturating_sub(1);
+    batch_update(
+        client,
+        connection_id,
+        spreadsheet_id,
+        SheetRequest::CopyPaste(CopyPaste {
+            source: RowRange {
+                sheet_id,
+                start_row_index: source,
+                end_row_index: source + 1,
+            },
+            destination: RowRange {
+                sheet_id,
+                start_row_index: destination,
+                end_row_index: destination + count,
+            },
+            paste_type: PASTE_FORMAT,
+            paste_orientation: "NORMAL",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 /// `spreadsheets.batchUpdate` with one `addSheet`. Nothing here deletes or
 /// reorders a tab.
 pub async fn add_tab(
@@ -446,6 +486,7 @@ enum SheetRequest {
     AddSheet(AddSheet),
     InsertDimension(InsertDimension),
     DeleteDimension(DeleteDimension),
+    CopyPaste(CopyPaste),
 }
 
 #[derive(Debug, Serialize)]
@@ -469,6 +510,16 @@ struct DimensionRange {
     end_index: u32,
 }
 
+/// The same rows, as `copyPaste` takes them. Whole rows only: no column
+/// bounds are sent, so the range is the row from its first cell to its last.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RowRange {
+    sheet_id: i64,
+    start_row_index: u32,
+    end_row_index: u32,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InsertDimension {
@@ -480,4 +531,13 @@ struct InsertDimension {
 #[serde(rename_all = "camelCase")]
 struct DeleteDimension {
     range: DimensionRange,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CopyPaste {
+    source: RowRange,
+    destination: RowRange,
+    paste_type: &'static str,
+    paste_orientation: &'static str,
 }

@@ -189,7 +189,7 @@ async fn each_render_mode_asks_google_for_it_and_answers_strings() {
 }
 
 #[tokio::test]
-async fn rows_are_inserted_and_deleted_one_request_at_a_time() {
+async fn rows_are_inserted_deleted_and_reformatted_one_request_at_a_time() {
     let h = harness().await;
     let at = format!("/v4/spreadsheets/{SHEET}:batchUpdate");
     h.mount_json("POST", &at, fixture("sheets_batch_rows.json"))
@@ -229,5 +229,19 @@ async fn rows_are_inserted_and_deleted_one_request_at_a_time() {
         json!({"requests": [{"deleteDimension": {
             "range": {"sheetId": 0, "dimension": "ROWS",
                       "startIndex": 11, "endIndex": 13}}}]})
+    );
+
+    // Whole rows, formatting only: no column bounds are sent and the paste
+    // type carries nothing else across.
+    sheets::copy_row_format(&h.client, CONNECTION, SHEET, 0, 4, 5, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", &at).await,
+        json!({"requests": [{"copyPaste": {
+            "source": {"sheetId": 0, "startRowIndex": 3, "endRowIndex": 4},
+            "destination": {"sheetId": 0, "startRowIndex": 4, "endRowIndex": 7},
+            "pasteType": "PASTE_FORMAT",
+            "pasteOrientation": "NORMAL"}}]})
     );
 }

@@ -1,7 +1,7 @@
 //! The Sheets tools. Reads are ranges in A1 notation, as the sheet shows
 //! them or as the formulas behind them; writes are append, overwrite, whole
-//! rows in and out, a new tab and a new spreadsheet, and every one of them
-//! takes `confirmed`.
+//! rows in and out, a copy of a row's formatting, a new tab and a new
+//! spreadsheet, and every one of them takes `confirmed`.
 //!
 //! A spreadsheet is the one place where a wrong write is quietly destructive —
 //! `sheets_update_range` overwrites whatever is in the range — so the preview
@@ -158,6 +158,22 @@ pub struct DeleteRowsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CopyFormatParam {
+    pub account: String,
+    pub spreadsheet_id: String,
+    /// The tab, by title. The row copied and the rows written are both on it.
+    pub tab: String,
+    /// The row whose formatting is copied, counting from 1
+    pub from_row: u32,
+    /// The first row to give that formatting to, counting from 1
+    pub to_row: u32,
+    /// How many rows to give it to, starting at to_row
+    pub count: u32,
+    /// Must be true to write.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AddTabParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -252,7 +268,9 @@ impl Gmcp {
                        once with confirmed=false, show the person the rows exactly as they will \
                        be written, and write only after they say yes. A write carries values \
                        and no formatting: rows appended under a formatted table arrive plain, so \
-                       currency, dates and borders do not follow. Say so before you append."
+                       currency, dates and borders do not follow. Say so before you append, and \
+                       use sheets_copy_format afterwards to make the new rows match the ones \
+                       above."
     )]
     async fn sheets_append_rows(
         &self,
@@ -518,6 +536,65 @@ impl Gmcp {
             last,
             count,
             format!("rows {from_row} to {last} of {:?} deleted", tab.title),
+        ))))
+    }
+
+    #[tool(
+        description = "Copy the formatting of one whole row onto other whole rows of the same \
+                       tab: fonts, colours, borders, number and date formats. Values and \
+                       formulas are not copied and are not disturbed. Whole rows only — this is \
+                       the tool for \"make these rows look like the one above\" after an append, \
+                       and there is deliberately no way here to format a single cell, a column \
+                       or a rectangle. Needs confirmed=true."
+    )]
+    async fn sheets_copy_format(
+        &self,
+        Parameters(p): Parameters<CopyFormatParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::SheetWriteOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Sheets).await?;
+        let spreadsheet_id = p.spreadsheet_id.trim().to_string();
+        let count = row_count(p.count)?;
+        let from_row = row_number(p.from_row, "from_row")?;
+        let to_row = row_number(p.to_row, "to_row")?;
+        let tab = self.tab(&connection, &spreadsheet_id, &p.tab).await?;
+        let last = to_row + count - 1;
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "give rows {to_row} to {last} of the tab {:?} in spreadsheet \
+                     {spreadsheet_id} in `{}` the formatting of row {from_row}",
+                    tab.title, connection.label
+                ),
+                vec![
+                    "only the formatting travels: what those rows say stays exactly as it is"
+                        .into(),
+                    format!("any formatting rows {to_row} to {last} have of their own is replaced"),
+                ],
+            ))));
+        }
+        sheets::copy_row_format(
+            &self.google()?.client,
+            connection.id,
+            &spreadsheet_id,
+            tab.sheet_id,
+            from_row,
+            to_row,
+            count,
+        )
+        .await
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(row_out(
+            connection.label,
+            spreadsheet_id,
+            &tab.title,
+            to_row,
+            last,
+            count,
+            format!(
+                "rows {to_row} to {last} of {:?} now have the formatting of row {from_row}",
+                tab.title
+            ),
         ))))
     }
 

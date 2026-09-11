@@ -81,7 +81,8 @@ fn instructions(portal: &str) -> String {
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \
-         cells; a write carries values and never formatting.\n\
+         cells; a write carries values and never formatting, which is what sheets_copy_format is \
+         for.\n\
          A Gmail draft is written as the account's default address unless you pass `from`, which \
          must be one of the account's verified send-as addresses; gmail_list_send_as reports \
          them, and a reply comes from the address the original was delivered to.\n\

@@ -2929,10 +2929,56 @@ async fn sheets_delete_rows_shows_what_would_go_and_then_deletes_once() {
 }
 
 #[tokio::test]
+async fn sheets_copy_format_pastes_the_formatting_of_one_whole_row() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_spreadsheet(&server).await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_batch_rows.json")))
+        .expect(1)
+        .named("copyPaste, exactly once")
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+    let args = |confirmed: bool| {
+        json!({"account": "work", "spreadsheet_id": SHEET, "tab": "September",
+               "from_row": 4, "to_row": 5, "count": 2, "confirmed": confirmed})
+    };
+
+    let shown = c.ok("sheets_copy_format", args(false)).await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("only the formatting travels")),
+        "{shown}"
+    );
+
+    let out = c.ok("sheets_copy_format", args(true)).await;
+    assert_eq!(out["updated_range"], "'September'!5:6");
+    assert_eq!(
+        last_batch(&server).await,
+        json!({"requests": [{"copyPaste": {
+            "source": {"sheetId": 0, "startRowIndex": 3, "endRowIndex": 4},
+            "destination": {"sheetId": 0, "startRowIndex": 4, "endRowIndex": 6},
+            "pasteType": "PASTE_FORMAT",
+            "pasteOrientation": "NORMAL"}}]})
+    );
+    drop(server);
+}
+
+#[tokio::test]
 async fn the_row_tools_belong_to_sheets_write() {
     let db = Db::open_memory().await.unwrap();
     let server = google_server().await;
-    let rows = ["sheets_insert_rows", "sheets_delete_rows"];
+    let rows = [
+        "sheets_insert_rows",
+        "sheets_delete_rows",
+        "sheets_copy_format",
+    ];
 
     let anna = user(&db, "anna", "anna@example.test").await;
     connect(&db, &anna, "work", &["sheets"], true).await;
