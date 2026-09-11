@@ -187,3 +187,47 @@ async fn each_render_mode_asks_google_for_it_and_answers_strings() {
     .unwrap();
     assert_eq!(read.rows[1], ["46266", "Phoenix", "1.5", "TRUE"]);
 }
+
+#[tokio::test]
+async fn rows_are_inserted_and_deleted_one_request_at_a_time() {
+    let h = harness().await;
+    let at = format!("/v4/spreadsheets/{SHEET}:batchUpdate");
+    h.mount_json("POST", &at, fixture("sheets_batch_rows.json"))
+        .await;
+
+    // 1-based at_row 5 is the API's 0-based startIndex 4, and the new rows
+    // take the formatting of the row above.
+    sheets::insert_rows(&h.client, CONNECTION, SHEET, 774411, 5, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", &at).await,
+        json!({"requests": [{"insertDimension": {
+            "range": {"sheetId": 774411, "dimension": "ROWS",
+                      "startIndex": 4, "endIndex": 7},
+            "inheritFromBefore": true}}]})
+    );
+
+    // At row 1 there is nothing above to inherit from, and the API refuses
+    // the flag there.
+    sheets::insert_rows(&h.client, CONNECTION, SHEET, 0, 1, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", &at).await,
+        json!({"requests": [{"insertDimension": {
+            "range": {"sheetId": 0, "dimension": "ROWS",
+                      "startIndex": 0, "endIndex": 2},
+            "inheritFromBefore": false}}]})
+    );
+
+    sheets::delete_rows(&h.client, CONNECTION, SHEET, 0, 12, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", &at).await,
+        json!({"requests": [{"deleteDimension": {
+            "range": {"sheetId": 0, "dimension": "ROWS",
+                      "startIndex": 11, "endIndex": 13}}}]})
+    );
+}

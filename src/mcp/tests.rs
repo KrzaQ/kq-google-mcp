@@ -2682,6 +2682,40 @@ async fn sheets_create_previews_the_spreadsheet_and_writes_nothing() {
     drop(server);
 }
 
+/// The body of the last `batchUpdate` the mock server saw.
+async fn last_batch(server: &MockServer) -> Value {
+    let request = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|r| r.method.as_str() == "POST" && r.url.path().ends_with(":batchUpdate"))
+        .expect("a batchUpdate was sent");
+    serde_json::from_slice(&request.body).expect("the batchUpdate body is JSON")
+}
+
+/// How many structural changes the mock server was asked for.
+async fn batch_calls(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with(":batchUpdate"))
+        .count()
+}
+
+/// The tab lookup every structural tool starts with.
+async fn mount_spreadsheet(server: &MockServer) {
+    mount(
+        server,
+        "GET",
+        &format!("/v4/spreadsheets/{SHEET}"),
+        fixture("sheets_spreadsheet.json"),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sheets_read_range_reads_each_mode_and_answers_strings_in_all_of_them() {
     let db = Db::open_memory().await.unwrap();
@@ -2775,6 +2809,165 @@ async fn an_unconfirmed_update_names_the_formulas_it_would_overwrite() {
     assert!(warning.contains("D3 =C3*1.23"), "{warning}");
     assert!(warning.contains("render=\"formula\""), "{warning}");
     drop(server);
+}
+
+#[tokio::test]
+async fn sheets_insert_rows_counts_from_one_and_inherits_from_the_row_above() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_spreadsheet(&server).await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_batch_rows.json")))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+    let args = |at_row: u32, confirmed: bool| {
+        json!({"account": "work", "spreadsheet_id": SHEET, "tab": "September",
+               "at_row": at_row, "count": 3, "confirmed": confirmed})
+    };
+
+    let shown = c.ok("sheets_insert_rows", args(5, false)).await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["action"].as_str().unwrap().contains("row 5"),
+        "{shown}"
+    );
+    assert_eq!(batch_calls(&server).await, 0, "a preview changes nothing");
+
+    // Row 5 on the sheet is startIndex 4 for the API, and the tab was looked
+    // up by title: September is sheet 0 in the fixture.
+    c.ok("sheets_insert_rows", args(5, true)).await;
+    assert_eq!(
+        last_batch(&server).await,
+        json!({"requests": [{"insertDimension": {
+            "range": {"sheetId": 0, "dimension": "ROWS",
+                      "startIndex": 4, "endIndex": 7},
+            "inheritFromBefore": true}}]})
+    );
+
+    // At the top of the sheet there is no row above to inherit from, and the
+    // API refuses the flag there.
+    c.ok("sheets_insert_rows", args(1, true)).await;
+    assert_eq!(
+        last_batch(&server).await,
+        json!({"requests": [{"insertDimension": {
+            "range": {"sheetId": 0, "dimension": "ROWS",
+                      "startIndex": 0, "endIndex": 3},
+            "inheritFromBefore": false}}]})
+    );
+
+    // Rows are numbered the way the sheet numbers them, and a tab that is not
+    // there is named along with the ones that are.
+    let zero = c.refused("sheets_insert_rows", args(0, true)).await;
+    assert!(zero.contains("counts from 1"), "{zero}");
+    let missing = c
+        .refused(
+            "sheets_insert_rows",
+            json!({"account": "work", "spreadsheet_id": SHEET, "tab": "October",
+                   "at_row": 2, "count": 1, "confirmed": true}),
+        )
+        .await;
+    assert!(missing.contains("\"September\""), "{missing}");
+    assert_eq!(
+        batch_calls(&server).await,
+        2,
+        "one write per confirmed call"
+    );
+}
+
+#[tokio::test]
+async fn sheets_delete_rows_shows_what_would_go_and_then_deletes_once() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_spreadsheet(&server).await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+/values/[^/]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_values.json")))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("POST"))
+        .and(path_regex(r"^/v4/spreadsheets/[^/]+:batchUpdate$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("sheets_batch_rows.json")))
+        .expect(1)
+        .named("deleteDimension, exactly once")
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["sheets:read", "sheets:write"]).await;
+    let args = |confirmed: bool| {
+        json!({"account": "work", "spreadsheet_id": SHEET, "tab": "September",
+               "from_row": 2, "count": 3, "confirmed": confirmed})
+    };
+
+    // The preview reads the doomed rows and prints them, because a wrong row
+    // number is the only way this tool goes wrong.
+    let shown = c.ok("sheets_delete_rows", args(false)).await;
+    assert_eq!(shown["written"], false);
+    let details: Vec<&str> = shown["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert!(details[0].contains("rows 2 to 4"), "{details:?}");
+    assert!(
+        details.iter().any(|d| d.contains("Restarted the exporter")),
+        "{details:?}"
+    );
+    assert_eq!(batch_calls(&server).await, 0, "a preview deletes nothing");
+
+    let out = c.ok("sheets_delete_rows", args(true)).await;
+    assert_eq!(out["updated_range"], "'September'!2:4");
+    assert_eq!(out["updated_rows"], 3);
+    assert_eq!(
+        last_batch(&server).await,
+        json!({"requests": [{"deleteDimension": {
+            "range": {"sheetId": 0, "dimension": "ROWS",
+                      "startIndex": 1, "endIndex": 4}}}]})
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn the_row_tools_belong_to_sheets_write() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let rows = ["sheets_insert_rows", "sheets_delete_rows"];
+
+    let anna = user(&db, "anna", "anna@example.test").await;
+    connect(&db, &anna, "work", &["sheets"], true).await;
+    let (_, read_only) = token(&db, &["sheets:read"], Some(&anna), ClientProfile::Generic).await;
+    let (_, may_write) = token(
+        &db,
+        &["sheets:read", "sheets:write"],
+        Some(&anna),
+        ClientProfile::Generic,
+    )
+    .await;
+    let app = Arc::new(app(&db, Some(&server)).await);
+
+    let mut reader = Client::new((*app).clone(), read_only);
+    reader.initialize().await;
+    let visible = reader.names().await;
+    for tool in rows {
+        assert!(!visible.contains(&tool.to_string()), "{tool} is a write");
+    }
+    assert!(visible.contains(&"sheets_read_range".to_string()));
+    let refused = reader
+        .refused(
+            "sheets_delete_rows",
+            json!({"account": "work", "spreadsheet_id": SHEET, "tab": "September",
+                   "from_row": 2, "count": 1, "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("sheets:write"), "{refused}");
+
+    let mut writer = Client::new((*app).clone(), may_write);
+    writer.initialize().await;
+    let visible = writer.names().await;
+    for tool in rows {
+        assert!(visible.contains(&tool.to_string()), "{tool} is missing");
+    }
 }
 
 // ----- clocks -----------------------------------------------------------------

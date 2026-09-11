@@ -1,6 +1,7 @@
 //! The Sheets tools. Reads are ranges in A1 notation, as the sheet shows
-//! them or as the formulas behind them; writes are append, overwrite, a new
-//! tab and a new spreadsheet, and all four take `confirmed`.
+//! them or as the formulas behind them; writes are append, overwrite, whole
+//! rows in and out, a new tab and a new spreadsheet, and every one of them
+//! takes `confirmed`.
 //!
 //! A spreadsheet is the one place where a wrong write is quietly destructive —
 //! `sheets_update_range` overwrites whatever is in the range — so the preview
@@ -21,6 +22,7 @@ use serde::Deserialize;
 
 use super::dto::{self, Confirmable, PreviewOut};
 use super::{Call, Gmcp, bad, capped};
+use crate::db::Connection;
 use crate::domain::scope::Service;
 use crate::google::{drive, sheets, text};
 
@@ -33,6 +35,11 @@ const PREVIEW_FORMULAS: usize = 5;
 
 /// How long a formula is allowed to be in a preview line.
 const FORMULA_CHARS: usize = 60;
+
+/// The most rows one structural call may add, remove or reformat. A model
+/// that means five and says five hundred is stopped here rather than in the
+/// grid, where undoing it is the person's problem.
+const MAX_ROWS_PER_CALL: u32 = 1000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SpreadsheetParam {
@@ -115,6 +122,38 @@ pub struct UpdateRangeParam {
     pub rows: Vec<Vec<String>>,
     /// Must be true to write. This overwrites what is there, so show the
     /// person the range and the rows first.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InsertRowsParam {
+    pub account: String,
+    pub spreadsheet_id: String,
+    /// The tab to insert into, by title
+    pub tab: String,
+    /// The row number the first new row takes, counting from 1 as A1 notation
+    /// does: 5 puts the new rows where row 5 is today and moves it down.
+    pub at_row: u32,
+    /// How many rows to insert
+    pub count: u32,
+    /// Must be true to write. Call with false first and show the person where
+    /// the rows go.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteRowsParam {
+    pub account: String,
+    pub spreadsheet_id: String,
+    /// The tab to delete from, by title
+    pub tab: String,
+    /// The first row to delete, counting from 1
+    pub from_row: u32,
+    /// How many rows to delete
+    pub count: u32,
+    /// Must be true to delete. Call with false first: the preview shows what
+    /// is in those rows today, which is the only guard against deleting the
+    /// wrong ones.
     pub confirmed: bool,
 }
 
@@ -318,6 +357,170 @@ impl Gmcp {
         ))))
     }
 
+    /// The tab a `tab` argument names, with its numeric id. Every structural
+    /// change below needs that id and a model only ever has the title, so the
+    /// lookup lives here once and answers an unknown title with the titles
+    /// that do exist.
+    async fn tab(
+        &self,
+        connection: &Connection,
+        spreadsheet_id: &str,
+        title: &str,
+    ) -> Result<sheets::Tab, ErrorData> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(bad("name the tab to change, by title"));
+        }
+        let spreadsheet = sheets::get(&self.google()?.client, connection.id, spreadsheet_id)
+            .await
+            .map_err(|e| self.google_err_for(connection, e))?;
+        spreadsheet
+            .tabs
+            .iter()
+            .find(|t| t.title.eq_ignore_ascii_case(title))
+            .cloned()
+            .ok_or_else(|| {
+                bad(format!(
+                    "there is no tab called {title:?} in that spreadsheet; it has {}",
+                    spreadsheet
+                        .tabs
+                        .iter()
+                        .map(|t| format!("{:?}", t.title))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+
+    #[tool(
+        description = "Insert empty rows into a tab, moving everything below them down. Rows are \
+                       numbered from 1 as in A1 notation, so at_row=5 puts the new rows where \
+                       row 5 is today. The new rows take the formatting of the row above them, \
+                       except at row 1, where there is none to take. Needs confirmed=true."
+    )]
+    async fn sheets_insert_rows(
+        &self,
+        Parameters(p): Parameters<InsertRowsParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::SheetWriteOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Sheets).await?;
+        let spreadsheet_id = p.spreadsheet_id.trim().to_string();
+        let count = row_count(p.count)?;
+        let at_row = row_number(p.at_row, "at_row")?;
+        let tab = self.tab(&connection, &spreadsheet_id, &p.tab).await?;
+        let last = at_row + count - 1;
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "insert {count} empty rows at row {at_row} of the tab {:?} \
+                     in spreadsheet {spreadsheet_id} in `{}`",
+                    tab.title, connection.label
+                ),
+                vec![
+                    format!(
+                        "rows {at_row} to {last} become empty; what is row {at_row} today \
+                         becomes row {}. Nothing is overwritten",
+                        at_row + count
+                    ),
+                    if at_row > 1 {
+                        format!("the new rows take the formatting of row {}", at_row - 1)
+                    } else {
+                        "inserted at the top, the new rows carry no formatting".into()
+                    },
+                ],
+            ))));
+        }
+        sheets::insert_rows(
+            &self.google()?.client,
+            connection.id,
+            &spreadsheet_id,
+            tab.sheet_id,
+            at_row,
+            count,
+        )
+        .await
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(row_out(
+            connection.label,
+            spreadsheet_id,
+            &tab.title,
+            at_row,
+            last,
+            count,
+            format!("{count} rows inserted at row {at_row} of {:?}", tab.title),
+        ))))
+    }
+
+    #[tool(
+        description = "Delete whole rows from a tab, moving everything below them up. Rows are \
+                       numbered from 1. Needs confirmed=true, and the preview shows what those \
+                       rows hold today — read it to the person, because it is the only thing \
+                       standing between a miscounted row number and lost data."
+    )]
+    async fn sheets_delete_rows(
+        &self,
+        Parameters(p): Parameters<DeleteRowsParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::SheetWriteOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Sheets).await?;
+        let spreadsheet_id = p.spreadsheet_id.trim().to_string();
+        let count = row_count(p.count)?;
+        let from_row = row_number(p.from_row, "from_row")?;
+        let tab = self.tab(&connection, &spreadsheet_id, &p.tab).await?;
+        let last = from_row + count - 1;
+        if !p.confirmed {
+            let doomed = sheets::values_get(
+                &self.google()?.client,
+                connection.id,
+                &spreadsheet_id,
+                &rows_range(&tab.title, from_row, last),
+                sheets::Render::Formatted,
+                Some(count as usize),
+            )
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+            let mut details = vec![
+                format!(
+                    "rows {from_row} to {last} are deleted and everything below them moves up; \
+                     there is no undo here"
+                ),
+                if doomed.rows.is_empty() {
+                    "those rows are empty today".to_string()
+                } else {
+                    "they hold this today:".to_string()
+                },
+            ];
+            details.extend(preview_rows(&doomed.rows));
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "delete rows {from_row} to {last} of the tab {:?} \
+                     in spreadsheet {spreadsheet_id} in `{}`",
+                    tab.title, connection.label
+                ),
+                details,
+            ))));
+        }
+        sheets::delete_rows(
+            &self.google()?.client,
+            connection.id,
+            &spreadsheet_id,
+            tab.sheet_id,
+            from_row,
+            count,
+        )
+        .await
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(row_out(
+            connection.label,
+            spreadsheet_id,
+            &tab.title,
+            from_row,
+            last,
+            count,
+            format!("rows {from_row} to {last} of {:?} deleted", tab.title),
+        ))))
+    }
+
     #[tool(
         description = "Add a tab to a spreadsheet. Needs confirmed=true. Nothing here deletes or \
                        reorders a tab."
@@ -494,6 +697,62 @@ fn write_out(
         updated_rows: Some(written.updated_rows),
         updated_cells: Some(written.updated_cells),
         written: summary,
+    }
+}
+
+/// A row number as the tools take it: 1-based, because every range these
+/// tools speak is A1 notation and a model that has just read `C7` should be
+/// able to say 7.
+fn row_number(value: u32, name: &str) -> Result<u32, ErrorData> {
+    if value == 0 {
+        return Err(bad(format!(
+            "{name} counts from 1, the way the row numbers down the side of the sheet do; \
+             there is no row 0"
+        )));
+    }
+    Ok(value)
+}
+
+/// How many rows one structural call may touch.
+fn row_count(value: u32) -> Result<u32, ErrorData> {
+    match value {
+        0 => Err(bad("count must be at least 1")),
+        n if n > MAX_ROWS_PER_CALL => Err(bad(format!(
+            "count is at most {MAX_ROWS_PER_CALL} rows in one call; \
+             ask the person before doing anything on that scale"
+        ))),
+        n => Ok(n),
+    }
+}
+
+/// Whole rows of one tab in A1 notation, `'September'!5:7`. The title is
+/// quoted always and its own quotes are doubled, because a tab called
+/// `Q3 2026` or `Anna's` is a perfectly ordinary tab.
+fn rows_range(tab: &str, from: u32, to: u32) -> String {
+    format!("'{}'!{from}:{to}", tab.replace('\'', "''"))
+}
+
+/// What a structural change answers: which rows it touched, as a range a
+/// person can look at.
+fn row_out(
+    account: String,
+    spreadsheet_id: String,
+    tab: &str,
+    from: u32,
+    to: u32,
+    count: u32,
+    written: String,
+) -> dto::SheetWriteOut {
+    dto::SheetWriteOut {
+        account,
+        url: Some(format!(
+            "https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+        )),
+        spreadsheet_id,
+        updated_range: Some(rows_range(tab, from, to)),
+        updated_rows: Some(count as i64),
+        updated_cells: None,
+        written,
     }
 }
 

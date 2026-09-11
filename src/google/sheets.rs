@@ -1,5 +1,6 @@
 //! Sheets: the tabs of a spreadsheet, a range read, two range writes and the
-//! one structural change this release makes, adding a tab.
+//! structural changes this release makes — adding a tab and inserting or
+//! deleting whole rows.
 //!
 //! Creating a whole spreadsheet is not here on purpose: a new Sheet is made
 //! through Drive, by uploading CSV and letting Drive convert it, which fills
@@ -16,6 +17,9 @@ const SHEETS: &str = "sheets";
 /// grid would get: `2026-09-08` becomes a date and `=SUM(A1:A2)` a formula,
 /// which is what someone asking a model to add rows means.
 const USER_ENTERED: &str = "USER_ENTERED";
+
+/// The only dimension this module changes. Columns are out of scope.
+const ROWS: &str = "ROWS";
 
 /// How a cell comes back from a read. `Formatted` is what the sheet shows and
 /// what a person reading the answer would see, so it stays the default.
@@ -117,7 +121,7 @@ pub async fn values_get(
         ))?
         .query(&[
             ("valueRenderOption", render.as_option()),
-            ("majorDimension", "ROWS"),
+            ("majorDimension", ROWS),
         ]);
     let wire: WireValueRange = client.json(connection_id, request).await?;
     let mut rows: Vec<Vec<String>> = wire
@@ -199,30 +203,108 @@ pub async fn values_update(
     Ok(wire.into())
 }
 
-/// `spreadsheets.batchUpdate` with one `addSheet`. The only structural change
-/// this release makes; nothing here deletes or reorders a tab.
-pub async fn add_tab(
+/// `spreadsheets.batchUpdate`, the one place a structural change is sent from.
+/// Every caller below builds exactly one request, so a failure changes one
+/// thing or nothing.
+async fn batch_update(
     client: &Client,
     connection_id: i64,
     spreadsheet_id: &str,
-    title: &str,
-) -> Result<Tab> {
-    let request = client
+    request: SheetRequest,
+) -> Result<WireBatchReply> {
+    let post = client
         .service(SHEETS)
         .post(&format!(
             "v4/spreadsheets/{}:batchUpdate",
             urlencode(spreadsheet_id)
         ))?
         .json(&BatchUpdate {
-            requests: vec![SheetRequest {
-                add_sheet: AddSheet {
-                    properties: NewSheetProperties {
-                        title: title.to_string(),
-                    },
-                },
-            }],
+            requests: vec![request],
         });
-    let wire: WireBatchReply = client.json(connection_id, request).await?;
+    client.json(connection_id, post).await
+}
+
+/// `insertDimension` over rows. `at_row` is 1-based, as every A1 range in
+/// these tools is, and becomes the API's 0-based `startIndex` here — the one
+/// place that conversion happens.
+///
+/// Inserted rows take the formatting of the row above them, which is what
+/// "add three more lines to this table" means. At row 1 there is no row above
+/// and the API refuses `inheritFromBefore`, so it is false there.
+pub async fn insert_rows(
+    client: &Client,
+    connection_id: i64,
+    spreadsheet_id: &str,
+    sheet_id: i64,
+    at_row: u32,
+    count: u32,
+) -> Result<()> {
+    let start = at_row.saturating_sub(1);
+    batch_update(
+        client,
+        connection_id,
+        spreadsheet_id,
+        SheetRequest::InsertDimension(InsertDimension {
+            range: DimensionRange {
+                sheet_id,
+                dimension: ROWS,
+                start_index: start,
+                end_index: start + count,
+            },
+            inherit_from_before: at_row > 1,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `deleteDimension` over rows. The rows below move up; the caller shows the
+/// person what is in them first, because that is the only guard there is.
+pub async fn delete_rows(
+    client: &Client,
+    connection_id: i64,
+    spreadsheet_id: &str,
+    sheet_id: i64,
+    from_row: u32,
+    count: u32,
+) -> Result<()> {
+    let start = from_row.saturating_sub(1);
+    batch_update(
+        client,
+        connection_id,
+        spreadsheet_id,
+        SheetRequest::DeleteDimension(DeleteDimension {
+            range: DimensionRange {
+                sheet_id,
+                dimension: ROWS,
+                start_index: start,
+                end_index: start + count,
+            },
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `spreadsheets.batchUpdate` with one `addSheet`. Nothing here deletes or
+/// reorders a tab.
+pub async fn add_tab(
+    client: &Client,
+    connection_id: i64,
+    spreadsheet_id: &str,
+    title: &str,
+) -> Result<Tab> {
+    let wire = batch_update(
+        client,
+        connection_id,
+        spreadsheet_id,
+        SheetRequest::AddSheet(AddSheet {
+            properties: NewSheetProperties {
+                title: title.to_string(),
+            },
+        }),
+    )
+    .await?;
     let properties = wire
         .replies
         .into_iter()
@@ -356,10 +438,14 @@ struct BatchUpdate {
     requests: Vec<SheetRequest>,
 }
 
+/// One `batchUpdate` request. Serde's external tagging is Google's own
+/// shape here: `{"insertDimension": {…}}`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SheetRequest {
-    add_sheet: AddSheet,
+enum SheetRequest {
+    AddSheet(AddSheet),
+    InsertDimension(InsertDimension),
+    DeleteDimension(DeleteDimension),
 }
 
 #[derive(Debug, Serialize)]
@@ -370,4 +456,28 @@ struct AddSheet {
 #[derive(Debug, Serialize)]
 struct NewSheetProperties {
     title: String,
+}
+
+/// Rows of one tab, as `insertDimension` and `deleteDimension` take them:
+/// 0-based, the start included and the end excluded.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DimensionRange {
+    sheet_id: i64,
+    dimension: &'static str,
+    start_index: u32,
+    end_index: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertDimension {
+    range: DimensionRange,
+    inherit_from_before: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteDimension {
+    range: DimensionRange,
 }

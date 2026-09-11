@@ -349,6 +349,8 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("sheets_read_range", needs(Service::Sheets, Level::Read)),
     ("sheets_append_rows", needs(Service::Sheets, Level::Write)),
     ("sheets_update_range", needs(Service::Sheets, Level::Write)),
+    ("sheets_insert_rows", needs(Service::Sheets, Level::Write)),
+    ("sheets_delete_rows", needs(Service::Sheets, Level::Write)),
     ("sheets_add_tab", needs(Service::Sheets, Level::Write)),
     ("sheets_create", needs(Service::Sheets, Level::Write)),
     ("calendar_list", needs(Service::Calendar, Level::Read)),
@@ -558,7 +560,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 37);
+        assert_eq!(TOOLS.len(), 39);
     }
 
     #[test]
