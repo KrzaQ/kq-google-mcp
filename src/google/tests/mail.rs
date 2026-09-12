@@ -647,6 +647,110 @@ async fn a_draft_with_files_goes_to_the_upload_endpoint() {
     assert!(body.contains(r#"{"message":{}}"#), "{body}");
 }
 
+/// Adding a file to a draft means rebuilding the message, so everything the
+/// draft has must survive the read: the headers, both bodies, the threading
+/// and the files it already carries, bytes included.
+#[tokio::test]
+async fn a_draft_is_read_back_raw_with_its_headers_bodies_and_files() {
+    let h = harness().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r-8812345678901234567"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_draft_raw.json")))
+        .mount(&h.server)
+        .await;
+
+    let draft = gmail::get_draft_raw(&h.client, CONNECTION, "r-8812345678901234567")
+        .await
+        .unwrap();
+    let content = &draft.content;
+    assert_eq!(content.from, "\"Anna Kowalska\" <anna@example.test>");
+    assert_eq!(content.to, ["\"Marta Nowak\" <marta@example.test>"]);
+    assert_eq!(content.cc, ["team@example.test"]);
+    // A draft keeps its blind copies, and so does the message written back.
+    assert_eq!(content.bcc, ["archiwum@example.test"]);
+    // The encoded word is decoded here and written afresh by the rebuild.
+    assert_eq!(content.subject, "Re: Q3 figures for Kraków");
+    assert!(content.text.contains("w załączeniu raport."), "{content:?}");
+    assert!(
+        content
+            .html
+            .as_deref()
+            .unwrap_or_default()
+            .contains("<b>raport</b>"),
+        "{content:?}"
+    );
+    // The conversation: losing any of these three takes the draft out of it.
+    assert_eq!(
+        content.in_reply_to.as_deref(),
+        Some("<CAF7n2sabc123@mail.example.test>")
+    );
+    assert_eq!(
+        content.references,
+        [
+            "<20260901T090000.0@example.test>",
+            "<CAF7n2sabc123@mail.example.test>"
+        ]
+    );
+    assert_eq!(content.thread_id.as_deref(), Some("18f0a1b2c3d4e5f0"));
+    assert!(draft.inline_ids.is_empty());
+
+    // The file that was already there, with its bytes: raw is what makes that
+    // one call rather than one more per file.
+    assert_eq!(content.attachments.len(), 1);
+    let file = &content.attachments[0];
+    assert_eq!(file.filename, "raport.pdf");
+    assert_eq!(file.mime_type, "application/pdf");
+    assert_eq!(file.bytes, b"%PDF-1.7 raport kwartalny");
+    let calls = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.url.path().contains("/drafts/"))
+        .count();
+    assert_eq!(calls, 1);
+
+    // And what came back can be written again, which is the whole point: the
+    // addresses are in the form a mail library reads back as it wrote them.
+    let mime = without_date(&gmail::build_mime(content).unwrap());
+    assert!(mime.contains("<anna@example.test>"), "{mime}");
+    assert!(mime.contains("Bcc: archiwum@example.test"), "{mime}");
+    assert!(mime.contains("filename=\"raport.pdf\""), "{mime}");
+}
+
+/// A draft whose body names its pictures cannot be rebuilt from its parts,
+/// so the read says which parts those are and the tool refuses.
+#[tokio::test]
+async fn a_draft_says_which_parts_its_body_names_by_content_id() {
+    let h = harness().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/drafts/r-4400000000000000002"))
+        .and(query_param("format", "raw"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture("gmail_draft_raw_inline.json")),
+        )
+        .mount(&h.server)
+        .await;
+
+    let draft = gmail::get_draft_raw(&h.client, CONNECTION, "r-4400000000000000002")
+        .await
+        .unwrap();
+    // The picture is what the body refers to, not a file beside it, so it is
+    // reported by the name the body uses and is not listed as an attachment.
+    assert_eq!(draft.inline_ids, ["chart-q3@example.test"]);
+    assert!(draft.content.attachments.is_empty());
+    // A draft written in HTML alone still has plain text to write back.
+    assert!(draft.content.text.contains("Wykres"), "{:?}", draft.content);
+    assert!(
+        draft
+            .content
+            .html
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cid:chart-q3@example.test")
+    );
+}
+
 #[tokio::test]
 async fn drafts_are_listed_updated_and_deleted_and_nothing_is_ever_sent() {
     let h = harness().await;

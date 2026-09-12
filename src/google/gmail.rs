@@ -8,10 +8,15 @@
 //!
 //! Messages come back from Google in `format=full`, which is already
 //! decomposed into MIME parts with an `attachmentId` per attachment — the id
-//! the attachments endpoint needs, and the reason the raw format is not used.
+//! the attachments endpoint needs, and the reason the raw format is not used
+//! for reading mail. A draft that is about to be written again is the one
+//! thing read as `format=raw`: rebuilding it needs the bytes of the files it
+//! already carries, and raw is the only format that brings them in the same
+//! answer.
+//!
 //! `mail-parser` does the part of the job Google leaves alone: decoding header
-//! values (RFC 2047 words, address lists, identifier lists) and turning an
-//! HTML-only body into something readable.
+//! values (RFC 2047 words, address lists, identifier lists), taking a raw
+//! draft apart, and turning an HTML-only body into something readable.
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
@@ -19,7 +24,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use lettre::message::header::{ContentType, InReplyTo, MessageId, References};
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use mail_parser::parsers::MessageStream;
-use mail_parser::{Address, HeaderValue};
+use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Error, Result, urlencode};
@@ -37,6 +42,12 @@ const REFUSED_LABELS: [&str; 2] = ["TRASH", "SPAM"];
 const SUMMARY_HEADERS: [&str; 4] = ["From", "To", "Subject", "Date"];
 /// The label id Gmail puts on a message the account sent itself.
 const SENT_LABEL: &str = "SENT";
+/// What a file is called when the part carrying it names it nothing. A MIME
+/// part may have no filename at all, and a message still has to be buildable
+/// from what came back.
+const UNNAMED_FILE: &str = "attachment";
+/// Bytes nobody can vouch for.
+const OCTET_STREAM: &str = "application/octet-stream";
 
 /// One row of a search result.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -145,13 +156,7 @@ impl SendAs {
     /// has a display name, so the draft reads like one written by hand, and
     /// the bare address when it does not.
     pub fn header(&self) -> String {
-        match self.display_name.as_deref().map(str::trim) {
-            Some(name) if !name.is_empty() => {
-                let escaped = name.replace('\\', r"\\").replace('"', "\\\"");
-                format!("\"{escaped}\" <{}>", self.email)
-            }
-            _ => self.email.clone(),
-        }
+        quoted(self.display_name.as_deref(), &self.email)
     }
 }
 
@@ -309,6 +314,20 @@ fn reply_subject(subject: Option<&str>) -> String {
 /// only the address inside the angle brackets is compared.
 fn same_address(a: &str, b: &str) -> bool {
     bare_address(a).eq_ignore_ascii_case(&bare_address(b))
+}
+
+/// One mailbox written the way a mail library reads it back: `"Display Name"
+/// <address>`, or the bare address when there is no name. The quotes are what
+/// makes it safe to read again — a name with a comma or a full stop in it is
+/// one mailbox inside them and two, or none, without them.
+fn quoted(name: Option<&str>, address: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => {
+            let escaped = name.replace('\\', r"\\").replace('"', "\\\"");
+            format!("\"{escaped}\" <{address}>")
+        }
+        None => address.to_string(),
+    }
 }
 
 /// The address inside a header value, with any display name dropped: both
@@ -557,6 +576,139 @@ pub async fn get_draft(client: &Client, connection_id: i64, draft_id: &str) -> R
         .ok_or_else(|| Error::Malformed(format!("draft {draft_id} came back without a message")))
 }
 
+/// A draft read back as the message it is: everything a rewrite has to keep,
+/// and the files it already carries with their bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawDraft {
+    /// The draft as [`create_draft`] and [`update_draft`] take it, so adding
+    /// a file to it is pushing one onto `attachments` and writing it back.
+    pub content: DraftContent,
+    /// The `Content-ID` of every part the HTML body names with `cid:`. A
+    /// draft that has any of these cannot be rebuilt from its parts — the
+    /// pictures in the body would lose what the body refers to them by — so
+    /// the caller refuses rather than writing a broken message.
+    pub inline_ids: Vec<String>,
+}
+
+/// `users.drafts.get` with `format=raw`, taken apart into the message it is.
+///
+/// Raw is the format that makes this one call: it carries the bytes of every
+/// attachment with the draft, where `format=full` carries ids and would need
+/// one more call per file. `mail-parser` does the taking apart, as it does
+/// everywhere else in this module.
+pub async fn get_draft_raw(
+    client: &Client,
+    connection_id: i64,
+    draft_id: &str,
+) -> Result<RawDraft> {
+    let request = client
+        .service(GMAIL)
+        .get(&format!(
+            "gmail/v1/users/{USER}/drafts/{}",
+            urlencode(draft_id)
+        ))?
+        .query(&[("format", "raw")]);
+    let wire: WireDraft = client.json(connection_id, request).await?;
+    let message = wire
+        .message
+        .ok_or_else(|| Error::Malformed(format!("draft {draft_id} came back without a message")))?;
+    let raw = message.raw.as_deref().ok_or_else(|| {
+        Error::Malformed(format!(
+            "draft {draft_id} came back without its raw message"
+        ))
+    })?;
+    parse_draft(&decode_body(raw)?, message.thread_id)
+}
+
+/// One RFC 2822 message, as the draft it can be written back as.
+fn parse_draft(raw: &[u8], thread_id: String) -> Result<RawDraft> {
+    let message = MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| Error::Malformed("the draft is not a message that can be read".into()))?;
+    let one = |address: Option<&Address>| -> String {
+        mailboxes(address)
+            .first()
+            .map(|(name, address)| quoted(name.as_deref(), address))
+            .unwrap_or_default()
+    };
+    let many = |address: Option<&Address>| -> Vec<String> {
+        mailboxes(address)
+            .iter()
+            .map(|(name, address)| quoted(name.as_deref(), address))
+            .collect()
+    };
+    let html = message.html_bodies().find_map(|part| match &part.body {
+        PartType::Html(html) => Some(html.as_ref().to_string()),
+        _ => None,
+    });
+    let text: Vec<&str> = message
+        .text_bodies()
+        .filter_map(|part| match &part.body {
+            PartType::Text(text) => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
+    // A draft written in HTML alone keeps its HTML and gains the plain-text
+    // reading of it, which is what this module does with any such message.
+    let text = match text.join("\n").trim_end().to_string() {
+        text if text.is_empty() => html.as_deref().map(html_to_text).unwrap_or_default(),
+        text => text,
+    };
+    let mut attachments = Vec::new();
+    let mut inline_ids = Vec::new();
+    for (index, part) in message.parts.iter().enumerate() {
+        let id = index as u32;
+        // The bodies are the message, not files beside it, and a multipart
+        // part is only the box the others came in.
+        if part.is_multipart() || message.text_body.contains(&id) || message.html_body.contains(&id)
+        {
+            continue;
+        }
+        if let Some(content_id) = part.content_id() {
+            inline_ids.push(
+                content_id
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+            continue;
+        }
+        attachments.push(NewAttachment {
+            filename: part.attachment_name().unwrap_or(UNNAMED_FILE).to_string(),
+            mime_type: part_mime(part),
+            bytes: part.contents().to_vec(),
+        });
+    }
+    Ok(RawDraft {
+        content: DraftContent {
+            from: one(message.from()),
+            to: many(message.to()),
+            cc: many(message.cc()),
+            bcc: many(message.bcc()),
+            subject: message.subject().unwrap_or_default().to_string(),
+            text,
+            html,
+            in_reply_to: identifiers(message.in_reply_to()).into_iter().next(),
+            references: identifiers(message.references()),
+            thread_id: Some(thread_id).filter(|id| !id.trim().is_empty()),
+            attachments,
+        },
+        inline_ids,
+    })
+}
+
+/// What one part says it is, as a content type a message can be built with.
+fn part_mime(part: &mail_parser::MessagePart) -> String {
+    match part.content_type() {
+        Some(content_type) => match content_type.subtype() {
+            Some(subtype) => format!("{}/{subtype}", content_type.ctype()),
+            None => content_type.ctype().to_string(),
+        },
+        None => OCTET_STREAM.to_string(),
+    }
+}
+
 /// `users.drafts.create`. The one way a message is ever written here.
 pub async fn create_draft(
     client: &Client,
@@ -795,6 +947,8 @@ struct WireMessage {
     /// `Date` header, which the sender writes.
     internal_date: Option<String>,
     payload: Option<WirePart>,
+    /// The whole message, base64url, as `format=raw` answers it.
+    raw: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1046,24 +1200,43 @@ fn text_header(value: &str) -> String {
 
 /// An address header, as `Name <address>` or the bare address.
 fn address_header(value: &str) -> Vec<String> {
+    match parse(value, |s| s.parse_address()) {
+        HeaderValue::Address(address) => mailboxes(Some(&address))
+            .into_iter()
+            .map(|(name, address)| match name {
+                Some(name) => format!("{name} <{address}>"),
+                None => address,
+            })
+            .collect(),
+        _ => vec![value.trim().to_string()],
+    }
+}
+
+/// Every mailbox an address header names, as its display name and its
+/// address. Groups are flattened: a draft is written to people, and a group
+/// is a list of them.
+fn mailboxes(address: Option<&Address>) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     let mut push = |addr: &mail_parser::Addr| {
         let address = addr.address.as_deref().unwrap_or_default().trim();
         if address.is_empty() {
             return;
         }
-        out.push(match addr.name.as_deref().map(str::trim) {
-            Some(name) if !name.is_empty() => format!("{name} <{address}>"),
-            _ => address.to_string(),
-        });
+        let name = addr
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        out.push((name, address.to_string()));
     };
-    match parse(value, |s| s.parse_address()) {
-        HeaderValue::Address(Address::List(list)) => list.iter().for_each(&mut push),
-        HeaderValue::Address(Address::Group(groups)) => groups
+    match address {
+        Some(Address::List(list)) => list.iter().for_each(&mut push),
+        Some(Address::Group(groups)) => groups
             .iter()
             .flat_map(|g| g.addresses.iter())
             .for_each(&mut push),
-        _ => out.push(value.trim().to_string()),
+        None => {}
     }
     out
 }
@@ -1071,17 +1244,28 @@ fn address_header(value: &str) -> Vec<String> {
 /// An identifier header (`Message-ID`, `In-Reply-To`, `References`), as the
 /// list of ids it names, angle brackets stripped by the parser.
 fn id_header(value: &str) -> Vec<String> {
-    let wrap = |id: &str| {
-        format!(
-            "<{}>",
-            id.trim().trim_start_matches('<').trim_end_matches('>')
-        )
-    };
-    match parse(value, |s| s.parse_id()) {
-        HeaderValue::Text(id) => vec![wrap(&id)],
-        HeaderValue::TextList(ids) => ids.iter().map(|id| wrap(id)).collect(),
-        _ => value.split_whitespace().map(wrap).collect(),
+    let ids = identifiers(&parse(value, |s| s.parse_id()));
+    if ids.is_empty() {
+        return value.split_whitespace().map(wrap_id).collect();
     }
+    ids
+}
+
+/// The ids inside an identifier header a message was parsed from, each one in
+/// the angle brackets a `References` line is written with.
+fn identifiers(value: &HeaderValue) -> Vec<String> {
+    match value {
+        HeaderValue::Text(id) => vec![wrap_id(id)],
+        HeaderValue::TextList(ids) => ids.iter().map(|id| wrap_id(id)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn wrap_id(id: &str) -> String {
+    format!(
+        "<{}>",
+        id.trim().trim_start_matches('<').trim_end_matches('>')
+    )
 }
 
 /// mail-parser's field parsers read a header value up to its terminating
