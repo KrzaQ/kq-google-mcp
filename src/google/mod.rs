@@ -18,6 +18,7 @@ pub mod client;
 pub mod docs;
 pub mod drive;
 pub mod gmail;
+pub mod multipart;
 pub mod oauth;
 pub mod sheets;
 pub mod text;

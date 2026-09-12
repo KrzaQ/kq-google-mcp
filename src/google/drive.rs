@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Download, Error, Result, urlencode};
+use super::multipart;
 
 /// What Google calls a Doc, a Sheet and a folder.
 pub const DOCUMENT_MIME: &str = "application/vnd.google-apps.document";
@@ -288,47 +289,20 @@ async fn create(
         "mimeType": target_mime,
         "parents": folder_id.map(|id| vec![id]).unwrap_or_default(),
     });
-    let boundary = boundary();
-    let body = multipart_related(&boundary, &metadata.to_string(), source_mime, content);
+    let boundary = multipart::boundary();
+    let body = multipart::related(
+        &boundary,
+        &metadata.to_string(),
+        &format!("{source_mime}; charset=UTF-8"),
+        content,
+    );
     let request = client
         .post("upload/drive/v3/files")?
         .query(&[("uploadType", "multipart"), ("fields", FILE_FIELDS)])
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            format!("multipart/related; boundary={boundary}"),
-        )
+        .header(reqwest::header::CONTENT_TYPE, multipart::header(&boundary))
         .body(body);
     let wire: WireFile = client.json(connection_id, request).await?;
     Ok(wire.into())
-}
-
-/// The two parts, with CRLF line endings as the format requires.
-fn multipart_related(
-    boundary: &str,
-    metadata: &str,
-    content_mime: &str,
-    content: &[u8],
-) -> Vec<u8> {
-    let mut body = Vec::with_capacity(content.len() + metadata.len() + 256);
-    let mut push = |s: &str| body.extend_from_slice(s.as_bytes());
-    push(&format!("--{boundary}\r\n"));
-    push("Content-Type: application/json; charset=UTF-8\r\n\r\n");
-    push(metadata);
-    push(&format!("\r\n--{boundary}\r\n"));
-    push(&format!(
-        "Content-Type: {content_mime}; charset=UTF-8\r\n\r\n"
-    ));
-    body.extend_from_slice(content);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body
-}
-
-/// A boundary that cannot occur in the content. Random rather than fixed
-/// because the content is whatever a model wrote.
-fn boundary() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("os randomness");
-    format!("gmcp{}", hex::encode(bytes))
 }
 
 /// Refuse a format the file cannot produce, with the ones it can.

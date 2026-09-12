@@ -16,13 +16,14 @@
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeZone, Utc};
-use lettre::message::header::{InReplyTo, MessageId, References};
+use lettre::message::header::{ContentType, InReplyTo, MessageId, References};
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use mail_parser::parsers::MessageStream;
 use mail_parser::{Address, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Error, Result, urlencode};
+use super::multipart;
 
 /// Everything is done as the connected account.
 const USER: &str = "me";
@@ -196,8 +197,9 @@ impl DraftRef {
     }
 }
 
-/// What a draft is made of. There is no attachment field: attaching files is
-/// deliberately out of this release.
+/// What a draft is made of, attachments included. A file gets here as bytes
+/// and nothing else: the server reads no path a caller supplies, because the
+/// caller is on another machine.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftContent {
     /// Which of the account's send-as addresses the draft is written as.
@@ -215,6 +217,19 @@ pub struct DraftContent {
     pub references: Vec<String>,
     /// Set so Gmail files the draft in the right conversation.
     pub thread_id: Option<String>,
+    /// The files the message carries. Empty is the common case, and a draft
+    /// with nothing here is built and sent to Gmail exactly as it was before
+    /// attachments existed.
+    pub attachments: Vec<NewAttachment>,
+}
+
+/// A file to attach to a draft: the bytes themselves, the name the recipient
+/// sees, and what it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 impl DraftContent {
@@ -267,6 +282,7 @@ impl DraftContent {
             in_reply_to: message.message_id.clone(),
             references,
             thread_id: Some(message.thread_id.clone()),
+            attachments: Vec::new(),
         }
     }
 }
@@ -547,10 +563,21 @@ pub async fn create_draft(
     connection_id: i64,
     content: &DraftContent,
 ) -> Result<DraftRef> {
-    let request = client
-        .service(GMAIL)
-        .post(&format!("gmail/v1/users/{USER}/drafts"))?
-        .json(&draft_body(content)?);
+    let mime = build_mime(content)?;
+    let request = if content.attachments.is_empty() {
+        client
+            .service(GMAIL)
+            .post(&format!("gmail/v1/users/{USER}/drafts"))?
+            .json(&draft_body(content, &mime))
+    } else {
+        upload(
+            client
+                .service(GMAIL)
+                .post(&format!("upload/gmail/v1/users/{USER}/drafts"))?,
+            content,
+            &mime,
+        )
+    };
     let wire: WireDraft = client.json(connection_id, request).await?;
     draft_ref(wire)
 }
@@ -562,15 +589,50 @@ pub async fn update_draft(
     draft_id: &str,
     content: &DraftContent,
 ) -> Result<DraftRef> {
-    let request = client
-        .service(GMAIL)
-        .put(&format!(
-            "gmail/v1/users/{USER}/drafts/{}",
-            urlencode(draft_id)
-        ))?
-        .json(&draft_body(content)?);
+    let mime = build_mime(content)?;
+    let request = if content.attachments.is_empty() {
+        client
+            .service(GMAIL)
+            .put(&format!(
+                "gmail/v1/users/{USER}/drafts/{}",
+                urlencode(draft_id)
+            ))?
+            .json(&draft_body(content, &mime))
+    } else {
+        upload(
+            client.service(GMAIL).put(&format!(
+                "upload/gmail/v1/users/{USER}/drafts/{}",
+                urlencode(draft_id)
+            ))?,
+            content,
+            &mime,
+        )
+    };
     let wire: WireDraft = client.json(connection_id, request).await?;
     draft_ref(wire)
+}
+
+/// The same draft, sent the way Gmail takes a message too large to carry as
+/// JSON: `uploadType=multipart`, a metadata part naming the conversation and
+/// the raw message beside it as `message/rfc822`. A draft with a file
+/// attached to it is such a message — base64 inside JSON would be a third
+/// again as large as the file, and the JSON endpoint has its own limit well
+/// under what one mail may carry.
+fn upload(
+    request: reqwest::RequestBuilder,
+    content: &DraftContent,
+    mime: &[u8],
+) -> reqwest::RequestBuilder {
+    let metadata = match &content.thread_id {
+        Some(thread_id) => serde_json::json!({ "message": { "threadId": thread_id } }),
+        None => serde_json::json!({ "message": {} }),
+    };
+    let boundary = multipart::boundary();
+    let body = multipart::related(&boundary, &metadata.to_string(), "message/rfc822", mime);
+    request
+        .query(&[("uploadType", "multipart")])
+        .header(reqwest::header::CONTENT_TYPE, multipart::header(&boundary))
+        .body(body)
 }
 
 /// `users.drafts.delete`, the undo for a draft and the only delete in this
@@ -594,17 +656,21 @@ fn draft_ref(wire: WireDraft) -> Result<DraftRef> {
     })
 }
 
-fn draft_body(content: &DraftContent) -> Result<DraftRequest> {
-    Ok(DraftRequest {
+fn draft_body(content: &DraftContent, mime: &[u8]) -> DraftRequest {
+    DraftRequest {
         message: DraftMessage {
-            raw: URL_SAFE_NO_PAD.encode(build_mime(content)?),
+            raw: URL_SAFE_NO_PAD.encode(mime),
             thread_id: content.thread_id.clone(),
         },
-    })
+    }
 }
 
 /// The RFC 2822 message a draft is made of, built with lettre. Text alone, or
-/// text and HTML as alternatives so a plain-text reader still gets something.
+/// text and HTML as alternatives so a plain-text reader still gets something;
+/// with files, that same body goes inside a `multipart/mixed` with them.
+///
+/// A draft with no attachments is built exactly as it was before there were
+/// any, down to the byte, and the module's tests hold it to that.
 pub fn build_mime(content: &DraftContent) -> Result<Vec<u8>> {
     let mailbox = |value: &str| -> Result<Mailbox> {
         value
@@ -630,15 +696,45 @@ pub fn build_mime(content: &DraftContent) -> Result<Vec<u8>> {
     if !content.references.is_empty() {
         builder = builder.header(References::from(content.references.join(" ")));
     }
-    let message = match &content.html {
-        Some(html) => builder.multipart(MultiPart::alternative_plain_html(
-            content.text.clone(),
-            html.clone(),
-        )),
-        None => builder.singlepart(SinglePart::plain(content.text.clone())),
+    let message = if content.attachments.is_empty() {
+        match &content.html {
+            Some(html) => builder.multipart(MultiPart::alternative_plain_html(
+                content.text.clone(),
+                html.clone(),
+            )),
+            None => builder.singlepart(SinglePart::plain(content.text.clone())),
+        }
+    } else {
+        let body = match &content.html {
+            Some(html) => MultiPart::mixed().multipart(MultiPart::alternative_plain_html(
+                content.text.clone(),
+                html.clone(),
+            )),
+            None => MultiPart::mixed().singlepart(SinglePart::plain(content.text.clone())),
+        };
+        let mut mixed = body;
+        for file in &content.attachments {
+            mixed = mixed.singlepart(attachment_part(file)?);
+        }
+        builder.multipart(mixed)
     }
     .map_err(|e| Error::Malformed(format!("the draft could not be built: {e}")))?;
     Ok(message.formatted())
+}
+
+/// One file as a MIME part. The type is whatever the upload settled on, and
+/// a type that will not parse is refused here rather than written into a
+/// header: the message must stay a message.
+fn attachment_part(file: &NewAttachment) -> Result<SinglePart> {
+    let content_type = ContentType::parse(&file.mime_type).map_err(|e| {
+        Error::Malformed(format!(
+            "{} is not a content type for {}: {e}",
+            file.mime_type, file.filename
+        ))
+    })?;
+    // Spelled out, because `Attachment` in this module is one that arrived.
+    Ok(lettre::message::Attachment::new(file.filename.clone())
+        .body(file.bytes.clone(), content_type))
 }
 
 /// A `Message-ID` header, for the rare caller that needs to set one.

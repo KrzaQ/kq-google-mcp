@@ -541,6 +541,7 @@ impl Gmcp {
             in_reply_to: existing.in_reply_to.filter(|id| !id.trim().is_empty()),
             references: existing.references,
             thread_id: Some(existing.thread_id).filter(|id| !id.trim().is_empty()),
+            attachments: Vec::new(),
         };
         let draft = gmail::update_draft(client, connection.id, draft_id, &content)
             .await

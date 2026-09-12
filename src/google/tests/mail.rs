@@ -421,6 +421,215 @@ async fn a_draft_with_html_is_sent_as_alternatives() {
     assert!(body["message"].get("threadId").is_none());
 }
 
+/// The message without its `Date`, which is the clock and not the draft.
+fn without_date(mime: &[u8]) -> String {
+    String::from_utf8(mime.to_vec())
+        .expect("the message is UTF-8")
+        .replace("\r\n", "\n")
+        .lines()
+        .filter(|line| !line.starts_with("Date: "))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A draft that carries no file must be the message this server has always
+/// written, byte for byte: attachments are a new shape for a new case and
+/// must not touch the common one.
+#[test]
+fn a_draft_with_no_attachments_is_the_message_it_has_always_been() {
+    let mut content = gmail::DraftContent {
+        from: "anna@example.test".into(),
+        to: vec!["marta@example.test".into()],
+        subject: "Q3".into(),
+        text: "here they are".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        without_date(&gmail::build_mime(&content).unwrap()),
+        "From: anna@example.test\n\
+         Subject: Q3\n\
+         To: marta@example.test\n\
+         MIME-Version: 1.0\n\
+         Content-Type: text/plain; charset=utf-8\n\
+         Content-Transfer-Encoding: 7bit\n\
+         \n\
+         here they are\n"
+    );
+
+    // And with HTML it is still the two alternatives and nothing around them.
+    content.html = Some("<p>here they are</p>".into());
+    let mime = without_date(&gmail::build_mime(&content).unwrap());
+    assert!(
+        mime.contains("Content-Type: multipart/alternative;"),
+        "{mime}"
+    );
+    assert!(!mime.contains("multipart/mixed"), "{mime}");
+    assert_eq!(mime.matches("boundary=").count(), 1, "{mime}");
+}
+
+#[test]
+fn a_draft_with_files_carries_them_beside_the_body() {
+    let content = gmail::DraftContent {
+        from: "anna@example.test".into(),
+        to: vec!["marta@example.test".into()],
+        subject: "Q3".into(),
+        text: "both are attached".into(),
+        html: Some("<p>both are attached</p>".into()),
+        attachments: vec![
+            gmail::NewAttachment {
+                filename: "raport.pdf".into(),
+                mime_type: "application/pdf".into(),
+                bytes: vec![0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x01],
+            },
+            gmail::NewAttachment {
+                filename: "zażółć.csv".into(),
+                mime_type: "text/csv".into(),
+                bytes: b"a,b\n1,2\n".to_vec(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mime = without_date(&gmail::build_mime(&content).unwrap());
+    // The body the message always had, inside a mixed part with the files.
+    assert!(mime.contains("Content-Type: multipart/mixed;"), "{mime}");
+    assert!(
+        mime.contains("Content-Type: multipart/alternative;"),
+        "{mime}"
+    );
+    assert!(mime.contains("both are attached"), "{mime}");
+    assert!(mime.contains("Content-Type: application/pdf"), "{mime}");
+    assert!(mime.contains("Content-Type: text/csv"), "{mime}");
+    assert!(
+        mime.contains("Content-Disposition: attachment; filename=\"raport.pdf\""),
+        "{mime}"
+    );
+    // A filename that is not ASCII is encoded rather than written raw, which
+    // is lettre's business; what matters here is that it is named at all.
+    assert!(mime.contains("filename"), "{mime}");
+    // Bytes that are not text travel as base64, or the message would be
+    // corrupt by the time Gmail read it.
+    use base64::Engine as _;
+    assert!(mime.contains("Content-Transfer-Encoding: base64"), "{mime}");
+    assert!(
+        mime.contains(
+            &base64::engine::general_purpose::STANDARD
+                .encode([0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x01])
+        ),
+        "{mime}"
+    );
+
+    // A content type that is not one is refused rather than written into a
+    // header: the message has to stay a message.
+    let mut broken = content.clone();
+    broken.attachments[0].mime_type = "not a type".into();
+    let error = gmail::build_mime(&broken).unwrap_err().to_string();
+    assert!(error.contains("raport.pdf"), "{error}");
+}
+
+/// A message with a file in it is too large to go as base64 inside JSON, so
+/// it goes to Gmail's upload endpoint instead. A draft with no file keeps the
+/// JSON path it has always used, which the tests above cover.
+#[tokio::test]
+async fn a_draft_with_files_goes_to_the_upload_endpoint() {
+    let h = harness().await;
+    h.mount_json(
+        "POST",
+        "/upload/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    h.mount_json(
+        "PUT",
+        "/upload/gmail/v1/users/me/drafts/r-8812345678901234567",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    // The JSON endpoint must not be asked to carry a file.
+    h.server
+        .register(
+            Mock::given(path("/gmail/v1/users/me/drafts"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("a draft with a file does not go as JSON"),
+        )
+        .await;
+
+    let content = gmail::DraftContent {
+        from: "anna@example.test".into(),
+        to: vec!["marta@example.test".into()],
+        subject: "Q3".into(),
+        text: "attached".into(),
+        thread_id: Some("18f0a1b2c3d4e5f0".into()),
+        attachments: vec![gmail::NewAttachment {
+            filename: "raport.pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: b"%PDF-1.7 x".to_vec(),
+        }],
+        ..Default::default()
+    };
+    let created = gmail::create_draft(&h.client, CONNECTION, &content)
+        .await
+        .unwrap();
+    assert_eq!(created.id, "r-8812345678901234567");
+
+    let request = h.last("POST", "/upload/gmail/v1/users/me/drafts").await;
+    assert_eq!(
+        request.url.query_pairs().find(|(k, _)| k == "uploadType"),
+        Some((
+            std::borrow::Cow::Borrowed("uploadType"),
+            std::borrow::Cow::Borrowed("multipart")
+        ))
+    );
+    let content_type = request.headers["content-type"].to_str().unwrap();
+    assert!(
+        content_type.starts_with("multipart/related; boundary=gmcp"),
+        "{content_type}"
+    );
+    let body = String::from_utf8_lossy(&request.body).to_string();
+    // The metadata part names the conversation, and the message travels as
+    // itself rather than as base64 inside JSON.
+    assert!(
+        body.contains(r#"{"message":{"threadId":"18f0a1b2c3d4e5f0"}}"#),
+        "{body}"
+    );
+    assert!(body.contains("Content-Type: message/rfc822"), "{body}");
+    assert!(body.contains("Subject: Q3"), "{body}");
+    assert!(body.contains("filename=\"raport.pdf\""), "{body}");
+
+    // The same for a rewrite, which is a PUT on the draft's own id.
+    gmail::update_draft(&h.client, CONNECTION, "r-8812345678901234567", &content)
+        .await
+        .unwrap();
+    let request = h
+        .last(
+            "PUT",
+            "/upload/gmail/v1/users/me/drafts/r-8812345678901234567",
+        )
+        .await;
+    assert!(
+        request
+            .url
+            .query()
+            .unwrap_or_default()
+            .contains("uploadType=multipart")
+    );
+
+    // A draft with no file at all has no thread to name either, and the
+    // metadata part says so rather than naming a null one.
+    let mut fresh = content.clone();
+    fresh.thread_id = None;
+    gmail::create_draft(&h.client, CONNECTION, &fresh)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(
+        &h.last("POST", "/upload/gmail/v1/users/me/drafts")
+            .await
+            .body,
+    )
+    .to_string();
+    assert!(body.contains(r#"{"message":{}}"#), "{body}");
+}
+
 #[tokio::test]
 async fn drafts_are_listed_updated_and_deleted_and_nothing_is_ever_sent() {
     let h = harness().await;
@@ -613,6 +822,11 @@ fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
     // exactly one path segment rather than pasted in raw.
     assert!(source.contains("/drafts/{}"));
     assert!(source.contains("urlencode(draft_id)"));
+    // And so are the two a draft with a file goes to. They are drafts
+    // endpoints like the others, which is the point: `upload` in a Gmail path
+    // is how a message is uploaded, never how one is sent.
+    assert!(source.contains(&format!("upload/gmail/v1/users/{{USER}}/drafts")));
+    assert!(source.contains(&format!("upload/gmail/v1/users/{{USER}}/drafts/{{}}")));
 }
 
 #[test]
