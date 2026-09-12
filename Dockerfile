@@ -36,13 +36,17 @@ COPY --from=backend /usr/local/bin/gmcp /usr/local/bin/gmcp
 # uid is part of the deployment contract. docs/deploy.md chowns `data/` to it.
 RUN groupadd --system --gid 10001 gmcp \
     && useradd --system --uid 10001 --gid 10001 --create-home gmcp \
-    && install -d -o gmcp -g gmcp /data
+    && install -d -o gmcp -g gmcp /data \
+    && install -d -o gmcp -g gmcp -m 700 /uploads
 USER gmcp
-# The container's own defaults. `GMCP_DATABASE` points at the volume, so a
-# `.env` that forgets it still stores the database where the mount is.
+# The container's own defaults. `GMCP_DATABASE` and `GMCP_UPLOAD_DIR` point at
+# the two mounts, so a `.env` that forgets them still puts the database and
+# the staged uploads where the host can see them. Everything under /uploads is
+# disposable: the server empties it at every startup.
 ENV GMCP_BIND=0.0.0.0:8000 \
-    GMCP_DATABASE=/data/gmcp.db
-VOLUME ["/data"]
+    GMCP_DATABASE=/data/gmcp.db \
+    GMCP_UPLOAD_DIR=/uploads
+VOLUME ["/data", "/uploads"]
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1

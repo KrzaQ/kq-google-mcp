@@ -10,8 +10,8 @@ Names and ports used throughout:
 |---|---|
 | Public name | `https://google-mcp.int.krzaq.cc` |
 | Container port on the host | `127.0.0.1:13386` (support-ui has 13382/13383, koryto 13384/13385) |
-| Run directory | `/storage/encrypted/gmcp` — `docker-compose.yml`, `.env`, `data/` |
-| Container uid | `10001`, the image's `gmcp` user; `data/` must be owned by it |
+| Run directory | `/storage/encrypted/gmcp` — `docker-compose.yml`, `.env`, `data/`, `uploads/` |
+| Container uid | `10001`, the image's `gmcp` user; `data/` and `uploads/` must be owned by it |
 | OIDC redirect URI | `https://google-mcp.int.krzaq.cc/api/auth/callback` |
 | Google redirect URI | `https://google-mcp.int.krzaq.cc/api/google/callback` |
 
@@ -143,9 +143,15 @@ CORS header, no `/api` bypass, no websocket rewrite and no special handling of
 ## 4. Deploy
 
 The run directory is its own ZFS dataset, `storage/encrypted/gmcp` at
-`/storage/encrypted/gmcp`, holding only `docker-compose.yml`, `.env` and
-`data/`. It is not a git checkout: the image is built in the development
+`/storage/encrypted/gmcp`, holding only `docker-compose.yml`, `.env`, `data/`
+and `uploads/`. It is not a git checkout: the image is built in the development
 checkout and started there.
+
+`data/` is the database. `uploads/` holds files on their way into a Gmail
+draft, for an hour at the most; the server empties it at every startup, so
+nothing in it is state and nothing in it is worth backing up. It is a bind
+mount rather than the container's own writable layer so that a 25 MB
+attachment lands on the dataset.
 
 **Already done:** the dataset exists with an empty `data/`, and `.env` is in
 place with a generated `GMCP_SECRET` and `CHANGE_ME` placeholders for the
@@ -154,7 +160,7 @@ values from steps 1 and 2. Had it not been:
 ```sh
 sudo zfs create -o compression=zstd storage/encrypted/gmcp
 sudo chown krzaq:krzaq /storage/encrypted/gmcp
-mkdir /storage/encrypted/gmcp/data
+mkdir /storage/encrypted/gmcp/data /storage/encrypted/gmcp/uploads
 install -m 600 .env.example /storage/encrypted/gmcp/.env   # then fill it in
 ```
 
@@ -164,12 +170,12 @@ Confirm no `CHANGE_ME` is left before starting:
 grep -c CHANGE_ME /storage/encrypted/gmcp/.env   # want 0
 ```
 
-**The container runs as uid 10001** (the image's `gmcp` user), and `data/` is a
-bind mount, so the directory has to belong to that uid or SQLite cannot create
-the file:
+**The container runs as uid 10001** (the image's `gmcp` user), and both `data/`
+and `uploads/` are bind mounts, so the directories have to belong to that uid
+or SQLite cannot create the file and no upload can be staged:
 
 ```sh
-sudo chown -R 10001:10001 /storage/encrypted/gmcp/data
+sudo chown -R 10001:10001 /storage/encrypted/gmcp/data /storage/encrypted/gmcp/uploads
 ```
 
 Then, from the development checkout, on the commit to ship:

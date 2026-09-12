@@ -3,6 +3,12 @@
 # user (`sudo chown -R 10001:10001 data`). Back it up with
 # `sqlite3 data/gmcp.db ".backup ..."` while it runs — a plain copy of a WAL
 # database under load is not a consistent backup.
+#
+# ./uploads is not state: it holds files on their way into a Gmail draft, for
+# an hour at the most, and the server empties it at every startup. It is bound
+# here rather than left in the container's writable layer so a 25 MB
+# attachment lands on the dataset. It is owned by the same uid and is not
+# worth backing up.
 services:
   gmcp:
     # The image is built here (or in the development checkout) and never
@@ -21,6 +27,7 @@ services:
       TZ: Europe/Warsaw
     volumes:
       - ./data:/data
+      - ./uploads:/uploads
     # The image has its own HEALTHCHECK; repeating it here keeps `docker
     # compose ps` honest when the stack is started from an older image.
     healthcheck:
