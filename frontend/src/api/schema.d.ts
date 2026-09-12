@@ -265,6 +265,26 @@ export interface paths {
     patch?: never
     trace?: never
   }
+  '/up/{id}': {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    /**
+     * Take the bytes of one upload. Unauthenticated by design: the ticket is the
+     *     permission, and it is spent before a byte of the body is read.
+     */
+    post: operations['upload']
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
 }
 export type webhooks = Record<string, never>
 export interface components {
@@ -458,6 +478,20 @@ export interface components {
       name: string
       /** @description `service:level` strings, plus `delegate` for a gateway token. */
       scopes: string[]
+    }
+    /**
+     * @description What the uploader reads back: the id a draft tool takes, and what the
+     *     server now holds under it.
+     */
+    Uploaded: {
+      /** Format: date-time */
+      expires_at: string
+      filename: string
+      mime_type: string
+      note: string
+      size: number
+      /** @description Pass this to a draft tool's `attachments`. */
+      upload_id: string
     }
     UserDto: {
       /** Format: date-time */
@@ -1042,6 +1076,52 @@ export interface operations {
       }
       /** @description unknown, expired or spent */
       404: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ErrorBody']
+        }
+      }
+    }
+  }
+  upload: {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        /** @description the upload ticket id */
+        id: string
+      }
+      cookie?: never
+    }
+    /** @description the file, as the whole request body */
+    requestBody: {
+      content: {
+        'application/octet-stream': number[]
+      }
+    }
+    responses: {
+      /** @description the file is staged */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['Uploaded']
+        }
+      }
+      /** @description unknown, expired or spent */
+      404: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ErrorBody']
+        }
+      }
+      /** @description over the attachment cap */
+      413: {
         headers: {
           [name: string]: unknown
         }
