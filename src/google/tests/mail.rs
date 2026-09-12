@@ -825,8 +825,8 @@ fn the_gmail_module_has_no_send_no_trash_and_no_message_delete() {
     // And so are the two a draft with a file goes to. They are drafts
     // endpoints like the others, which is the point: `upload` in a Gmail path
     // is how a message is uploaded, never how one is sent.
-    assert!(source.contains(&format!("upload/gmail/v1/users/{{USER}}/drafts")));
-    assert!(source.contains(&format!("upload/gmail/v1/users/{{USER}}/drafts/{{}}")));
+    assert!(source.contains("upload/gmail/v1/users/{USER}/drafts"));
+    assert!(source.contains("upload/gmail/v1/users/{USER}/drafts/{}"));
 }
 
 #[test]

@@ -329,6 +329,7 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("gmail_attachment_link", needs(Service::Gmail, Level::Read)),
     ("gmail_attachment_text", needs(Service::Gmail, Level::Read)),
     ("gmail_view_image", needs(Service::Gmail, Level::Read)),
+    ("gmail_upload_link", needs(Service::Gmail, Level::Draft)),
     ("gmail_create_draft", needs(Service::Gmail, Level::Draft)),
     ("gmail_reply_draft", needs(Service::Gmail, Level::Draft)),
     ("gmail_update_draft", needs(Service::Gmail, Level::Draft)),
@@ -561,7 +562,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 40);
+        assert_eq!(TOOLS.len(), 41);
     }
 
     #[test]

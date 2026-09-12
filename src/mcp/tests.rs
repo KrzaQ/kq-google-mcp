@@ -849,6 +849,325 @@ async fn writing_a_draft_never_touches_a_send_endpoint() {
     drop(server);
 }
 
+// ----- attachments ------------------------------------------------------------
+
+/// A client on a router whose staging directory this test can look into, and
+/// which removes it again when the test ends.
+struct Attaching {
+    client: Client,
+    app: Router,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for Attaching {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Attaching {
+    async fn new(db: &Db, server: &MockServer, scopes: &[&str]) -> Self {
+        let (_, _, secret) = one_of_everything(db, scopes, ClientProfile::Generic).await;
+        Self::for_token(db, server, secret).await
+    }
+
+    async fn for_token(db: &Db, server: &MockServer, secret: String) -> Self {
+        let dir = uploads_dir();
+        let app = app_in(db, Some(server), dir.clone()).await;
+        let mut client = Client::new(app.clone(), secret);
+        client.initialize().await;
+        Self { client, app, dir }
+    }
+
+    /// Mint a URL with the tool and POST the bytes to it, the way an agent
+    /// does with curl. The upload id is what a draft tool takes.
+    async fn upload(&mut self, filename: &str, bytes: &[u8]) -> Value {
+        let minted = self
+            .client
+            .ok("gmail_upload_link", json!({"filename": filename}))
+            .await;
+        let url = minted["url"].as_str().expect("a URL").to_string();
+        let path = url.strip_prefix("https://gmcp.example").expect(&url);
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::from(bytes.to_vec()))
+            .unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).expect("the upload answers JSON")
+    }
+
+    fn staged_files(&self) -> usize {
+        std::fs::read_dir(&self.dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+}
+
+/// The three steps end to end: a tool mints a URL, the agent posts the bytes
+/// itself, and the draft carries them.
+#[tokio::test]
+async fn a_draft_carries_the_files_that_were_uploaded_for_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/upload/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    // A draft with files never goes to the JSON endpoint: the message is too
+    // large to carry as base64 inside it.
+    server
+        .register(
+            Mock::given(path("/gmail/v1/users/me/drafts"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("a draft with files does not go as JSON"),
+        )
+        .await;
+    let mut a = Attaching::new(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let first = a.upload("Faktura 04-2026.pdf", b"%PDF-1.7 invoice").await;
+    assert_eq!(first["filename"], "Faktura 04-2026.pdf");
+    assert_eq!(first["mime_type"], "application/pdf");
+    assert_eq!(first["size"], 16);
+    let second = a.upload("zażółć.csv", b"a,b\n1,2\n").await;
+    assert_eq!(a.staged_files(), 2);
+
+    let out = a
+        .client
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Faktura",
+                   "body": "W załączeniu faktura i zestawienie.",
+                   "attachments": [first["upload_id"], second["upload_id"]]}),
+        )
+        .await;
+    // The result says what the mail actually carries, by name.
+    assert_eq!(
+        out["attachments"],
+        json!(["Faktura 04-2026.pdf", "zażółć.csv"])
+    );
+    // And the body promised files it has, so there is nothing to warn about.
+    assert!(out["attachment_warning"].is_null(), "{out}");
+
+    // The message is one multipart/mixed carrying both files beside the body.
+    let request = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|r| r.url.path() == "/upload/gmail/v1/users/me/drafts")
+        .expect("the draft went to the upload endpoint");
+    assert!(
+        request
+            .url
+            .query()
+            .unwrap_or_default()
+            .contains("uploadType=multipart"),
+        "{:?}",
+        request.url.query()
+    );
+    let body = String::from_utf8_lossy(&request.body).to_string();
+    assert!(body.contains("Content-Type: message/rfc822"), "{body}");
+    assert!(body.contains("multipart/mixed"), "{body}");
+    assert!(body.contains("W za"), "the body survives: {body}");
+    assert!(body.contains("Faktura 04-2026.pdf"), "{body}");
+    assert!(body.contains("Content-Type: text/csv"), "{body}");
+
+    // The files were attached once and are gone: nothing is left on disk for
+    // a second draft to pick up, and the ids no longer resolve.
+    assert_eq!(a.staged_files(), 0);
+    let again = a
+        .client
+        .refused(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "again",
+                   "body": "again", "attachments": [first["upload_id"]]}),
+        )
+        .await;
+    assert!(again.contains("gmail_upload_link"), "{again}");
+    drop(server);
+}
+
+/// One person's staged file is not another's to attach, however they came by
+/// the id.
+#[tokio::test]
+async fn an_upload_of_somebody_elses_is_refused_and_stays_theirs() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/upload/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    let mut anna = Attaching::new(&db, &server, &["gmail:read", "gmail:draft"]).await;
+    let uploaded = anna.upload("prywatne.pdf", b"%PDF-1.7 mine").await;
+
+    // A second person, with their own account and their own token, on the
+    // same server and so the same staging store.
+    let marta = user(&db, "marta", "marta@example.test").await;
+    connect(&db, &marta, "marta-work", &["gmail"], false).await;
+    let (_, secret) = token(
+        &db,
+        &["gmail:read", "gmail:draft"],
+        Some(&marta),
+        ClientProfile::Generic,
+    )
+    .await;
+    let mut hers = Client::new(anna.app.clone(), secret);
+    hers.initialize().await;
+
+    let refused = hers
+        .refused(
+            "gmail_create_draft",
+            json!({"account": "marta-work", "to": ["someone@example.test"],
+                   "subject": "not mine", "body": "not mine",
+                   "attachments": [uploaded["upload_id"]]}),
+        )
+        .await;
+    assert!(refused.contains("there is no staged upload"), "{refused}");
+    // And the file is still Anna's to attach.
+    assert_eq!(anna.staged_files(), 1);
+    let out = anna
+        .client
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "mine",
+                   "body": "mine", "attachments": [uploaded["upload_id"]]}),
+        )
+        .await;
+    assert_eq!(out["attachments"], json!(["prywatne.pdf"]));
+    drop(server);
+}
+
+/// The failure this whole thing is for: a body that promises files and a
+/// draft that carries none.
+#[tokio::test]
+async fn a_draft_that_promises_a_file_and_carries_none_says_so() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    // Polish, which is what the mail that prompted this was written in.
+    let polish = c
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Faktury",
+                   "body": "Cześć, przesyłam w załączeniu trzy faktury. Pozdrawiam"}),
+        )
+        .await;
+    let warning = polish["attachment_warning"].as_str().unwrap_or_default();
+    assert!(warning.contains("carries no file"), "{polish}");
+    assert!(warning.contains("gmail_upload_link"), "{polish}");
+    assert_eq!(polish["attachments"], json!([]));
+
+    // English, and from the HTML half of a body as well as the plain one.
+    let english = c
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Report",
+                   "body": "The report is ready.",
+                   "html": "<p>Please see the <b>attached</b> report.</p>"}),
+        )
+        .await;
+    assert!(!english["attachment_warning"].is_null(), "{english}");
+
+    // An ordinary body says nothing about files, and gets no warning.
+    let plain = c
+        .ok(
+            "gmail_create_draft",
+            json!({"account": "work", "to": ["marta@example.test"], "subject": "Jutro",
+                   "body": "Cześć, spotkajmy się jutro o dziesiątej. Pozdrawiam"}),
+        )
+        .await;
+    assert!(plain["attachment_warning"].is_null(), "{plain}");
+
+    // Nothing here had a file, so every one of these went as JSON.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|r| !r.url.path().starts_with("/upload/")),
+        "a draft with no files does not use the upload endpoint"
+    );
+    drop(server);
+}
+
+/// Minting a URL is drafting, not reading: a read-only token never sees it.
+#[tokio::test]
+async fn an_upload_link_needs_the_draft_scope() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    let (anna, _, read_only) =
+        one_of_everything(&db, &["gmail:read"], ClientProfile::Generic).await;
+    let mut reader = Client::new(app(&db, Some(&server)).await, read_only);
+    reader.initialize().await;
+    assert!(
+        !reader
+            .names()
+            .await
+            .contains(&"gmail_upload_link".to_string())
+    );
+    let refused = reader
+        .refused("gmail_upload_link", json!({"filename": "x.pdf"}))
+        .await;
+    assert!(refused.contains("gmail:draft"), "{refused}");
+
+    // The same person's other token, which may draft.
+    let (_, secret) = token(
+        &db,
+        &["gmail:read", "gmail:draft"],
+        Some(&anna),
+        ClientProfile::Generic,
+    )
+    .await;
+    let mut writer = Client::new(app(&db, Some(&server)).await, secret);
+    writer.initialize().await;
+    assert!(
+        writer
+            .names()
+            .await
+            .contains(&"gmail_upload_link".to_string())
+    );
+    let minted = writer
+        .ok("gmail_upload_link", json!({"filename": "Faktura.pdf"}))
+        .await;
+    assert!(
+        minted["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://gmcp.example/up/"),
+        "{minted}"
+    );
+    assert_eq!(minted["filename"], "Faktura.pdf");
+    // The note has to teach the whole dance, because the model reads it and
+    // then has to do the middle step itself.
+    let note = minted["note"].as_str().unwrap();
+    assert!(note.contains("curl"), "{note}");
+    assert!(note.contains("upload_id"), "{note}");
+    assert!(note.contains("attachments"), "{note}");
+    drop(server);
+}
+
 // ----- which address a draft is written as ------------------------------------
 
 /// The account's send-as addresses: its own, one verified alias with a display

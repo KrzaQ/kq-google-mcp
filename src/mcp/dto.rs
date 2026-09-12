@@ -252,10 +252,39 @@ pub struct DraftOut {
     /// than to its sender; tell the person, so a reply that went somewhere
     /// they did not expect is visible here.
     pub to_reason: Option<String>,
+    /// The files this draft actually carries, by name. Read them back to the
+    /// person: what they are told is attached and what the mail carries have
+    /// to be the same thing.
+    pub attachments: Vec<String>,
+    /// Set when the body talks about attaching something and the draft
+    /// carries nothing. A mail that promises three files and carries none is
+    /// the failure this whole field exists for; say it to the person rather
+    /// than reporting the draft as done.
+    pub attachment_warning: Option<String>,
     /// Where the person opens the draft and presses send. This server never
     /// sends anything itself.
     pub url: String,
     pub note: String,
+}
+
+/// The words a body uses when it says a file is coming with it, in the two
+/// languages this server is written and read in. They are stems rather than
+/// whole words, so `attach` covers attached and attachment, `załącz` covers
+/// załączam and w załączniku, and `dołącz` covers dołączam.
+///
+/// Without diacritics as well, because that is how half of Polish is typed.
+const ATTACHMENT_WORDS: [&str; 6] = ["attach", "enclos", "załąc", "zalacz", "dołąc", "dolacz"];
+
+/// Whether a draft's body promises a file. Matched on the lower-cased text:
+/// `eq_ignore_ascii_case` and its relatives leave `Ł` and `Ą` exactly as they
+/// were, so a body that opens with `Załączam` would go unnoticed.
+///
+/// It errs towards saying yes. A false positive costs one line in a result
+/// the model reads; a false negative costs a mail that promised a file and
+/// carried nothing, which is what this is here to stop.
+pub fn promises_attachment(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ATTACHMENT_WORDS.iter().any(|word| lower.contains(word))
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -352,6 +381,17 @@ pub struct LinkOut {
     pub filename: String,
     pub mime_type: String,
     pub size: Option<i64>,
+    pub expires_at: String,
+    pub note: String,
+}
+
+/// Where one file goes on its way into a draft. There is no id here: the id
+/// that matters comes back from the upload itself, so a model cannot mistake
+/// the ticket for the file.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UploadLinkOut {
+    pub url: String,
+    pub filename: String,
     pub expires_at: String,
     pub note: String,
 }

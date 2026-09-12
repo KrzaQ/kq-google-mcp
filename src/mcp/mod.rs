@@ -83,6 +83,12 @@ fn instructions(portal: &str) -> String {
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \
          cells; a write carries values and never formatting, which is what sheets_copy_format is \
          for.\n\
+         A file is attached to a draft by uploading it first: gmail_upload_link answers a URL, \
+         you POST the bytes to it yourself, and you pass the upload_id you read back to a draft \
+         tool as one of `attachments` — this server cannot read a file on your machine. A draft \
+         whose body says something is attached while it carries no file is a mistake: the result \
+         says so in attachment_warning, and you must tell the person rather than reporting the \
+         draft as done.\n\
          A Gmail draft is written as the account's default address unless you pass `from`, which \
          must be one of the account's verified send-as addresses; gmail_list_send_as reports \
          them, and a reply comes from the address the original was delivered to.\n\

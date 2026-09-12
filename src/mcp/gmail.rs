@@ -20,6 +20,7 @@ use crate::db::Connection;
 use crate::domain::scope::Service;
 use crate::google::{gmail, text};
 use crate::http::links::{self, NewDownload, Target};
+use crate::http::uploads;
 
 /// Gmail's own label ids for the two places nothing here ever puts a message.
 const REFUSED: [&str; 2] = ["TRASH", "SPAM"];
@@ -94,6 +95,9 @@ pub struct CreateDraftParam {
     /// gmail_list_send_as reports the ones that work. Defaults to the
     /// account's default address
     pub from: Option<String>,
+    /// Files to attach, by the upload_id each POST to a gmail_upload_link URL
+    /// answered. Each id is used once and the file is then forgotten
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -110,6 +114,9 @@ pub struct ReplyDraftParam {
     /// gmail_list_send_as reports the ones that work. Left out, the reply
     /// comes from the address the original was delivered to
     pub from: Option<String>,
+    /// Files to attach, by the upload_id each POST to a gmail_upload_link URL
+    /// answered. Each id is used once and the file is then forgotten
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -127,6 +134,18 @@ pub struct UpdateDraftParam {
     /// gmail_list_send_as reports the ones that work. Defaults to the
     /// account's default address
     pub from: Option<String>,
+    /// Files to attach, by the upload_id each POST to a gmail_upload_link URL
+    /// answered. The rewrite replaces the whole message, so a file the draft
+    /// already carries is kept only by uploading it again
+    pub attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadLinkParam {
+    /// The name the recipient sees, e.g. "Faktura 04-2026.pdf"
+    pub filename: String,
+    /// What the file is, e.g. "application/pdf". Left out, the filename decides
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -406,12 +425,57 @@ impl Gmcp {
     }
 
     #[tool(
+        description = "A URL to upload one file to, so a draft can carry it. Attaching a file \
+                       takes three steps and you do the middle one yourself: call this, then \
+                       POST the bytes to the `url` it answers (`curl --data-binary @file URL`), \
+                       then pass the `upload_id` you read back in the draft tool's \
+                       `attachments`. This server cannot read a file on your machine, so \
+                       uploading it is the only way to attach it. The URL takes one upload and \
+                       lives 15 minutes; the file itself waits an hour to be attached and is \
+                       forgotten once it is."
+    )]
+    async fn gmail_upload_link(
+        &self,
+        Parameters(p): Parameters<UploadLinkParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::UploadLinkOut>, ErrorData> {
+        let filename = p.filename.trim();
+        if filename.is_empty() {
+            return Err(bad(
+                "filename is empty; name the file the recipient will see",
+            ));
+        }
+        let minted = uploads::mint(
+            &self.state,
+            uploads::NewUpload {
+                user_id: call.principal.user().id,
+                token_id: self.token_id(&call)?,
+                filename: filename.to_string(),
+                mime_type: p.content_type.clone(),
+            },
+        );
+        Ok(Json(dto::UploadLinkOut {
+            url: minted.url,
+            filename: minted.filename,
+            expires_at: dto::at_zone(minted.expires_at, call.tz),
+            note: "POST the file to this URL as the whole request body — \
+                   `curl --data-binary @/path/to/file URL` — and pass the upload_id it answers \
+                   to gmail_create_draft, gmail_reply_draft or gmail_update_draft as one of \
+                   `attachments`. The URL works once and for 15 minutes."
+                .into(),
+        }))
+    }
+
+    #[tool(
         description = "Write a new draft in the account's Gmail and return its id and URL. \
                        Nothing is sent: the person opens the draft and presses send themselves, \
                        so say that rather than claiming the mail went out. No confirmation \
                        argument, because the draft is the confirmation. `from` must be one of \
                        the account's verified send-as addresses, which gmail_list_send_as \
-                       reports; left out, the draft comes from the account's default address."
+                       reports; left out, the draft comes from the account's default address. \
+                       Files are attached by uploading them first with gmail_upload_link and \
+                       passing the upload ids as `attachments`; the result lists what the draft \
+                       actually carries."
     )]
     async fn gmail_create_draft(
         &self,
@@ -436,12 +500,15 @@ impl Gmcp {
             subject: p.subject,
             text: p.body,
             html: p.html,
+            // Last, so a call refused for anything else leaves the files
+            // where they are and can simply be made again.
+            attachments: self.attachments(&call, p.attachments)?,
             ..gmail::DraftContent::default()
         };
         let draft = gmail::create_draft(&self.google()?.client, connection.id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft, from)))
+        Ok(Json(draft_out(connection.label, draft, from, &content)))
     }
 
     #[tool(
@@ -455,6 +522,8 @@ impl Gmcp {
                        Replying to a message the account itself sent writes to that message's \
                        own recipients, not back to the account, because the person is carrying \
                        on a thread they started; the result says so in `to_reason`. \
+                       Files are attached by uploading them first with gmail_upload_link and \
+                       passing the upload ids as `attachments`. \
                        Nothing is sent; the person sends it from Gmail."
     )]
     async fn gmail_reply_draft(
@@ -477,10 +546,11 @@ impl Gmcp {
             p.reply_all.unwrap_or(false),
         );
         content.html = p.html;
+        content.attachments = self.attachments(&call, p.attachments)?;
         let draft = gmail::create_draft(client, connection.id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        let mut out = draft_out(connection.label, draft, from);
+        let mut out = draft_out(connection.label, draft, from, &content);
         if message.is_sent() {
             out.to_reason = Some(
                 "this account sent the original, so the reply goes to its recipients rather \
@@ -499,7 +569,10 @@ impl Gmcp {
                        with its In-Reply-To, References and thread id, so correcting a recipient \
                        does not start a new thread. `from` must be one of the account's verified \
                        send-as addresses, which gmail_list_send_as reports; left out, the draft \
-                       comes from the account's default address. Still nothing is sent."
+                       comes from the account's default address. The message is replaced whole, \
+                       attachments included: a file the draft already carries is kept only by \
+                       uploading it again with gmail_upload_link and naming it in \
+                       `attachments`. Still nothing is sent."
     )]
     async fn gmail_update_draft(
         &self,
@@ -541,12 +614,12 @@ impl Gmcp {
             in_reply_to: existing.in_reply_to.filter(|id| !id.trim().is_empty()),
             references: existing.references,
             thread_id: Some(existing.thread_id).filter(|id| !id.trim().is_empty()),
-            attachments: Vec::new(),
+            attachments: self.attachments(&call, p.attachments)?,
         };
         let draft = gmail::update_draft(client, connection.id, draft_id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft, from)))
+        Ok(Json(draft_out(connection.label, draft, from, &content)))
     }
 
     #[tool(description = "The account's drafts, newest first, with their ids and Gmail URLs.")]
@@ -595,6 +668,8 @@ impl Gmcp {
             from: None,
             from_reason: None,
             to_reason: None,
+            attachments: Vec::new(),
+            attachment_warning: None,
             draft_id,
             note: "the draft is gone".into(),
         }))
@@ -714,6 +789,45 @@ struct ChosenFrom {
 }
 
 impl Gmcp {
+    /// The files a draft is about to carry, taken off the shelf as the acting
+    /// person. Every id is checked before any file is taken, so a call naming
+    /// one id that is not there leaves the rest where they are: a draft is
+    /// written once, with all of its files or with none.
+    ///
+    /// The files are gone once this answers. That is what makes an upload id
+    /// a thing that cannot be attached twice by accident.
+    fn attachments(
+        &self,
+        call: &Call,
+        ids: Option<Vec<String>>,
+    ) -> Result<Vec<gmail::NewAttachment>, ErrorData> {
+        let ids: Vec<String> = ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let files = self
+            .state
+            .staging
+            .take(call.principal.user().id, &ids)
+            .map_err(|e| match e {
+                uploads::TakeError::Io(_) => ErrorData::internal_error(e.to_string(), None),
+                _ => bad(e.to_string()),
+            })?;
+        Ok(files
+            .into_iter()
+            .map(|file| gmail::NewAttachment {
+                filename: file.filename,
+                mime_type: file.mime_type,
+                bytes: file.bytes,
+            })
+            .collect())
+    }
+
     /// The account's send-as addresses. The Google client keeps them for a few
     /// minutes per connection, so drafting several replies asks Gmail once.
     async fn send_as(&self, connection: &Connection) -> Result<Vec<gmail::SendAs>, ErrorData> {
@@ -1013,7 +1127,12 @@ fn addresses(values: Vec<String>, field: &str) -> Result<Vec<String>, ErrorData>
     Ok(out)
 }
 
-fn draft_out(account: String, draft: gmail::DraftRef, from: ChosenFrom) -> dto::DraftOut {
+fn draft_out(
+    account: String,
+    draft: gmail::DraftRef,
+    from: ChosenFrom,
+    content: &gmail::DraftContent,
+) -> dto::DraftOut {
     dto::DraftOut {
         account,
         url: draft.url(),
@@ -1023,9 +1142,33 @@ fn draft_out(account: String, draft: gmail::DraftRef, from: ChosenFrom) -> dto::
         from: Some(from.header),
         from_reason: Some(from.reason),
         to_reason: None,
+        attachments: content
+            .attachments
+            .iter()
+            .map(|f| f.filename.clone())
+            .collect(),
+        attachment_warning: attachment_warning(content),
         note: "nothing was sent; the person opens this draft in Gmail and sends it themselves"
             .into(),
     }
+}
+
+/// The sentence a draft gets when its body talks about attaching something
+/// and it carries nothing. The mail this whole feature is for went out
+/// promising three files, with a tool result that read as success; a model
+/// that reads this has to tell the person before they press send.
+fn attachment_warning(content: &gmail::DraftContent) -> Option<String> {
+    if !content.attachments.is_empty() {
+        return None;
+    }
+    let html = content.html.as_deref().unwrap_or_default();
+    let promises = dto::promises_attachment(&content.text) || dto::promises_attachment(html);
+    promises.then(|| {
+        "this draft says something is attached and it carries no file. Tell the person before \
+         they send it, or attach the file: mint a URL with gmail_upload_link, POST the file to \
+         it, and pass the upload_id to gmail_update_draft as one of `attachments`"
+            .to_string()
+    })
 }
 
 pub(super) fn link_out(minted: links::Minted, tz: Tz) -> dto::LinkOut {
