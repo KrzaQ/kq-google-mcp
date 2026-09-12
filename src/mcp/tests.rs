@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use http_body_util::BodyExt;
+use mail_parser::MimeHeaders;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::matchers::{method as http_method, path, path_regex, query_param};
@@ -1110,6 +1111,293 @@ async fn a_draft_that_promises_a_file_and_carries_none_says_so() {
         "a draft with no files does not use the upload endpoint"
     );
     drop(server);
+}
+
+/// The draft whose raw read every attach test answers with.
+const DRAFT: &str = "r-8812345678901234567";
+const DRAFT_AT: &str = "/gmail/v1/users/me/drafts/r-8812345678901234567";
+const DRAFT_UPLOAD_AT: &str = "/upload/gmail/v1/users/me/drafts/r-8812345678901234567";
+
+/// The message inside an upload request, parsed back. A draft with files goes
+/// to Gmail as a `multipart/related` whose second part is the mail itself, so
+/// this is what Gmail is actually being asked to store.
+fn uploaded_message(body: &[u8]) -> mail_parser::Message<'_> {
+    const MARK: &[u8] = b"Content-Type: message/rfc822\r\n\r\n";
+    const CLOSE: &[u8] = b"\r\n--gmcp";
+    let start = body
+        .windows(MARK.len())
+        .position(|window| window == MARK)
+        .expect("a message part")
+        + MARK.len();
+    let rest = &body[start..];
+    let end = rest
+        .windows(CLOSE.len())
+        .rposition(|window| window == CLOSE)
+        .expect("the closing boundary");
+    mail_parser::MessageParser::default()
+        .parse(&rest[..end])
+        .expect("the draft Gmail was sent is a message")
+}
+
+/// Every address of one header, as `name <address>` or the bare address.
+fn header_addresses(address: Option<&mail_parser::Address>) -> Vec<String> {
+    address
+        .map(|a| {
+            a.iter()
+                .map(|addr| match (addr.name(), addr.address()) {
+                    (Some(name), Some(address)) => format!("{name} <{address}>"),
+                    (_, address) => address.unwrap_or_default().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A draft with one file gains a second one, and everything else about it —
+/// who it is to, what it says in both bodies, and which conversation it
+/// belongs to — is still there afterwards. Rewriting it with
+/// gmail_update_draft would mean restating all of that correctly.
+#[tokio::test]
+async fn a_file_is_added_to_a_draft_that_keeps_everything_else() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(&server, "GET", DRAFT_AT, fixture("gmail_draft_raw.json")).await;
+    mount(&server, "PUT", DRAFT_UPLOAD_AT, fixture("gmail_draft.json")).await;
+    // A message with files in it never goes as JSON.
+    server
+        .register(
+            Mock::given(http_method("PUT"))
+                .and(path(DRAFT_AT))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .named("a draft with files does not go as JSON"),
+        )
+        .await;
+    let mut a = Attaching::new(&db, &server, &["gmail:read", "gmail:draft"]).await;
+    let added = a.upload("zestawienie.csv", b"a,b\n1,2\n").await;
+
+    let out = a
+        .client
+        .ok(
+            "gmail_attach_to_draft",
+            json!({"account": "work", "draft_id": DRAFT,
+                   "attachments": [added["upload_id"]]}),
+        )
+        .await;
+    // The whole list, not the one that was added: what the person is told the
+    // draft carries has to be what it carries.
+    assert_eq!(out["attachments"], json!(["raport.pdf", "zestawienie.csv"]));
+    assert_eq!(out["from"], "\"Anna Kowalska\" <anna@example.test>");
+    assert!(out["url"].as_str().unwrap().contains(DRAFT), "{out}");
+
+    let request = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|r| r.url.path() == DRAFT_UPLOAD_AT)
+        .expect("the draft went to the upload endpoint");
+    assert!(
+        request
+            .url
+            .query()
+            .unwrap_or_default()
+            .contains("uploadType=multipart"),
+        "{:?}",
+        request.url.query()
+    );
+    // The conversation, which the metadata part names and the headers repeat.
+    let body = String::from_utf8_lossy(&request.body).to_string();
+    assert!(
+        body.contains(r#"{"message":{"threadId":"18f0a1b2c3d4e5f0"}}"#),
+        "{body}"
+    );
+    let message = uploaded_message(&request.body);
+    assert_eq!(
+        message.in_reply_to().as_text(),
+        Some("CAF7n2sabc123@mail.example.test")
+    );
+    let references: Vec<&str> = message
+        .references()
+        .as_text_list()
+        .unwrap_or_default()
+        .iter()
+        .map(|id| id.as_ref())
+        .collect();
+    assert_eq!(
+        references,
+        [
+            "20260901T090000.0@example.test",
+            "CAF7n2sabc123@mail.example.test"
+        ]
+    );
+    // Everyone it was addressed to, including the blind copy.
+    assert_eq!(
+        header_addresses(message.to()),
+        ["Marta Nowak <marta@example.test>"]
+    );
+    assert_eq!(header_addresses(message.cc()), ["team@example.test"]);
+    assert_eq!(header_addresses(message.bcc()), ["archiwum@example.test"]);
+    assert_eq!(
+        header_addresses(message.from()),
+        ["Anna Kowalska <anna@example.test>"]
+    );
+    assert_eq!(message.subject(), Some("Re: Q3 figures for Kraków"));
+    // Both bodies, still saying what they said.
+    assert!(
+        message
+            .body_text(0)
+            .unwrap_or_default()
+            .contains("w załączeniu raport."),
+        "{:?}",
+        message.body_text(0)
+    );
+    assert!(
+        message
+            .body_html(0)
+            .unwrap_or_default()
+            .contains("<b>raport</b>"),
+        "{:?}",
+        message.body_html(0)
+    );
+    // And both files, the old one byte for byte beside the new one.
+    let files: Vec<(String, Vec<u8>)> = message
+        .attachments()
+        .map(|part| {
+            (
+                part.attachment_name().unwrap_or_default().to_string(),
+                part.contents().to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_eq!(files[0].0, "raport.pdf");
+    assert_eq!(files[0].1, b"%PDF-1.7 raport kwartalny");
+    assert_eq!(files[1].0, "zestawienie.csv");
+    assert_eq!(files[1].1, b"a,b\n1,2\n");
+
+    // The upload was spent, so nothing is left on the shelf to attach twice.
+    assert_eq!(a.staged_files(), 0);
+    drop(server);
+}
+
+/// A draft whose body names its own pictures cannot be rebuilt from its
+/// parts, so nothing is written at all and the uploads stay where they are.
+#[tokio::test]
+async fn a_draft_with_a_picture_in_its_body_is_refused_rather_than_flattened() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    let at = "/gmail/v1/users/me/drafts/r-4400000000000000002";
+    mount(&server, "GET", at, fixture("gmail_draft_raw_inline.json")).await;
+    let mut a = Attaching::new(&db, &server, &["gmail:read", "gmail:draft"]).await;
+    let added = a.upload("zestawienie.csv", b"a,b\n1,2\n").await;
+
+    let refused = a
+        .client
+        .refused(
+            "gmail_attach_to_draft",
+            json!({"account": "work", "draft_id": "r-4400000000000000002",
+                   "attachments": [added["upload_id"]]}),
+        )
+        .await;
+    assert!(refused.contains("chart-q3@example.test"), "{refused}");
+    assert!(refused.contains("gmail_update_draft"), "{refused}");
+    // Nothing was written, and the file is still there to attach elsewhere.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|r| r.method.as_str() == "GET" || r.url.path() == "/token"),
+        "the draft was written anyway"
+    );
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// A draft Gmail would refuse is refused here first, with the sizes, and the
+/// uploads are left where they are: the person attaches them to something
+/// else rather than uploading them again.
+#[tokio::test]
+async fn files_over_what_one_message_may_carry_are_refused_before_anything_is_written() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    // The draft already carries 20 MB, which is under the cap on its own.
+    let carried = 20 * 1024 * 1024;
+    Mock::given(http_method("GET"))
+        .and(path(DRAFT_AT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(raw_draft_carrying(carried)))
+        .mount(&server)
+        .await;
+    let mut a = Attaching::new(&db, &server, &["gmail:read", "gmail:draft"]).await;
+    let added = a.upload("zdjęcia.zip", &vec![b'z'; 6 * 1024 * 1024]).await;
+
+    let refused = a
+        .client
+        .refused(
+            "gmail_attach_to_draft",
+            json!({"account": "work", "draft_id": DRAFT,
+                   "attachments": [added["upload_id"]]}),
+        )
+        .await;
+    assert!(refused.contains("plan.pdf 20.0 MB"), "{refused}");
+    assert!(refused.contains("zdjęcia.zip 6.0 MB"), "{refused}");
+    assert!(refused.contains("26.0 MB"), "{refused}");
+    assert!(refused.contains("25.0 MB"), "{refused}");
+    // Nothing was written and the upload is still waiting, as the refusal says.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|r| r.method.as_str() == "GET" || r.url.path() == "/token"),
+        "the draft was written anyway"
+    );
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// A draft carrying one file of `size` bytes, as `users.drafts.get` with
+/// `format=raw` answers. Built here rather than recorded, because the size is
+/// what the test is about and a fixture that large belongs in no repository.
+fn raw_draft_carrying(size: usize) -> Value {
+    use base64::Engine as _;
+    let file = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; size]);
+    let mime = [
+        "From: anna@example.test",
+        "To: marta@example.test",
+        "Subject: Plan",
+        "MIME-Version: 1.0",
+        "Content-Type: multipart/mixed; boundary=\"mixed-1\"",
+        "",
+        "--mixed-1",
+        "Content-Type: text/plain; charset=\"utf-8\"",
+        "",
+        "w załączeniu plan",
+        "--mixed-1",
+        "Content-Type: application/pdf; name=\"plan.pdf\"",
+        "Content-Disposition: attachment; filename=\"plan.pdf\"",
+        "Content-Transfer-Encoding: base64",
+        "",
+        &file,
+        "--mixed-1--",
+        "",
+    ]
+    .join("\r\n");
+    json!({
+        "id": DRAFT,
+        "message": {
+            "id": "18f0a1b2c3d4e5fb",
+            "threadId": "18f0a1b2c3d4e5f0",
+            "labelIds": ["DRAFT"],
+            "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mime),
+        }
+    })
 }
 
 /// Minting a URL is drafting, not reading: a read-only token never sees it.

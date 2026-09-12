@@ -85,7 +85,9 @@ fn instructions(portal: &str) -> String {
          for.\n\
          A file is attached to a draft by uploading it first: gmail_upload_link answers a URL, \
          you POST the bytes to it yourself, and you pass the upload_id you read back to a draft \
-         tool as one of `attachments` — this server cannot read a file on your machine. A draft \
+         tool as one of `attachments` — this server cannot read a file on your machine. Use \
+         gmail_attach_to_draft to put a file on a draft that already exists: it keeps everything \
+         that draft has, where gmail_update_draft replaces the whole message. A draft \
          whose body says something is attached while it carries no file is a mistake: the result \
          says so in attachment_warning, and you must tell the person rather than reporting the \
          draft as done.\n\

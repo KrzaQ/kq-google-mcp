@@ -90,6 +90,16 @@ to say about itself is here and in `README.md`.
   produces byte-identical MIME to what it did before attachments existed and
   still goes to the JSON endpoint; one with files goes to Gmail's upload
   endpoint, which is still a drafts endpoint and still sends nothing.
+- **A file is added to a draft by rebuilding it, and a rebuild refuses rather
+  than damages.** Gmail cannot append a part, so `gmail_attach_to_draft` reads
+  the draft as `format=raw` — the one read that carries the existing files'
+  bytes in the same answer — and writes the whole message back. Everything
+  survives: From, To, Cc, Bcc, Subject, both bodies, In-Reply-To, References
+  and the thread id. A draft with inline images cannot be rebuilt faithfully
+  and is refused, as are files that come to more than `ATTACHMENT_MAX_BYTES`
+  together with the ones the draft already carries. Both refusals leave the
+  uploads staged, so the person attaches them elsewhere rather than sending
+  them again.
 - Every tool call, link mint and link hit is logged, with the arguments
   stripped of bodies and cut at 4 KB. Tool output is never logged.
 - **Tests must not need the network, a file on disk or an existing database.**

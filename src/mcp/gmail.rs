@@ -17,6 +17,7 @@ use super::dto;
 use super::images::{self, Kind, Source};
 use super::{Call, Gmcp, api_err, bad, cap_text, capped, refuse};
 use crate::db::Connection;
+use crate::domain::limits::ATTACHMENT_MAX_BYTES;
 use crate::domain::scope::Service;
 use crate::google::{gmail, text};
 use crate::http::links::{self, NewDownload, Target};
@@ -138,6 +139,15 @@ pub struct UpdateDraftParam {
     /// answered. The rewrite replaces the whole message, so a file the draft
     /// already carries is kept only by uploading it again
     pub attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachToDraftParam {
+    pub account: String,
+    pub draft_id: String,
+    /// Files to add, by the upload_id each POST to a gmail_upload_link URL
+    /// answered. Everything the draft already carries is kept
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -572,7 +582,8 @@ impl Gmcp {
                        comes from the account's default address. The message is replaced whole, \
                        attachments included: a file the draft already carries is kept only by \
                        uploading it again with gmail_upload_link and naming it in \
-                       `attachments`. Still nothing is sent."
+                       `attachments`. To add a file and change nothing else, use \
+                       gmail_attach_to_draft instead. Still nothing is sent."
     )]
     async fn gmail_update_draft(
         &self,
@@ -616,6 +627,89 @@ impl Gmcp {
             thread_id: Some(existing.thread_id).filter(|id| !id.trim().is_empty()),
             attachments: self.attachments(&call, p.attachments)?,
         };
+        let draft = gmail::update_draft(client, connection.id, draft_id, &content)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(draft_out(connection.label, draft, from, &content)))
+    }
+
+    #[tool(
+        description = "Add files to a draft that already exists and keep everything else it has: \
+                       its recipients, its subject, both bodies and the conversation it belongs \
+                       to, as well as the files it already carries. Upload each file with \
+                       gmail_upload_link first and pass the upload ids as `attachments`. Use this \
+                       rather than gmail_update_draft to attach something, because that tool \
+                       replaces the whole message and every recipient and both bodies would have \
+                       to be restated correctly. A draft with pictures inside its HTML body is \
+                       refused: rebuilding it would break them. The result lists every file the \
+                       draft now carries, the old ones and the new ones together. Nothing is sent."
+    )]
+    async fn gmail_attach_to_draft(
+        &self,
+        Parameters(p): Parameters<AttachToDraftParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::DraftOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Gmail).await?;
+        let ids = upload_ids(p.attachments)?;
+        let client = &self.google()?.client;
+        let draft_id = p.draft_id.trim();
+        // Raw, because that answer carries the bytes of the files the draft
+        // already has: a draft with three of them costs one call rather than
+        // four, and the message is rebuilt from what came back.
+        let existing = gmail::get_draft_raw(client, connection.id, draft_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        if !existing.inline_ids.is_empty() {
+            return Err(refuse(format!(
+                "this draft has pictures inside its HTML body (Content-ID {}), and adding a file \
+                 means rebuilding the message, which would leave the body pointing at pictures \
+                 that are no longer in it — the draft would still look right in a list and be \
+                 broken when it is opened. Nothing was changed and the uploads are still waiting. \
+                 Write this one again with gmail_update_draft, which replaces the message whole \
+                 and takes files as `attachments`",
+                existing.inline_ids.join(", ")
+            )));
+        }
+        // Weighed before anything is taken: a draft that cannot hold the files
+        // leaves them staged, so the person attaches them somewhere else
+        // rather than uploading them again.
+        let adding = self
+            .state
+            .staging
+            .sizes(call.principal.user().id, &ids)
+            .map_err(take_err)?;
+        let carried: Vec<(String, usize)> = existing
+            .content
+            .attachments
+            .iter()
+            .map(|file| (file.filename.clone(), file.bytes.len()))
+            .collect();
+        let total: usize = carried
+            .iter()
+            .chain(adding.iter())
+            .map(|(_, size)| size)
+            .sum();
+        if total > ATTACHMENT_MAX_BYTES {
+            return Err(bad(too_large(&carried, &adding)));
+        }
+        let mut content = existing.content;
+        let from = match content.from.trim() {
+            "" => {
+                // Gmail always writes one, so this is the draft that came from
+                // somewhere else. The account's own address is what Gmail
+                // would compose with.
+                let chosen = self.draft_from(&connection, None).await?;
+                content.from = chosen.header.clone();
+                chosen
+            }
+            header => ChosenFrom {
+                header: header.to_string(),
+                reason: "the draft was already written as it".into(),
+            },
+        };
+        content
+            .attachments
+            .extend(self.attachments(&call, Some(ids))?);
         let draft = gmail::update_draft(client, connection.id, draft_id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
@@ -814,10 +908,7 @@ impl Gmcp {
             .state
             .staging
             .take(call.principal.user().id, &ids)
-            .map_err(|e| match e {
-                uploads::TakeError::Io(_) => ErrorData::internal_error(e.to_string(), None),
-                _ => bad(e.to_string()),
-            })?;
+            .map_err(take_err)?;
         Ok(files
             .into_iter()
             .map(|file| gmail::NewAttachment {
@@ -1111,6 +1202,60 @@ fn locate_picture(message: &gmail::Message, wanted: &str) -> Result<Picture, Err
             known.join(", ")
         }
     )))
+}
+
+/// A staged upload that cannot be read is this server's problem; every other
+/// way one can fail is the caller's to fix, and the message says how.
+fn take_err(e: uploads::TakeError) -> ErrorData {
+    match e {
+        uploads::TakeError::Io(_) => ErrorData::internal_error(e.to_string(), None),
+        _ => bad(e.to_string()),
+    }
+}
+
+/// The upload ids an argument names. A call that names none is refused rather
+/// than rewriting a draft to change nothing about it.
+fn upload_ids(values: Vec<String>) -> Result<Vec<String>, ErrorData> {
+    let ids: Vec<String> = values
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Err(bad(
+            "attachments is empty; name at least one upload_id from gmail_upload_link",
+        ));
+    }
+    Ok(ids)
+}
+
+/// Why a draft may not have these files: what it carries, what was being
+/// added, and what the two come to. The sizes are named the way an upload
+/// that is too large on its own already names them, because "too large" on
+/// its own leaves a person guessing which file to leave out.
+fn too_large(carried: &[(String, usize)], adding: &[(String, usize)]) -> String {
+    let named = |files: &[(String, usize)]| match files {
+        [] => "nothing".to_string(),
+        files => files
+            .iter()
+            .map(|(name, size)| format!("{name} {}", uploads::megabytes(*size)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let total: usize = carried
+        .iter()
+        .chain(adding.iter())
+        .map(|(_, size)| size)
+        .sum();
+    format!(
+        "the draft carries {} and adding {} comes to {}, over the {} Gmail allows one message; \
+         attach fewer files, or send the rest as download links. The draft was not changed and \
+         the uploads are still waiting",
+        named(carried),
+        named(adding),
+        uploads::megabytes(total),
+        uploads::megabytes(ATTACHMENT_MAX_BYTES)
+    )
 }
 
 /// Recipients as written, minus the empty ones. An address list that ends up

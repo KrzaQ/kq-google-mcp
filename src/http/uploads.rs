@@ -141,7 +141,7 @@ impl fmt::Display for TakeError {
 }
 
 /// A size as a person reads it. One decimal is enough to tell 24 MB from 26.
-fn megabytes(bytes: usize) -> String {
+pub fn megabytes(bytes: usize) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
@@ -274,20 +274,7 @@ impl Staging {
         let now = Utc::now();
         let taken = {
             let mut staged = self.staged.lock().expect("the staged lock");
-            let mut found: Vec<(String, Staged)> = Vec::with_capacity(ids.len());
-            for id in ids {
-                let id = id.trim();
-                match staged.get(id) {
-                    Some(entry)
-                        if entry.user_id == user_id
-                            && entry.expires_at > now
-                            && !found.iter().any(|(seen, _)| seen == id) =>
-                    {
-                        found.push((id.to_string(), entry.clone()));
-                    }
-                    _ => return Err(TakeError::Unknown(id.to_string())),
-                }
-            }
+            let found = find(&staged, user_id, ids, now)?;
             let total: usize = found.iter().map(|(_, entry)| entry.size).sum();
             if total > ATTACHMENT_MAX_BYTES {
                 return Err(TakeError::TooLarge {
@@ -313,6 +300,19 @@ impl Staging {
             });
         }
         Ok(files)
+    }
+
+    /// What the named uploads weigh, and what they are called, without taking
+    /// them. A draft that is rebuilt around the files it already carries has
+    /// to know what the new ones add up to before it writes anything, and
+    /// finding that out must not spend them: the ids are still good for the
+    /// draft the person tries next.
+    pub fn sizes(&self, user_id: i64, ids: &[String]) -> Result<Vec<(String, usize)>, TakeError> {
+        let staged = self.staged.lock().expect("the staged lock");
+        Ok(find(&staged, user_id, ids, Utc::now())?
+            .into_iter()
+            .map(|(_, entry)| (entry.filename, entry.size))
+            .collect())
     }
 
     /// Everything past its time: tickets nobody used, and files nobody
@@ -350,6 +350,32 @@ impl Staging {
         }
         Ok(())
     }
+}
+
+/// The entries the named ids stand for, or the first id that stands for
+/// nothing this person may attach. Nothing is removed here: the two callers
+/// differ in whether they spend what they find.
+fn find(
+    staged: &HashMap<String, Staged>,
+    user_id: i64,
+    ids: &[String],
+    now: DateTime<Utc>,
+) -> Result<Vec<(String, Staged)>, TakeError> {
+    let mut found: Vec<(String, Staged)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id.trim();
+        match staged.get(id) {
+            Some(entry)
+                if entry.user_id == user_id
+                    && entry.expires_at > now
+                    && !found.iter().any(|(seen, _)| seen == id) =>
+            {
+                found.push((id.to_string(), entry.clone()));
+            }
+            _ => return Err(TakeError::Unknown(id.to_string())),
+        }
+    }
+    Ok(found)
 }
 
 fn remove(path: &FsPath) {
