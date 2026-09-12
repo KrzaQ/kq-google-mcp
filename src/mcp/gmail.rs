@@ -193,8 +193,10 @@ impl Gmcp {
     #[tool(
         description = "Search one account's mail with Gmail's own query syntax and get a compact \
                        list back: message and thread ids, date, sender, recipients, subject, \
-                       snippet, labels and how many attachments each has. Use gmail_get_message or \
-                       gmail_get_thread for the bodies."
+                       snippet and labels. A row does not say whether the message carries files, \
+                       because Gmail answers a listing without the part tree; narrow the search \
+                       with `has:attachment`, and read one message with gmail_get_message to see \
+                       what it carries. Use gmail_get_message or gmail_get_thread for the bodies."
     )]
     async fn gmail_search(
         &self,
@@ -438,10 +440,13 @@ impl Gmcp {
         description = "A URL to upload one file to, so a draft can carry it. Attaching a file \
                        takes three steps and you do the middle one yourself: call this, then \
                        POST the bytes to the `url` it answers (`curl --data-binary @file URL`), \
-                       then pass the `upload_id` you read back in the draft tool's \
-                       `attachments`. This server cannot read a file on your machine, so \
-                       uploading it is the only way to attach it. The URL takes one upload and \
-                       lives 15 minutes; the file itself waits an hour to be attached and is \
+                       then pass the `upload_id` you read back in the `attachments` of \
+                       gmail_create_draft, gmail_reply_draft, gmail_update_draft or \
+                       gmail_attach_to_draft. This server cannot read a file on your machine, so \
+                       uploading it is the only way to attach it. There is no `account` here \
+                       because a staged file belongs to you and not to a mailbox: the draft tool \
+                       you pass it to decides which account it lands in. The URL takes one upload \
+                       and lives 15 minutes; the file itself waits an hour to be attached and is \
                        forgotten once it is."
     )]
     async fn gmail_upload_link(
@@ -716,7 +721,11 @@ impl Gmcp {
         Ok(Json(draft_out(connection.label, draft, from, &content)))
     }
 
-    #[tool(description = "The account's drafts, newest first, with their ids and Gmail URLs.")]
+    #[tool(
+        description = "The account's drafts, newest first, with their ids and Gmail URLs. A row \
+                       does not say whether a draft carries files; gmail_get_message on the \
+                       draft's message_id names them."
+    )]
     async fn gmail_list_drafts(
         &self,
         Parameters(p): Parameters<ListDraftsParam>,
@@ -847,7 +856,7 @@ impl Gmcp {
                     subject: message.subject,
                     snippet: message.snippet,
                     labels: message.labels,
-                    attachments: message.attachments.len(),
+                    attachments: Some(message.attachments.len()),
                 }),
                 Err(e) => {
                     let error = self.google_err_for(&connection, e);

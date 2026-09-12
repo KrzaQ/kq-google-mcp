@@ -517,8 +517,10 @@ pub async fn upload(
         mime_type: staged.mime_type,
         expires_at: staged.expires_at,
         note: format!(
-            "pass upload_id as one of `attachments` to a draft tool within {UPLOAD_TTL_MINUTES} \
-             minutes; the file is attached once and then forgotten"
+            "pass upload_id as one of `attachments` within {UPLOAD_TTL_MINUTES} minutes: to \
+             gmail_create_draft, gmail_reply_draft or gmail_update_draft for a draft you are \
+             writing, or to gmail_attach_to_draft for one that already exists. The file is \
+             attached once and then forgotten"
         ),
     }))
 }
