@@ -246,6 +246,12 @@ pub struct DraftOut {
     /// silent; tell the person which address the draft is from.
     pub from: Option<String>,
     pub from_reason: Option<String>,
+    /// Why a reply went to these recipients, when the answer is not the
+    /// obvious one. Set when the original was a message the account itself
+    /// sent, because then the reply goes to the original's recipients rather
+    /// than to its sender; tell the person, so a reply that went somewhere
+    /// they did not expect is visible here.
+    pub to_reason: Option<String>,
     /// Where the person opens the draft and presses send. This server never
     /// sends anything itself.
     pub url: String,

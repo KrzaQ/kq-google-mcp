@@ -1075,6 +1075,65 @@ async fn a_reply_comes_from_the_address_the_message_was_delivered_to() {
     drop(server);
 }
 
+#[tokio::test]
+async fn a_reply_to_mail_the_account_sent_goes_to_the_people_it_was_sent_to() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f9",
+        fixture("gmail_message_sent.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let out = c
+        .ok(
+            "gmail_reply_draft",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f9",
+                   "body": "One more thing.", "reply_all": true}),
+        )
+        .await;
+    // The account wrote the original, so the reply carries on the thread the
+    // person started instead of answering themselves, and the result says so.
+    assert!(
+        out["to_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sent"),
+        "{out}"
+    );
+
+    let mime = draft_mime(&server).await;
+    let to = mime
+        .lines()
+        .find(|l| l.starts_with("To:"))
+        .unwrap_or_default();
+    assert!(to.contains("marta@example.test"), "{mime}");
+    assert!(to.contains("bob@example.test"), "{mime}");
+    assert!(!to.contains("anna@example.test"), "{mime}");
+    assert!(mime.contains("Cc: team@example.test"), "{mime}");
+    assert!(
+        mime.contains("From: \"Anna Kowalska\" <anna@example.test>"),
+        "{mime}"
+    );
+    assert!(mime.contains("Subject: Re: Q3 figures"), "{mime}");
+    assert!(
+        mime.contains("In-Reply-To: <CAF7n2sghi789@mail.example.test>"),
+        "{mime}"
+    );
+    drop(server);
+}
+
 // ----- confirmation -----------------------------------------------------------
 
 #[tokio::test]

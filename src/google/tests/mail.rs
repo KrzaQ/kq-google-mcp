@@ -666,3 +666,52 @@ fn a_reply_keeps_one_re_and_drops_the_replying_account_from_the_recipients() {
     assert_eq!(subject_of("re: budget"), "re: budget");
     assert_eq!(subject_of(""), "Re:");
 }
+
+#[test]
+fn a_reply_to_a_message_the_account_sent_goes_to_that_message_s_recipients() {
+    let message = gmail::Message {
+        id: "m2".into(),
+        thread_id: "t2".into(),
+        date: None,
+        from: Some("Anna Kowalska <anna@example.test>".into()),
+        to: vec![
+            "Marta Nowak <marta@example.test>".into(),
+            "anna@example.test".into(),
+        ],
+        cc: vec!["team@example.test".into()],
+        delivered_to: vec![],
+        subject: Some("budget".into()),
+        snippet: None,
+        labels: vec!["SENT".into()],
+        message_id: Some("<sent@example.test>".into()),
+        in_reply_to: None,
+        references: vec![],
+        text: String::new(),
+        text_from_html: false,
+        attachments: vec![],
+        inline_images: vec![],
+    };
+    // The account wrote the original, so answering its From would write to the
+    // person replying. The reply goes where the original went, and the copy
+    // the account kept to itself stays a recipient.
+    let reply =
+        gmail::DraftContent::reply_to(&message, "anna@example.test", "one more thing", true);
+    assert_eq!(
+        reply.to,
+        ["Marta Nowak <marta@example.test>", "anna@example.test"]
+    );
+    assert_eq!(reply.cc, ["team@example.test"]);
+    assert_eq!(reply.subject, "Re: budget");
+    assert_eq!(reply.in_reply_to.as_deref(), Some("<sent@example.test>"));
+    assert_eq!(reply.references, ["<sent@example.test>"]);
+    assert_eq!(reply.thread_id.as_deref(), Some("t2"));
+
+    // Without reply_all the copies are left off, as on any other reply.
+    let alone =
+        gmail::DraftContent::reply_to(&message, "anna@example.test", "one more thing", false);
+    assert_eq!(
+        alone.to,
+        ["Marta Nowak <marta@example.test>", "anna@example.test"]
+    );
+    assert!(alone.cc.is_empty());
+}

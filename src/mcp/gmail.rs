@@ -452,6 +452,9 @@ impl Gmcp {
                        another of the account's verified send-as addresses, which \
                        gmail_list_send_as reports. The result says which address was chosen and \
                        why — tell the person, so a wrong guess is caught before they send. \
+                       Replying to a message the account itself sent writes to that message's \
+                       own recipients, not back to the account, because the person is carrying \
+                       on a thread they started; the result says so in `to_reason`. \
                        Nothing is sent; the person sends it from Gmail."
     )]
     async fn gmail_reply_draft(
@@ -477,7 +480,15 @@ impl Gmcp {
         let draft = gmail::create_draft(client, connection.id, &content)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        Ok(Json(draft_out(connection.label, draft, from)))
+        let mut out = draft_out(connection.label, draft, from);
+        if message.is_sent() {
+            out.to_reason = Some(
+                "this account sent the original, so the reply goes to its recipients rather \
+                 than back to its sender"
+                    .into(),
+            );
+        }
+        Ok(Json(out))
     }
 
     #[tool(
@@ -569,6 +580,7 @@ impl Gmcp {
             thread_id: String::new(),
             from: None,
             from_reason: None,
+            to_reason: None,
             draft_id,
             note: "the draft is gone".into(),
         }))
@@ -996,6 +1008,7 @@ fn draft_out(account: String, draft: gmail::DraftRef, from: ChosenFrom) -> dto::
         thread_id: draft.thread_id,
         from: Some(from.header),
         from_reason: Some(from.reason),
+        to_reason: None,
         note: "nothing was sent; the person opens this draft in Gmail and sends it themselves"
             .into(),
     }

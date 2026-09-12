@@ -34,6 +34,8 @@ const GMAIL: &str = "gmail";
 const REFUSED_LABELS: [&str; 2] = ["TRASH", "SPAM"];
 /// Which headers a summary needs, so a list does not pull whole bodies.
 const SUMMARY_HEADERS: [&str; 4] = ["From", "To", "Subject", "Date"];
+/// The label id Gmail puts on a message the account sent itself.
+const SENT_LABEL: &str = "SENT";
 
 /// One row of a search result.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -74,6 +76,16 @@ pub struct Message {
     pub text_from_html: bool,
     pub attachments: Vec<Attachment>,
     pub inline_images: Vec<InlineImage>,
+}
+
+impl Message {
+    /// True when the account sent this message itself. Gmail says so with the
+    /// `SENT` label, and a reply to such a message is addressed differently:
+    /// its `From` is the account, so answering it would write to the person
+    /// replying.
+    pub fn is_sent(&self) -> bool {
+        self.labels.iter().any(|l| l == SENT_LABEL)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -211,17 +223,33 @@ impl DraftContent {
     /// that id in `References`, its thread id on the draft, and its subject
     /// with one `Re:`.
     pub fn reply_to(message: &Message, from: &str, body: &str, reply_all: bool) -> Self {
-        let mut to: Vec<String> = message.from.clone().into_iter().collect();
-        let mut cc = Vec::new();
-        if reply_all {
-            // Everyone the message went to, minus the account replying.
-            for address in message.to.iter().chain(message.cc.iter()) {
-                if !same_address(address, from) && !to.iter().any(|t| same_address(t, address)) {
-                    cc.push(address.clone());
+        let (to, cc) = if message.is_sent() {
+            // The account wrote this one, so its `From` is the account itself
+            // and a reply built from it would go back to the person writing.
+            // What continues the thread is the message's own recipients.
+            // Nothing is dropped for being an address of this account: writing
+            // to yourself is the point once you have sent the mail.
+            let cc = if reply_all {
+                message.cc.clone()
+            } else {
+                Vec::new()
+            };
+            (message.to.clone(), cc)
+        } else {
+            let mut to: Vec<String> = message.from.clone().into_iter().collect();
+            let mut cc = Vec::new();
+            if reply_all {
+                // Everyone the message went to, minus the account replying.
+                for address in message.to.iter().chain(message.cc.iter()) {
+                    if !same_address(address, from) && !to.iter().any(|t| same_address(t, address))
+                    {
+                        cc.push(address.clone());
+                    }
                 }
             }
-        }
-        to.retain(|address| !same_address(address, from) || message.to.len() <= 1);
+            to.retain(|address| !same_address(address, from) || message.to.len() <= 1);
+            (to, cc)
+        };
         let mut references = message.references.clone();
         if let Some(id) = &message.message_id
             && !references.contains(id)
