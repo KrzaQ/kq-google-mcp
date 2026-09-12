@@ -95,7 +95,11 @@ pub struct MessageBriefOut {
     pub subject: Option<String>,
     pub snippet: Option<String>,
     pub labels: Vec<String>,
-    pub attachments: usize,
+    /// How many files the message carries, when that was read. A listing
+    /// leaves it out rather than saying zero: Gmail answers a listing without
+    /// the part tree, so nothing there can count what a message holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<usize>,
 }
 
 impl MessageBriefOut {
@@ -109,7 +113,7 @@ impl MessageBriefOut {
             subject: m.subject,
             snippet: m.snippet,
             labels: m.labels,
-            attachments: m.attachment_count,
+            attachments: None,
         }
     }
 }

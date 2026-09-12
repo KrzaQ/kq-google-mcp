@@ -6,7 +6,7 @@ use crate::domain::limits::DOWNLOAD_MAX_BYTES;
 use crate::google::gmail;
 
 #[tokio::test]
-async fn a_search_returns_rows_with_senders_subjects_and_attachment_counts() {
+async fn a_search_returns_rows_with_senders_subjects_and_labels() {
     let h = harness().await;
     h.mount_json(
         "GET",
@@ -40,7 +40,6 @@ async fn a_search_returns_rows_with_senders_subjects_and_attachment_counts() {
     );
     // The encoded word in the header is decoded for the model.
     assert_eq!(first.subject.as_deref(), Some("Q3 figures for Kraków"));
-    assert_eq!(first.attachment_count, 1);
     assert_eq!(first.labels, ["INBOX", "IMPORTANT", "UNREAD"]);
     assert_eq!(
         first.date.unwrap().to_rfc3339(),

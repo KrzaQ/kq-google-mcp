@@ -32,25 +32,6 @@
     ],
     "body": {
       "size": 0
-    },
-    "parts": [
-      {
-        "mimeType": "text/plain",
-        "filename": "",
-        "headers": [],
-        "body": {
-          "size": 212
-        }
-      },
-      {
-        "mimeType": "application/pdf",
-        "filename": "q3-figures.pdf",
-        "headers": [],
-        "body": {
-          "attachmentId": "ANGjdJ8pdfQ3",
-          "size": 26112
-        }
-      }
-    ]
+    }
   }
 }

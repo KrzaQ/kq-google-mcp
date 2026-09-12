@@ -2100,6 +2100,10 @@ async fn labels_are_resolved_by_name_and_the_bin_is_refused() {
     assert_eq!(out["added"], json!(["Label_18"]));
     assert_eq!(out["removed"], json!(["INBOX", "UNREAD"]));
     assert_eq!(out["modified"], 1);
+    // This one read the whole message, so a zero here is a counted zero and
+    // means the message carries nothing. The same row in a listing leaves the
+    // field out entirely, because there it would be a guess.
+    assert_eq!(out["messages"][0]["attachments"], 0);
 
     // However they are spelled and whichever side they are named on: taking a
     // message out of the bin is not a thing this server does either.
@@ -2567,7 +2571,15 @@ async fn gmail_search_asks_gmail_the_query_it_was_given_and_answers_in_rows() {
         out["messages"][0]["from"],
         "Marta Nowak <marta@example.test>"
     );
-    assert_eq!(out["messages"][0]["attachments"], 1);
+    // A listing says nothing about files. Gmail answers `format=metadata`
+    // without the part tree, so the old count here was zero against real mail
+    // however many files a message carried; an absent field sends a model to
+    // gmail_get_message instead of to a wrong conclusion.
+    assert!(
+        out["messages"][0].get("attachments").is_none(),
+        "{}",
+        out["messages"][0]
+    );
 
     let asked = server.received_requests().await.unwrap();
     let list = asked

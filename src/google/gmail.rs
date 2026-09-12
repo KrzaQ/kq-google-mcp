@@ -60,7 +60,6 @@ pub struct MessageSummary {
     pub subject: Option<String>,
     pub snippet: Option<String>,
     pub labels: Vec<String>,
-    pub attachment_count: usize,
 }
 
 /// One message, read. The headers are the three the plan names plus the
@@ -1055,11 +1054,11 @@ impl WireMessage {
         Utc.timestamp_millis_opt(millis).single()
     }
 
+    /// A row of a listing. `format=metadata` answers headers and no part
+    /// tree, so nothing here can say what a message carries; the count this
+    /// used to hold was always zero against real Gmail, however many files
+    /// the message had.
     fn summary(&self) -> MessageSummary {
-        let mut bodies = Bodies::default();
-        if let Some(payload) = &self.payload {
-            payload.walk(&mut bodies);
-        }
         MessageSummary {
             id: self.id.clone(),
             thread_id: self.thread_id.clone(),
@@ -1069,7 +1068,6 @@ impl WireMessage {
             subject: self.header("Subject").map(text_header),
             snippet: self.snippet.clone(),
             labels: self.label_ids.clone(),
-            attachment_count: bodies.attachments.len(),
         }
     }
 
