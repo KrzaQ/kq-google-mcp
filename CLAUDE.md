@@ -80,6 +80,16 @@ to say about itself is here and in `README.md`.
 - Files leave through short-lived download links (15 min, 3 uses), never as MCP
   payloads. The constants live in `domain/` and are constants, not
   configuration.
+- **A file gets into a draft over the wire and no other way.** `gmail_upload_link`
+  mints a one-time ticket, the agent POSTs the bytes to `/up/{id}` itself, and
+  the upload id goes to a draft tool, which attaches the file and deletes it.
+  Nothing reads a path a caller supplies: the caller is on another machine.
+  Tickets and staged files are in memory and in `GMCP_UPLOAD_DIR`, never in the
+  database, and `serve` empties that directory at startup — nothing survives a
+  restart that the database does not know about. A draft with no attachments
+  produces byte-identical MIME to what it did before attachments existed and
+  still goes to the JSON endpoint; one with files goes to Gmail's upload
+  endpoint, which is still a drafts endpoint and still sends nothing.
 - Every tool call, link mint and link hit is logged, with the arguments
   stripped of bodies and cut at 4 KB. Tool output is never logged.
 - **Tests must not need the network, a file on disk or an existing database.**

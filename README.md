@@ -36,6 +36,11 @@ database and no network.
 - **Files** leave through short-lived download links (15 minutes, three uses),
   never as MCP payloads; images additionally come back downscaled as image
   content, and text is extracted server-side for PDF, DOCX, CSV and plain text.
+  They come in the same way round: `gmail_upload_link` mints a URL, the agent
+  POSTs the bytes to it, and the upload id it reads back goes to a draft tool,
+  which attaches the file and forgets it. Nothing reads a path a model
+  supplies — the caller is on another machine — and no ticket or staged file
+  outlives a restart.
 - **Every call is logged** — who, which token, which connection, which tool,
   the arguments with secrets stripped, the outcome — and the log is the
   portal's front page.
