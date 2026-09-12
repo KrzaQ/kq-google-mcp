@@ -467,6 +467,23 @@ fn a_draft_with_no_attachments_is_the_message_it_has_always_been() {
     assert_eq!(mime.matches("boundary=").count(), 1, "{mime}");
 }
 
+/// Gmail is handed the message and nothing else, so the blind copies have to
+/// be in it. A mail library drops them by default, because a mail server
+/// reads them off the envelope instead and a sent message must not name them.
+#[test]
+fn a_draft_carries_its_blind_copies() {
+    let content = gmail::DraftContent {
+        from: "anna@example.test".into(),
+        to: vec!["marta@example.test".into()],
+        bcc: vec!["archiwum@example.test".into()],
+        subject: "Q3".into(),
+        text: "here they are".into(),
+        ..Default::default()
+    };
+    let mime = without_date(&gmail::build_mime(&content).unwrap());
+    assert!(mime.contains("Bcc: archiwum@example.test"), "{mime}");
+}
+
 #[test]
 fn a_draft_with_files_carries_them_beside_the_body() {
     let content = gmail::DraftContent {

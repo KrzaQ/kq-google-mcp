@@ -679,6 +679,11 @@ pub fn build_mime(content: &DraftContent) -> Result<Vec<u8>> {
             .map_err(|e| Error::Malformed(format!("{value:?} is not an email address: {e}")))
     };
     let mut builder = lettre::Message::builder()
+        // lettre takes the blind copies out of the message once it has made
+        // an envelope from them, which is right for a mail server and wrong
+        // here: Gmail is handed the message alone and reads the recipients
+        // out of it, so a draft built without this loses every Bcc silently.
+        .keep_bcc()
         .from(mailbox(&content.from)?)
         .subject(content.subject.clone());
     for address in &content.to {
