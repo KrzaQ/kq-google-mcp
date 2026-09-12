@@ -18,7 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::AppState;
-use super::{auth, links};
+use super::{auth, links, uploads};
 use crate::google::text;
 
 /// What a monitor and the container's HEALTHCHECK ask for. The database is the
@@ -88,4 +88,5 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(scopes::scopes))
         .routes(routes!(activity::list_audit))
         .routes(routes!(links::download))
+        .routes(routes!(uploads::upload))
 }

@@ -22,6 +22,7 @@ use crate::db::{
     ApiToken, ClientProfile, Connection, ConnectionStatus, LinkKind, NewConnection, NewLink,
     NewToken, User,
 };
+use crate::domain::limits::ATTACHMENT_MAX_BYTES;
 use crate::domain::{link as domain_link, seal, token as domain_token};
 use crate::http::auth::{DEV_SUBJECT, Principal};
 
@@ -62,6 +63,7 @@ fn mocked(server: &MockServer) -> GoogleConfig {
 fn config(auth: AuthMode, public_url: &str, google: GoogleConfig) -> Config {
     Config {
         database: PathBuf::new(),
+        upload_dir: uploads_dir(),
         bind: "127.0.0.1:0".parse().unwrap(),
         public_url: public_url.parse().unwrap(),
         secret: SECRET.to_vec(),
@@ -86,13 +88,26 @@ fn oidc_mode() -> AuthMode {
 fn state_of(db: &Db, config: Config) -> AppState {
     let key = cookie_key(&config.secret);
     let google = AppState::google_parts(&config, db).expect("google parts");
+    let staging = Arc::new(crate::http::uploads::Staging::new(
+        config.upload_dir.clone(),
+    ));
     AppState {
         db: db.clone(),
         config: Arc::new(config),
         oidc: None,
         google,
+        staging,
         key,
     }
+}
+
+/// A staging directory of this test's own. Nothing is created on disk until
+/// something is actually staged, and the tests that stage remove it again.
+fn uploads_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "gmcp-test-uploads-{}",
+        crate::domain::link::new_id()
+    ))
 }
 
 /// Dev auth: every request is the dev user, and no Google credentials.
@@ -1240,6 +1255,179 @@ async fn the_three_refusals_are_one_answer() {
         details.iter().any(|d| d.contains("no uses left")),
         "{details:?}"
     );
+}
+
+// ----- staged uploads ---------------------------------------------------------
+
+/// Everything an upload test needs, with a staging directory of its own that
+/// goes away when the test ends.
+struct UploadFixture {
+    state: AppState,
+    app: Router,
+    dir: PathBuf,
+    user: User,
+    token: ApiToken,
+}
+
+impl Drop for UploadFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn upload_fixture(db: &Db) -> UploadFixture {
+    let anna = user(db, "anna", "anna@example.test").await;
+    let (token, _) = token_for(db, "claude", &["gmail:draft"], Some(&anna), anna.id).await;
+    let mut cfg = config(AuthMode::Dev, "http://localhost:8000", unconfigured());
+    let dir = cfg.upload_dir.clone();
+    cfg.upload_dir = dir.clone();
+    let state = state_of(db, cfg);
+    UploadFixture {
+        app: router(state.clone()),
+        state,
+        dir,
+        user: anna,
+        token,
+    }
+}
+
+fn staged_files(dir: &PathBuf) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect()
+}
+
+fn post(uri: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The ticket is the whole credential, it works once, and what it staged is
+/// the acting person's to attach and nobody else's.
+#[tokio::test]
+async fn a_ticket_takes_one_upload_and_is_then_spent() {
+    let db = Db::open_memory().await.unwrap();
+    let f = upload_fixture(&db).await;
+    let minted = uploads::mint(
+        &f.state,
+        uploads::NewUpload {
+            user_id: f.user.id,
+            token_id: f.token.id,
+            filename: "zażółć raport.pdf".into(),
+            mime_type: None,
+        },
+    );
+    assert!(
+        minted.url.starts_with("http://localhost:8000/up/"),
+        "{}",
+        minted.url
+    );
+    assert_eq!(
+        minted
+            .expires_at
+            .signed_duration_since(Utc::now())
+            .num_minutes(),
+        14
+    );
+
+    // No session and no bearer token: knowing the id is the permission.
+    let (s, b, _) = call(
+        &f.app,
+        post(&format!("/up/{}", minted.id), b"%PDF-1.7 x".to_vec()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["filename"], "zażółć raport.pdf");
+    assert_eq!(b["size"], 10);
+    // Nobody said what it was, so the name did.
+    assert_eq!(b["mime_type"], "application/pdf");
+    let upload_id = b["upload_id"].as_str().unwrap().to_string();
+    assert_eq!(staged_files(&f.dir).len(), 1);
+
+    // The second POST has nothing to spend, and is refused the way an unknown
+    // and an expired ticket are: the same 404, so a ticket cannot be probed.
+    let (s, b, _) = call(
+        &f.app,
+        post(&format!("/up/{}", minted.id), b"again".to_vec()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(b["error"]["code"], "not_found");
+    let (s, _, _) = call(&f.app, post("/up/neverminted0000000000", b"x".to_vec())).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(staged_files(&f.dir).len(), 1, "nothing else was written");
+
+    // Another person's upload id is not theirs to attach, and asking does not
+    // take the file away from the person it belongs to.
+    assert!(
+        f.state
+            .staging
+            .take(f.user.id + 1, std::slice::from_ref(&upload_id))
+            .is_err()
+    );
+    let files = f.state.staging.take(f.user.id, &[upload_id]).unwrap();
+    assert_eq!(files[0].bytes, b"%PDF-1.7 x");
+    assert_eq!(files[0].filename, "zażółć raport.pdf");
+    assert!(
+        staged_files(&f.dir).is_empty(),
+        "the file is gone once it is read"
+    );
+}
+
+/// A file over what one mail may carry is refused before any of it reaches
+/// the disk. Gmail would refuse the draft anyway; this refuses it here, where
+/// the answer can say what to do instead.
+#[tokio::test]
+async fn a_file_over_the_cap_is_refused_and_leaves_nothing_behind() {
+    let db = Db::open_memory().await.unwrap();
+    let f = upload_fixture(&db).await;
+    let mint = || {
+        uploads::mint(
+            &f.state,
+            uploads::NewUpload {
+                user_id: f.user.id,
+                token_id: f.token.id,
+                filename: "huge.zip".into(),
+                mime_type: Some("application/zip".into()),
+            },
+        )
+    };
+    let over = vec![0u8; ATTACHMENT_MAX_BYTES + 1];
+
+    // A sender that declares its length is turned away before it sends a byte.
+    let mut request = post(&format!("/up/{}", mint().id), Vec::new());
+    request.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        over.len().to_string().parse().unwrap(),
+    );
+    let (s, b, _) = call(&f.app, request).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("25.0 MB"),
+        "{b}"
+    );
+
+    // And one that does not is cut off at the cap as the bytes go past.
+    let (s, b, _) = call(&f.app, post(&format!("/up/{}", mint().id), over)).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+    assert!(staged_files(&f.dir).is_empty(), "no part of it was written");
+
+    // An empty body is a mistake worth naming rather than a nought-byte file.
+    let (s, b, _) = call(&f.app, post(&format!("/up/{}", mint().id), Vec::new())).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("body"),
+        "{b}"
+    );
+    assert!(staged_files(&f.dir).is_empty());
 }
 
 // ----- the login flow --------------------------------------------------------

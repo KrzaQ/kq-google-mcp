@@ -56,8 +56,23 @@ fn google_config(server: Option<&MockServer>) -> GoogleConfig {
 }
 
 async fn app(db: &Db, server: Option<&MockServer>) -> Router {
+    app_in(db, server, uploads_dir()).await
+}
+
+/// A staging directory of this test's own. Nothing is written to disk until a
+/// test actually stages a file, and the tests that do remove it again.
+fn uploads_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "gmcp-test-uploads-{}",
+        crate::domain::link::new_id()
+    ))
+}
+
+/// The same, for a test that has to look at the staged files itself.
+async fn app_in(db: &Db, server: Option<&MockServer>, upload_dir: std::path::PathBuf) -> Router {
     let config = Config {
         database: std::path::PathBuf::new(),
+        upload_dir,
         bind: "127.0.0.1:0".parse().unwrap(),
         public_url: format!("https://{HOST}").parse().unwrap(),
         secret: SECRET.to_vec(),

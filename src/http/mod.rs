@@ -1,5 +1,5 @@
 //! The HTTP server: the JSON API under `/api`, the download route at `/dl`,
-//! and the embedded frontend everywhere else.
+//! the upload route at `/up`, and the embedded frontend everywhere else.
 //!
 //! Two rules shape the router. `/api/*` never redirects on a missing session —
 //! it answers 401 with the error envelope, because the frontend is a SPA and a
@@ -16,6 +16,7 @@ pub mod links;
 pub mod oidc;
 mod r#static;
 pub mod store;
+pub mod uploads;
 
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,10 @@ pub struct AppState {
     /// None when `GMCP_GOOGLE_CLIENT_ID` and `GMCP_GOOGLE_CLIENT_SECRET` are
     /// unset; `/api/health` reports it and the connections page says so.
     pub google: Option<Google>,
+    /// The upload tickets and the files waiting to be attached to a draft.
+    /// They live in this process and nowhere else, so the tool that mints a
+    /// ticket and the route that spends it must share one of these.
+    pub staging: Arc<uploads::Staging>,
     pub key: Key,
 }
 
@@ -71,11 +76,13 @@ impl AppState {
         };
         let google = Self::google_parts(&config, &db)?;
         let key = cookie_key(&config.secret);
+        let staging = Arc::new(uploads::Staging::new(config.upload_dir.clone()));
         Ok(Self {
             db,
             config: Arc::new(config),
             oidc,
             google,
+            staging,
             key,
         })
     }
@@ -122,11 +129,12 @@ pub fn cookie_key(secret: &[u8]) -> Key {
 #[openapi(
     info(
         title = "gmcp",
-        description = "Scoped Google portal: connections, tokens, activity and download links"
+        description = "Scoped Google portal: connections, tokens, activity, download links \
+                       and staged uploads"
     ),
     tags(
         (name = "health"), (name = "auth"), (name = "connections"), (name = "tokens"),
-        (name = "audit"), (name = "links")
+        (name = "audit"), (name = "links"), (name = "uploads")
     )
 )]
 struct ApiDoc;

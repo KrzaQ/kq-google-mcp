@@ -12,6 +12,10 @@ use anyhow::{Context, Result, bail};
 /// Where the database lives when `GMCP_DATABASE` is unset: development runs
 /// out of the checkout, the container mounts `/data`.
 const DEFAULT_DATABASE: &str = "./data/gmcp.db";
+/// Where staged uploads are written when `GMCP_UPLOAD_DIR` is unset. The
+/// directory is emptied at every startup, so the system temporary directory
+/// is the honest place for it; the container points it at a mount instead.
+const DEFAULT_UPLOAD_DIR: &str = "gmcp-uploads";
 const DEFAULT_API_BASE: &str = "https://www.googleapis.com";
 const DEFAULT_OAUTH_BASE: &str = "https://oauth2.googleapis.com";
 const DEFAULT_ACCOUNTS_BASE: &str = "https://accounts.google.com";
@@ -23,6 +27,11 @@ const DEFAULT_TIMEZONE: &str = "Europe/Warsaw";
 pub struct Config {
     /// Path of the SQLite file; the directory is created at startup.
     pub database: PathBuf,
+    /// Where a file waits between the upload that stages it and the draft
+    /// that attaches it. Everything in it is disposable: `serve` empties it
+    /// at startup, because nothing the database does not know about may
+    /// survive a restart.
+    pub upload_dir: PathBuf,
     pub bind: SocketAddr,
     /// Public origin of the deployment. Both redirect URIs and every download
     /// link derive from it; it is never taken from a request header.
@@ -135,6 +144,15 @@ fn database(vars: Vars) -> PathBuf {
         .into()
 }
 
+/// `GMCP_UPLOAD_DIR`, a directory of the deployment's own under the system
+/// temporary directory when unset.
+fn upload_dir(vars: Vars) -> PathBuf {
+    match vars("GMCP_UPLOAD_DIR") {
+        Some(dir) => dir.into(),
+        None => std::env::temp_dir().join(DEFAULT_UPLOAD_DIR),
+    }
+}
+
 impl Config {
     /// Everything `serve` needs, from the process environment.
     pub fn from_env() -> Result<Self> {
@@ -178,6 +196,7 @@ impl Config {
         };
         Ok(Self {
             database: database(vars),
+            upload_dir: upload_dir(vars),
             bind,
             public_url,
             secret,
@@ -206,11 +225,12 @@ impl Config {
             ),
         };
         format!(
-            "bind {}, public url {}, database {}, auth {auth}, {}, session secret {} bytes, \
-             auto-migrate {}, timezone {}",
+            "bind {}, public url {}, database {}, uploads {}, auth {auth}, {}, \
+             session secret {} bytes, auto-migrate {}, timezone {}",
             self.bind,
             self.public_url,
             self.database.display(),
+            self.upload_dir.display(),
             self.google.describe(),
             self.secret.len(),
             self.auto_migrate,
@@ -329,6 +349,12 @@ mod tests {
         let config = Config::from_vars(&vars(&with_bind)).unwrap();
         assert!(matches!(config.auth, AuthMode::Dev));
         assert_eq!(config.database, PathBuf::from(DEFAULT_DATABASE));
+        // Nothing the database does not know about survives a restart, so the
+        // staging directory defaults under the system temporary directory.
+        assert_eq!(
+            config.upload_dir,
+            std::env::temp_dir().join(DEFAULT_UPLOAD_DIR)
+        );
         assert!(config.auto_migrate);
         // Dev mode with no GMCP_SECRET gets a random one, per process.
         assert_eq!(config.secret.len(), 64);
