@@ -1134,6 +1134,121 @@ async fn a_reply_to_mail_the_account_sent_goes_to_the_people_it_was_sent_to() {
     drop(server);
 }
 
+#[tokio::test]
+async fn an_updated_draft_stays_in_the_conversation_it_belongs_to() {
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    mount_send_as(&server).await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6",
+        fixture("gmail_message_full.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/gmail/v1/users/me/drafts",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/drafts/r-8812345678901234567",
+        fixture("gmail_draft_reply.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "PUT",
+        "/gmail/v1/users/me/drafts/r-8812345678901234567",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/drafts/r-4400000000000000001",
+        fixture("gmail_draft_plain.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "PUT",
+        "/gmail/v1/users/me/drafts/r-4400000000000000001",
+        fixture("gmail_draft.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
+
+    let reply = c
+        .ok(
+            "gmail_reply_draft",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6",
+                   "body": "Thanks, I will read it tonight."}),
+        )
+        .await;
+    assert_eq!(reply["draft_id"], "r-8812345678901234567");
+
+    // One recipient corrected, and nothing else meant: the draft must still
+    // answer the message it answered before.
+    c.ok(
+        "gmail_update_draft",
+        json!({"account": "work", "draft_id": "r-8812345678901234567",
+               "to": ["marta@example.test"], "subject": "Re: Q3 figures",
+               "body": "Thanks, I will read it tonight."}),
+    )
+    .await;
+    let (body, mime) = updated_draft(&server, "r-8812345678901234567").await;
+    assert_eq!(body["message"]["threadId"], "18f0a1b2c3d4e5f0");
+    assert!(
+        mime.contains("In-Reply-To: <CAF7n2sabc123@mail.example.test>"),
+        "{mime}"
+    );
+    assert!(mime.contains("References:"), "{mime}");
+    assert!(mime.contains("<20260901T090000.0@example.test>"), "{mime}");
+    assert!(mime.contains("<CAF7n2sabc123@mail.example.test>"), "{mime}");
+
+    // A draft that was never a reply keeps its own thread and gains no
+    // threading headers it never had.
+    c.ok(
+        "gmail_update_draft",
+        json!({"account": "work", "draft_id": "r-4400000000000000001",
+               "to": ["marta@example.test"], "subject": "Order 4471",
+               "body": "confirmed, and one pallet more"}),
+    )
+    .await;
+    let (body, mime) = updated_draft(&server, "r-4400000000000000001").await;
+    assert_eq!(body["message"]["threadId"], "18f0a1b2c3d4e5fd");
+    assert!(!mime.contains("In-Reply-To"), "{mime}");
+    assert!(!mime.contains("References"), "{mime}");
+    drop(server);
+}
+
+/// The last update sent to one draft: the request body, and the RFC 2822
+/// message inside it decoded.
+async fn updated_draft(server: &MockServer, draft_id: &str) -> (Value, String) {
+    use base64::Engine;
+    let request = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|r| r.method.as_str() == "PUT" && r.url.path().ends_with(draft_id))
+        .expect("the draft was updated");
+    let body: Value = serde_json::from_slice(&request.body).expect("the update request is JSON");
+    let raw = body["message"]["raw"].as_str().expect("a raw message");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim_end_matches('='))
+        .expect("the raw message is base64url");
+    (
+        body,
+        String::from_utf8(bytes).expect("the message is UTF-8"),
+    )
+}
+
 // ----- confirmation -----------------------------------------------------------
 
 #[tokio::test]
@@ -1981,6 +2096,14 @@ async fn gmail_update_draft_replaces_the_message_and_still_sends_nothing() {
         .expect(1)
         .mount(&server)
         .await;
+    // The update reads the draft first, to keep the conversation it is in.
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/drafts/r-8812345678901234567",
+        fixture("gmail_draft_reply.json"),
+    )
+    .await;
     mount_send_as(&server).await;
     let mut c = client(&db, &server, &["gmail:read", "gmail:draft"]).await;
 

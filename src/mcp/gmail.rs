@@ -494,10 +494,12 @@ impl Gmcp {
     #[tool(
         description = "Replace an existing draft's whole message: recipients, subject and body \
                        are written as given, and anything left out is dropped. Read the draft \
-                       with gmail_list_drafts first if you mean to keep part of it. `from` must \
-                       be one of the account's verified send-as addresses, which \
-                       gmail_list_send_as reports; left out, the draft comes from the account's \
-                       default address. Still nothing is sent."
+                       with gmail_list_drafts first if you mean to keep part of it. The \
+                       conversation is kept: a draft that answers a message goes on answering it, \
+                       with its In-Reply-To, References and thread id, so correcting a recipient \
+                       does not start a new thread. `from` must be one of the account's verified \
+                       send-as addresses, which gmail_list_send_as reports; left out, the draft \
+                       comes from the account's default address. Still nothing is sent."
     )]
     async fn gmail_update_draft(
         &self,
@@ -506,32 +508,43 @@ impl Gmcp {
     ) -> Result<Json<dto::DraftOut>, ErrorData> {
         let connection = self.account(&call, &p.account, Service::Gmail).await?;
         let from = self.draft_from(&connection, p.from.as_deref()).await?;
+        let to = addresses(p.to, "to")?;
+        let cc =
+            p.cc.map(|c| addresses(c, "cc"))
+                .transpose()?
+                .unwrap_or_default();
+        let bcc = p
+            .bcc
+            .map(|c| addresses(c, "bcc"))
+            .transpose()?
+            .unwrap_or_default();
+        let client = &self.google()?.client;
+        let draft_id = p.draft_id.trim();
+        // The caller rewrites the message, not the conversation. Reading the
+        // draft first is what says which conversation that is: leaving the
+        // threading out files the rewritten draft as a new one, and a reply
+        // the person corrected one address of would leave its thread.
+        let existing = gmail::get_draft(client, connection.id, draft_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
         let content = gmail::DraftContent {
             from: from.header.clone(),
-            to: addresses(p.to, "to")?,
-            cc: p
-                .cc
-                .map(|c| addresses(c, "cc"))
-                .transpose()?
-                .unwrap_or_default(),
-            bcc: p
-                .bcc
-                .map(|c| addresses(c, "bcc"))
-                .transpose()?
-                .unwrap_or_default(),
+            to,
+            cc,
+            bcc,
             subject: p.subject,
             text: p.body,
             html: p.html,
-            ..gmail::DraftContent::default()
+            // A draft that was never a reply has neither header, and carrying
+            // nothing forward writes nothing. Its thread id is its own, and
+            // handing it back keeps the draft where it already is.
+            in_reply_to: existing.in_reply_to.filter(|id| !id.trim().is_empty()),
+            references: existing.references,
+            thread_id: Some(existing.thread_id).filter(|id| !id.trim().is_empty()),
         };
-        let draft = gmail::update_draft(
-            &self.google()?.client,
-            connection.id,
-            p.draft_id.trim(),
-            &content,
-        )
-        .await
-        .map_err(|e| self.google_err_for(&connection, e))?;
+        let draft = gmail::update_draft(client, connection.id, draft_id, &content)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
         Ok(Json(draft_out(connection.label, draft, from)))
     }
 

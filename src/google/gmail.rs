@@ -525,8 +525,8 @@ fn draft_message_id(draft: &WireDraft) -> Result<String> {
         .ok_or_else(|| Error::Malformed(format!("draft {} has no message", draft.id)))
 }
 
-/// `users.drafts.get`, the draft read back in full.
-#[allow(dead_code)]
+/// `users.drafts.get`, the draft read back in full. An update reads the draft
+/// this way to learn which conversation it belongs to.
 pub async fn get_draft(client: &Client, connection_id: i64, draft_id: &str) -> Result<Message> {
     let request = client
         .service(GMAIL)
