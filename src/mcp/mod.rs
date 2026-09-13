@@ -187,7 +187,7 @@ fn google_err(e: crate::google::Error) -> ErrorData {
         G::Unsupported(m) => refuse(m),
         G::Google(g) => bad(format!("google returned {}: {}", g.status, g.message)),
         G::TooLarge | G::PdftotextMissing | G::PdftotextTimeout(_) => bad(e.to_string()),
-        G::Path(_) => refuse(e.to_string()),
+        G::Path(_) | G::Untrusted(_) => refuse(e.to_string()),
         G::Transport(_) | G::Malformed(_) | G::Connection(_) => {
             ErrorData::internal_error(e.to_string(), None)
         }

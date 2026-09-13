@@ -1030,6 +1030,126 @@ async fn a_link_streams_from_google_once_it_is_hit() {
     assert_eq!(db.get_link(&minted.id).await.unwrap().unwrap().uses_left, 0);
 }
 
+/// A picture in a document is found again on every hit.
+///
+/// Google's `contentUri` is good for about half an hour, a link lives fifteen
+/// minutes and may be spent long after it was minted, and the document is
+/// edited in between. A link that stored the URL would be a link that stops
+/// working, so the object id is what is stored and the current URL is read out
+/// of the document each time. The mock answers a different URL on the second
+/// read, which is what makes the difference visible.
+#[tokio::test]
+async fn a_link_to_a_picture_in_a_document_is_resolved_afresh_on_every_hit() {
+    const DOC: &str = "1PiCtUrEsDoCiDeXaMpLe0123456789abcdefgh";
+    let doc_at = format!("/v1/documents/{DOC}");
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("oauth_refresh.json")))
+        .mount(&server)
+        .await;
+    let document = |which: &str| {
+        let mut document = fixture("docs_document_images.json");
+        document["inlineObjects"]["kix.chart"]["inlineObjectProperties"]["embeddedObject"]["imageProperties"]
+            ["contentUri"] = json!(format!("{}/docs-image/{which}", server.uri()));
+        document
+    };
+    for which in ["first", "second"] {
+        Mock::given(method("GET"))
+            .and(path(doc_at.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document(which)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/docs-image/{which}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(format!("the {which} picture").into_bytes())
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&server)
+            .await;
+    }
+    // Once the picture is gone from the document there is nothing to resolve.
+    let mut without = fixture("docs_document_images.json");
+    without["inlineObjects"] = json!({});
+    Mock::given(method("GET"))
+        .and(path(doc_at.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(without))
+        .mount(&server)
+        .await;
+
+    let (state, c, t) = link_fixture(&db, &server).await;
+    let app = router(state.clone());
+    let minted = links::mint(
+        &state,
+        c.user_id,
+        links::NewDownload {
+            connection_id: c.id,
+            token_id: t.id,
+            target: links::Target::DocsImage {
+                doc_id: DOC.into(),
+                object_id: "kix.chart".into(),
+            },
+            filename: "Five screenshots image1.png".into(),
+            mime_type: "image/png".into(),
+            size: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_link(&minted.id).await.unwrap().unwrap().target,
+        json!({"doc_id": DOC, "object_id": "kix.chart"}),
+        "the URL Google serves it from is never stored"
+    );
+
+    let hit = || {
+        let app = app.clone();
+        let id = minted.id.clone();
+        async move { call_bytes(&app, req("GET", &format!("/dl/{id}"), None, None)).await }
+    };
+    let (s, bytes, h) = hit().await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(bytes, b"the first picture");
+    assert_eq!(h[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        h[header::CONTENT_DISPOSITION],
+        "attachment; filename*=UTF-8''Five%20screenshots%20image1.png"
+    );
+
+    let (s, bytes, _) = hit().await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        bytes, b"the second picture",
+        "the second hit read the document again rather than a stored URL"
+    );
+
+    // The picture is gone from the document, and the refusal says so.
+    let (s, bytes, _) = hit().await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("kix.chart"), "{message}");
+
+    let audit = db.list_audit(Default::default()).await.unwrap();
+    let outcomes: Vec<(&str, &str)> = audit
+        .iter()
+        .map(|e| (e.kind.as_str(), e.outcome.as_str()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("link_used", "error"),
+            ("link_used", "ok"),
+            ("link_used", "ok"),
+            ("link_created", "ok"),
+        ]
+    );
+}
+
 /// The route has no principal — the id is the permission — but the row it
 /// spends belongs to somebody, and the Activity page filters on the person
 /// looking at it. A hit logged against nobody is a hit nobody can see.

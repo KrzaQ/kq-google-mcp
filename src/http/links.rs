@@ -30,7 +30,7 @@ use crate::db::{AuditKind, AuditOutcome, Link, LinkKind, LinkRefusal, NewAuditEn
 use crate::domain::limits::DOWNLOAD_MAX_BYTES;
 use crate::domain::link;
 use crate::google::drive::ExportFormat;
-use crate::google::{drive, gmail};
+use crate::google::{docs, drive, gmail};
 
 /// Where a download link points. This is the `target` column, typed; the JSON
 /// shape is this module's business and nothing else reads it.
@@ -47,6 +47,15 @@ pub enum Target {
         file_id: String,
         format: ExportFormat,
     },
+    /// A picture inside a Google Doc, named by the document and Docs' own id
+    /// for the object. The URL Google serves the picture from is deliberately
+    /// not stored: it expires in about half an hour, which is sooner than a
+    /// link may be spent, so the route asks the document for a fresh one on
+    /// every hit.
+    DocsImage {
+        doc_id: String,
+        object_id: String,
+    },
 }
 
 impl Target {
@@ -55,6 +64,7 @@ impl Target {
             Self::GmailAttachment { .. } => LinkKind::GmailAttachment,
             Self::DriveDownload { .. } => LinkKind::DriveDownload,
             Self::DriveExport { .. } => LinkKind::DriveExport,
+            Self::DocsImage { .. } => LinkKind::DocsImage,
         }
     }
 
@@ -67,6 +77,9 @@ impl Target {
             Self::DriveDownload { file_id } => json!({ "file_id": file_id }),
             Self::DriveExport { file_id, format } => {
                 json!({ "file_id": file_id, "format": format.as_str() })
+            }
+            Self::DocsImage { doc_id, object_id } => {
+                json!({ "doc_id": doc_id, "object_id": object_id })
             }
         }
     }
@@ -94,6 +107,10 @@ impl Target {
                 format: field("format")?
                     .parse()
                     .map_err(|e: drive::ExportFormatError| e.to_string())?,
+            }),
+            LinkKind::DocsImage => Ok(Self::DocsImage {
+                doc_id: field("doc_id")?,
+                object_id: field("object_id")?,
             }),
         }
     }
@@ -323,6 +340,16 @@ async fn stream(
             let file = drive::export(&google.client, link.connection_id, &file_id, format).await?;
             streamed(file)?
         }
+        // The picture is found again on every hit. Google's `contentUri` lives
+        // about half an hour, a link lives fifteen minutes and may be spent
+        // later than it was minted, and a document is edited in between: the
+        // object id is what stays true, so the current URL is read out of the
+        // document each time rather than stored with the link.
+        Target::DocsImage { doc_id, object_id } => {
+            let held = docs::images(&google.client, link.connection_id, &doc_id).await?;
+            let picture = docs::open_image(&google.client, held.find(&object_id)?).await?;
+            streamed(picture)?
+        }
     };
     if let Err(e) = state.db.touch_connection_used(link.connection_id).await {
         tracing::warn!("connection {}: {e}", link.connection_id);
@@ -500,6 +527,10 @@ mod tests {
             Target::DriveExport {
                 file_id: "1AbC".into(),
                 format: ExportFormat::Pdf,
+            },
+            Target::DocsImage {
+                doc_id: "1PiC".into(),
+                object_id: "kix.chart".into(),
             },
         ] {
             let row = Link {

@@ -117,9 +117,10 @@ impl From<google::Error> for ApiError {
                 e.to_string()
             }),
             G::Unsupported(m) => Self::bad_request(m),
-            // An id that would point the call at another endpoint: the caller
-            // asked for something this server does not do.
-            G::Path(m) => Self::bad_request(m),
+            // An id that would point the call at another endpoint, or a URL
+            // out of a response body that does not point at Google: the
+            // caller asked for something this server does not do.
+            G::Path(m) | G::Untrusted(m) => Self::bad_request(m),
             G::TooLarge | G::PdftotextMissing => Self::bad_request(e.to_string()),
             G::PdftotextTimeout(_) => {
                 Self::new(StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string())

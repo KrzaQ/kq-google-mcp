@@ -86,6 +86,7 @@ text_enum! {
         GmailAttachment => "gmail_attachment",
         DriveDownload => "drive_download",
         DriveExport => "drive_export",
+        DocsImage => "docs_image",
     }
 }
 

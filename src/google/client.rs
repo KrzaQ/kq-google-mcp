@@ -83,6 +83,10 @@ pub enum Error {
     /// come from a model, so this is a refusal and not a panic.
     #[error("{0}")]
     Path(String),
+    /// A URL out of a response body that this server will not follow. See
+    /// [`Client::follow_content_uri`].
+    #[error("{0}")]
+    Untrusted(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -507,6 +511,62 @@ impl Client {
         let response = self.send(connection_id, request).await?;
         Ok(Download::new(response))
     }
+
+    /// Follow a URL Google wrote into a response body: the `contentUri` of a
+    /// picture in a document, which is the only one of these this server has.
+    ///
+    /// Every other call here is built from a base this crate configures and a
+    /// path this crate writes. This one is not, and a response body is not a
+    /// place to take a URL from on trust, so the URL has to be https and the
+    /// host has to be Google's. Anything else is refused and nothing is
+    /// fetched.
+    ///
+    /// No access token goes with it. The `contentUri` is Google's own
+    /// short-lived capability, it is served from a host that is not the API
+    /// host, and a bearer token sent there would do nothing but travel.
+    ///
+    /// The configured API base is trusted beside the real hosts. In production
+    /// that base *is* Google, so it adds nothing; in a test it is the wiremock
+    /// server, which is how these tests exercise this path without the check
+    /// being switched off under `cfg(test)`.
+    pub async fn follow_content_uri(&self, uri: &str) -> Result<Download> {
+        let url: Url = uri.parse().map_err(|e| {
+            Error::Untrusted(format!("{uri:?} is not a URL this server can follow: {e}"))
+        })?;
+        if !content_uri_allowed(&url, &self.api_base) {
+            return Err(Error::Untrusted(format!(
+                "the picture is served from {}://{}, which this server does not follow: a \
+                 picture in a document is fetched from Google over https and from nowhere else",
+                url.scheme(),
+                url.host_str().unwrap_or("nowhere")
+            )));
+        }
+        let response = self.http.get(url).send().await?;
+        Ok(Download::new(check(response).await?))
+    }
+}
+
+/// The hosts Google serves a document's pictures from. The suffix is matched
+/// on a label boundary, so `evilgoogleusercontent.com` is not one of them.
+const CONTENT_HOSTS: [&str; 3] = ["googleusercontent.com", "google.com", "googleapis.com"];
+
+/// Whether a URL out of a response body may be fetched: one of Google's own
+/// hosts over https, or exactly the configured API base — same scheme, same
+/// host, same port.
+fn content_uri_allowed(url: &Url, api_base: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if url.scheme() == "https"
+        && CONTENT_HOSTS
+            .iter()
+            .any(|google| host == *google || host.ends_with(&format!(".{google}")))
+    {
+        return true;
+    }
+    url.scheme() == api_base.scheme()
+        && Some(host) == api_base.host_str()
+        && url.port_or_known_default() == api_base.port_or_known_default()
 }
 
 /// One service's endpoints, on whichever host serves them. Requests built
@@ -775,6 +835,44 @@ mod tests {
         // Unreserved characters are left alone, so an ordinary id reads as
         // itself in the log and in a mock's path matcher.
         assert_eq!(urlencode("18f0a1b2c3d4e5f6-_.~"), "18f0a1b2c3d4e5f6-_.~");
+    }
+
+    /// A `contentUri` is the one URL this server takes out of a response body,
+    /// so the rule that decides whether it is followed is worth stating on its
+    /// own: Google over https, or the configured base and nothing else.
+    #[test]
+    fn a_content_uri_is_followed_only_to_google_or_to_the_configured_base() {
+        let google: Url = "https://www.googleapis.com".parse().unwrap();
+        let allowed =
+            |uri: &str, base: &Url| content_uri_allowed(&uri.parse::<Url>().expect(uri), base);
+        for uri in [
+            "https://lh7-us.googleusercontent.com/docsz/AbCdEf",
+            "https://googleusercontent.com/docsz/AbCdEf",
+            "https://lh3.google.com/x",
+            "https://docs.googleapis.com/x",
+        ] {
+            assert!(allowed(uri, &google), "{uri}");
+        }
+        for uri in [
+            // A host that only ends in the letters of a Google one.
+            "https://evilgoogleusercontent.com/docsz/AbCdEf",
+            "https://googleusercontent.com.evil.example/docsz/AbCdEf",
+            "https://lh7-us.googleusercontent.com.evil.example/x",
+            // The right host over the wrong scheme.
+            "http://lh7-us.googleusercontent.com/docsz/AbCdEf",
+            // Somewhere else entirely, which is what the check exists for.
+            "https://evil.example/docsz/AbCdEf",
+            "file:///etc/passwd",
+        ] {
+            assert!(!allowed(uri, &google), "{uri}");
+        }
+
+        // A test's wiremock is the configured base, and only on its own port.
+        let mock: Url = "http://127.0.0.1:8123".parse().unwrap();
+        assert!(allowed("http://127.0.0.1:8123/docs-image/chart", &mock));
+        assert!(!allowed("http://127.0.0.1:8124/docs-image/chart", &mock));
+        assert!(!allowed("https://127.0.0.1:8123/docs-image/chart", &mock));
+        assert!(allowed("https://lh7-us.googleusercontent.com/x", &mock));
     }
 
     #[test]

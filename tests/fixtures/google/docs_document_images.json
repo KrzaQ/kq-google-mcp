@@ -1,0 +1,140 @@
+{
+  "documentId": "1PiCtUrEsDoCiDeXaMpLe0123456789abcdefgh",
+  "title": "Five screenshots",
+  "revisionId": "ALm37BW1Example",
+  "tabs": [],
+  "inlineObjects": {
+    "kix.drawing": {
+      "objectId": "kix.drawing",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "title": "Sketch",
+          "embeddedDrawingProperties": {},
+          "size": {
+            "height": {"magnitude": 120, "unit": "PT"},
+            "width": {"magnitude": 200, "unit": "PT"}
+          }
+        }
+      }
+    },
+    "kix.screenshot": {
+      "objectId": "kix.screenshot",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "imageProperties": {
+            "contentUri": "https://lh7-us.googleusercontent.com/docsz/AbCdEfScreenshot"
+          },
+          "size": {
+            "height": {"magnitude": 263.25, "unit": "PT"},
+            "width": {"magnitude": 468, "unit": "PT"}
+          }
+        }
+      }
+    },
+    "kix.chart": {
+      "objectId": "kix.chart",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "title": "Revenue",
+          "description": "Revenue by quarter, in thousands",
+          "imageProperties": {
+            "contentUri": "https://lh7-us.googleusercontent.com/docsz/AbCdEfChart"
+          },
+          "size": {
+            "height": {"magnitude": 180, "unit": "PT"},
+            "width": {"magnitude": 320, "unit": "PT"}
+          }
+        }
+      }
+    }
+  },
+  "body": {
+    "content": [
+      {
+        "startIndex": 0,
+        "endIndex": 1,
+        "sectionBreak": {"sectionStyle": {}}
+      },
+      {
+        "startIndex": 1,
+        "endIndex": 20,
+        "paragraph": {
+          "elements": [
+            {
+              "startIndex": 1,
+              "endIndex": 19,
+              "textRun": {"content": "Revenue held up.\n"}
+            },
+            {
+              "startIndex": 19,
+              "endIndex": 20,
+              "inlineObjectElement": {
+                "inlineObjectId": "kix.chart",
+                "textStyle": {}
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 20,
+        "endIndex": 44,
+        "table": {
+          "rows": 1,
+          "columns": 1,
+          "tableRows": [
+            {
+              "startIndex": 21,
+              "endIndex": 43,
+              "tableCells": [
+                {
+                  "startIndex": 22,
+                  "endIndex": 42,
+                  "content": [
+                    {
+                      "startIndex": 22,
+                      "endIndex": 42,
+                      "paragraph": {
+                        "elements": [
+                          {
+                            "startIndex": 41,
+                            "endIndex": 42,
+                            "inlineObjectElement": {
+                              "inlineObjectId": "kix.screenshot",
+                              "textStyle": {}
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 44,
+        "endIndex": 46,
+        "paragraph": {
+          "elements": [
+            {
+              "startIndex": 44,
+              "endIndex": 45,
+              "inlineObjectElement": {
+                "inlineObjectId": "kix.drawing",
+                "textStyle": {}
+              }
+            },
+            {
+              "startIndex": 45,
+              "endIndex": 46,
+              "textRun": {"content": "\n"}
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
