@@ -276,8 +276,11 @@ struct Inline {
 /// over the client's output limit and the words never arrive.
 ///
 /// So each data URI becomes a short note of what stood there. The reference
-/// keeps its label, so `![][image1]` in the body still resolves to a line
-/// that says what it was, and a closing line says how much was left out.
+/// keeps its label, so `![][image1]` in the body still resolves to a line that
+/// says what it was — and that line carries the call that shows the picture,
+/// because the label is the argument and a model reading the text in the
+/// middle of a document should not have to go looking for the tool. A closing
+/// line says how much was left out and names the tool that lists them all.
 fn without_inline_images(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut gone: Vec<Inline> = Vec::new();
@@ -288,7 +291,7 @@ fn without_inline_images(markdown: &str) -> String {
         match reference_definition(line) {
             Some((label, inline)) => {
                 out.push_str(&format!(
-                    "[{label}]: <a {} of {}, not included>",
+                    "[{label}]: <a {} of {}, not included; docs_view_image image=\"{label}\">",
                     kind(&inline.mime),
                     size(inline.bytes)
                 ));
@@ -305,8 +308,8 @@ fn without_inline_images(markdown: &str) -> String {
     if !gone.is_empty() {
         let total: usize = gone.iter().map(|i| i.bytes).sum();
         out.push_str(&format!(
-            "\n\n[{} {} left out of this text, {} in all. A picture cannot be read from its \
-             base64; open the document to see them.]",
+            "\n\n[{} {} left out of this text, {} in all. docs_list_images lists them; \
+             docs_view_image shows one.]",
             gone.len(),
             if gone.len() == 1 {
                 "image was"

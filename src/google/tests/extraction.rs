@@ -158,10 +158,21 @@ async fn a_doc_full_of_screenshots_comes_back_as_words() {
     assert!(!doc.contains("iVBORw0KGgo"), "{doc}");
     assert!(doc.contains("# Notes"), "{doc}");
     assert!(doc.contains("See the diagram: ![][image1]"), "{doc}");
-    // Each label still resolves, to a line saying what stood there.
-    assert!(doc.contains("[image1]: <a PNG of"), "{doc}");
-    assert!(doc.contains("[image2]: <a JPEG of"), "{doc}");
+    // Each label still resolves, to a line saying what stood there and what
+    // to call to see it. The label is the argument, so a model reading this in
+    // the middle of a document has the whole call in front of it.
+    assert!(
+        doc.contains(r#"[image1]: <a PNG of 66 KB, not included; docs_view_image image="image1">"#),
+        "{doc}"
+    );
+    assert!(
+        doc.contains(
+            r#"[image2]: <a JPEG of 66 KB, not included; docs_view_image image="image2">"#
+        ),
+        "{doc}"
+    );
     assert!(doc.contains("2 images were left out of this text"), "{doc}");
+    assert!(doc.contains("docs_list_images lists them"), "{doc}");
     // The export was 180 KB of base64 and the text is a few lines.
     assert!(doc.len() < 500, "{} chars: {doc}", doc.len());
 }

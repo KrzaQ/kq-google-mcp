@@ -91,9 +91,9 @@ impl Gmcp {
     #[tool(
         description = "A Google Doc as markdown, with its title, URL and tab list. This is \
                        drive_read_text for a Doc, plus the tabs. Pictures in the document are \
-                       left out and each one says what it was: Drive writes them into the export \
-                       as base64, which no model can see and which crowds the words out of the \
-                       answer."
+                       left out and each one says what it was and what to call to see it: Drive \
+                       writes them into the export as base64, which no model can see and which \
+                       crowds the words out of the answer. docs_list_images lists them."
     )]
     async fn docs_read(
         &self,
