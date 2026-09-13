@@ -143,6 +143,137 @@ async fn migrations_apply_to_a_fresh_in_memory_database() {
     db.migrate().await.unwrap();
 }
 
+/// A database migrated only as far as `version`, which is how the step a
+/// migration takes can be seen from both sides.
+async fn migrated_to(version: i64) -> Db {
+    let options = pragmas(SqliteConnectOptions::new().in_memory(true));
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(options)
+        .await
+        .unwrap();
+    for migration in MIGRATOR.iter().filter(|m| m.version <= version) {
+        sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
+    }
+    Db::from_pool(pool)
+}
+
+/// 0004 rebuilds `links` to widen the kinds its CHECK allows, and a rebuild is
+/// where rows go missing and properties are quietly dropped. So the table is
+/// filled before the migration and read after it: the row survives whole, the
+/// new kind is accepted, an undefined one is still refused, the table is still
+/// STRICT, the index is back and the link still follows its connection out.
+#[tokio::test]
+async fn the_links_rebuild_keeps_every_row_and_every_rule() {
+    let db = migrated_to(3).await;
+    let alice = db
+        .upsert_user("sub-alice", Some("alice@example.test"), None, HOUSE)
+        .await
+        .unwrap();
+    let work = db
+        .create_connection(NewConnection {
+            user_id: alice.id,
+            label: "work".into(),
+            google_email: "work@example.test".into(),
+            services: strings(&["drive", "docs"]),
+            granted_scopes: strings(&["openid"]),
+            refresh_token_sealed: sealed("refresh"),
+            delegate_ok: false,
+        })
+        .await
+        .unwrap();
+    let token = db
+        .create_token(NewToken {
+            name: "claude".into(),
+            token_hash: "hash-claude".into(),
+            scopes: strings(&["docs:read"]),
+            client: ClientProfile::ClaudeCode,
+            user_id: Some(alice.id),
+            all_connections: true,
+            created_by: alice.id,
+        })
+        .await
+        .unwrap();
+    let before = db
+        .create_link(NewLink {
+            id: "beforethemigration00x".into(),
+            connection_id: work.id,
+            token_id: token.id,
+            kind: LinkKind::DriveDownload,
+            target: serde_json::json!({"file_id": "1AbC"}),
+            filename: "zażółć raport.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: Some(12),
+            expires_at: utc("2030-01-01T00:00:00Z"),
+            uses_left: 2,
+        })
+        .await
+        .unwrap();
+
+    let fourth = MIGRATOR.iter().find(|m| m.version == 4).expect("0004");
+    sqlx::raw_sql(&fourth.sql).execute(db.pool()).await.unwrap();
+
+    let after = db.get_link(&before.id).await.unwrap().expect("the row");
+    assert_eq!(after, before);
+
+    // The kind the migration was for, which the table refused before it.
+    let docs_image = format!(
+        "INSERT INTO links (id, connection_id, token_id, kind, target, filename, mime_type, \
+           size, expires_at, uses_left, created_at) \
+         VALUES ('afterthemigration000x', {}, {}, 'docs_image', \
+           '{{\"doc_id\": \"1PiC\", \"object_id\": \"kix.chart\"}}', \
+           'Q3 report image1.png', 'image/png', NULL, '2030-01-01T00:00:00Z', 3, \
+           '2026-09-13T00:00:00Z')",
+        work.id, token.id,
+    );
+    sqlx::raw_sql(&docs_image)
+        .execute(db.pool())
+        .await
+        .expect("a picture in a document is a kind of link now");
+
+    // And nothing else: a kind no code defines is still refused, the column
+    // types are still enforced, and the use counter still cannot go negative.
+    for (column, value, refusal) in [
+        ("kind", "'wandering'", "CHECK constraint failed"),
+        ("size", "'not a number'", "cannot store TEXT value"),
+        ("uses_left", "-1", "CHECK constraint failed"),
+    ] {
+        let sql = format!(
+            "INSERT INTO links (id, connection_id, token_id, kind, target, filename, mime_type, \
+               size, expires_at, uses_left, created_at) \
+             VALUES ('refused00000000000000', {}, {}, {}, '{{}}', 'f', 'text/plain', {}, \
+               '2030-01-01T00:00:00Z', {}, '2026-09-13T00:00:00Z')",
+            work.id,
+            token.id,
+            if column == "kind" {
+                value
+            } else {
+                "'drive_download'"
+            },
+            if column == "size" { value } else { "1" },
+            if column == "uses_left" { value } else { "3" },
+        );
+        let error = sqlx::raw_sql(&sql).execute(db.pool()).await.unwrap_err();
+        assert!(error.to_string().contains(refusal), "{column}: {error}");
+    }
+
+    // The index the drop took with it is back.
+    let index: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'links_expires_at'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(index.as_deref(), Some("links_expires_at"));
+
+    // A link is worthless once its connection is gone, and still follows it.
+    db.delete_connection(work.id).await.unwrap();
+    assert!(db.get_link(&before.id).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn instants_are_rfc_3339_text_that_sorts_chronologically() {
     let w = world().await;
