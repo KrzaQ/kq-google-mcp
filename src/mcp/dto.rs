@@ -479,6 +479,52 @@ impl From<docs::Tab> for DocTabOut {
     }
 }
 
+/// The pictures a document holds, in the order they appear in it.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocImagesOut {
+    pub account: String,
+    pub doc_id: String,
+    pub title: String,
+    pub url: String,
+    pub count: usize,
+    pub images: Vec<DocImageOut>,
+    pub note: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocImageOut {
+    /// What to pass as `image`: image1 is the first picture in the document,
+    /// and these are the labels the text of a read document is left with.
+    pub image: String,
+    /// Docs' own id for the object, which also works as `image` and which
+    /// stays the same when a picture is added above this one.
+    pub object_id: String,
+    /// The alt text, when the document carries any.
+    pub alt_title: Option<String>,
+    pub alt_text: Option<String>,
+    /// How large the picture is in the document, in points. Docs says nothing
+    /// about how many bytes it is.
+    pub width_pt: Option<i64>,
+    pub height_pt: Option<i64>,
+    /// A drawing or a chart has no picture of its own, so there is nothing to
+    /// look at or to download; open the document to see it.
+    pub fetchable: bool,
+}
+
+impl From<docs::InlineImage> for DocImageOut {
+    fn from(i: docs::InlineImage) -> Self {
+        Self {
+            image: i.label,
+            object_id: i.object_id,
+            alt_title: i.alt_title,
+            alt_text: i.alt_text,
+            width_pt: i.width_pt,
+            height_pt: i.height_pt,
+            fetchable: i.content_uri.is_some(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DocWriteOut {
     pub account: String,

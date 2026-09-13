@@ -71,6 +71,33 @@ pub struct InlineImage {
     pub content_uri: Option<String>,
 }
 
+impl InlineImage {
+    /// What the picture is called once it has left the document. Docs gives a
+    /// picture no name, so the document's title and the label are the only two
+    /// things that tell the person who downloads it what they have.
+    pub fn filename(&self, title: &str, mime_type: Option<&str>) -> String {
+        let stem = match title.trim() {
+            "" => self.label.clone(),
+            title => format!("{title} {}", self.label),
+        };
+        format!("{stem}.{}", extension(mime_type))
+    }
+}
+
+/// The file extension for what Google said the bytes are.
+fn extension(mime_type: Option<&str>) -> &'static str {
+    match mime_type.unwrap_or_default() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
 /// What a document holds in the way of pictures.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DocumentImages {

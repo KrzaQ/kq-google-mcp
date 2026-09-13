@@ -105,7 +105,8 @@ fn instructions(portal: &str) -> String {
          15 minutes and may be fetched a few times. Give it to the person, or curl it. For text \
          there is no need for a link at all: gmail_attachment_text and drive_read_text extract it \
          server-side.\n\
-         gmail_view_image and drive_view_image return the picture itself, downscaled. It is only \
+         gmail_view_image, drive_view_image and docs_view_image return the picture itself, \
+         downscaled. It is only \
          visible in the turn it was fetched; to look again later, call the tool again. In Claude \
          Code the picture counts against MAX_MCP_OUTPUT_TOKENS (25000 by default) — raise that \
          environment variable if images come back truncated."

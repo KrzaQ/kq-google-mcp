@@ -3144,6 +3144,189 @@ async fn docs_read_answers_the_document_with_its_tabs_and_its_markdown() {
     assert_eq!(out["text"], MARKDOWN);
 }
 
+const PICTURE_DOC: &str = "1PiCtUrEsDoCiDeXaMpLe0123456789abcdefgh";
+
+/// A document of pictures whose first picture this same mock serves, so the
+/// contentUri the tools follow is one a test can answer.
+async fn mount_document_pictures(server: &MockServer) {
+    let mut document = fixture("docs_document_images.json");
+    document["inlineObjects"]["kix.chart"]["inlineObjectProperties"]["embeddedObject"]["imageProperties"]
+        ["contentUri"] = json!(format!("{}/docs-image/chart", server.uri()));
+    mount(
+        server,
+        "GET",
+        &format!("/v1/documents/{PICTURE_DOC}"),
+        document,
+    )
+    .await;
+    Mock::given(http_method("GET"))
+        .and(path("/docs-image/chart"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(png())
+                .insert_header("content-type", "image/png"),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_document_says_which_pictures_it_holds_and_what_to_call_them() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_document_pictures(&server).await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let out = c
+        .ok(
+            "docs_list_images",
+            json!({"account": "work", "doc_id": PICTURE_DOC}),
+        )
+        .await;
+    assert_eq!(out["doc_id"], PICTURE_DOC);
+    assert_eq!(out["title"], "Five screenshots");
+    assert_eq!(out["count"], 3);
+    // In the order the document holds them, which is not the order the
+    // inlineObjects map carries them in.
+    let images = out["images"].as_array().unwrap();
+    assert_eq!(
+        images
+            .iter()
+            .map(|i| (
+                i["image"].as_str().unwrap(),
+                i["object_id"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("image1", "kix.chart"),
+            ("image2", "kix.screenshot"),
+            ("image3", "kix.drawing"),
+        ]
+    );
+    assert_eq!(images[0]["alt_title"], "Revenue");
+    assert_eq!(images[0]["alt_text"], "Revenue by quarter, in thousands");
+    assert_eq!(images[0]["width_pt"], 320);
+    assert_eq!(images[0]["height_pt"], 180);
+    assert_eq!(images[0]["fetchable"], true);
+    assert!(images[1]["alt_title"].is_null());
+    // A drawing has no picture of its own, and the row says so before a model
+    // spends a call finding out.
+    assert_eq!(images[2]["fetchable"], false);
+    assert!(
+        out["note"].as_str().unwrap().contains("docs_view_image"),
+        "{}",
+        out["note"]
+    );
+
+    // A label nobody gave out and an object id nobody has are both refused
+    // with what the document does hold.
+    for wanted in ["image9", "kix.nothing"] {
+        for tool in ["docs_view_image", "docs_image_link"] {
+            let refused = c
+                .refused(
+                    tool,
+                    json!({"account": "work", "doc_id": PICTURE_DOC, "image": wanted}),
+                )
+                .await;
+            assert!(
+                refused.contains("image1, image2, image3"),
+                "{tool}: {refused}"
+            );
+            assert!(refused.contains(wanted), "{tool}: {refused}");
+        }
+    }
+
+    // And a drawing says why it cannot be fetched rather than failing to
+    // decode something it never had.
+    let refused = c
+        .refused(
+            "docs_view_image",
+            json!({"account": "work", "doc_id": PICTURE_DOC, "image": "image3"}),
+        )
+        .await;
+    assert!(refused.contains("drawing"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_picture_in_a_document_is_shaped_for_the_client_and_linked_at_full_size() {
+    for (profile, blocks) in [
+        (ClientProfile::ClaudeCode, 2),
+        (ClientProfile::OpenWebUi, 3),
+    ] {
+        let db = Db::open_memory().await.unwrap();
+        let server = google_server().await;
+        mount_document_pictures(&server).await;
+        let (_, work, secret) = one_of_everything(&db, &["docs:read"], profile).await;
+        let mut c = Client::new(app(&db, Some(&server)).await, secret);
+        c.initialize().await;
+
+        let v = c
+            .call(
+                "docs_view_image",
+                json!({"account": "work", "doc_id": PICTURE_DOC, "image": "image1"}),
+            )
+            .await;
+        assert!(!is_error(&v), "{profile}: {}", error_text(&v));
+        let result = &v["result"];
+        assert!(
+            result["structuredContent"].is_null(),
+            "{profile} must never get structuredContent: {result}"
+        );
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), blocks, "{profile}: {content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Five screenshots image1.png"),
+            "{}",
+            content[0]["text"]
+        );
+        assert_eq!(content[1]["type"], "image");
+        // The original is 1600 px wide and never leaves as it is.
+        let (width, _) = image_size(content[1]["data"].as_str().unwrap());
+        assert_eq!(
+            width,
+            if profile == ClientProfile::ClaudeCode {
+                1024
+            } else {
+                1568
+            }
+        );
+        if profile == ClientProfile::OpenWebUi {
+            assert_eq!(content[2]["type"], "resource");
+            assert_eq!(
+                content[2]["resource"]["uri"],
+                format!("gmcp://{}/docs/{PICTURE_DOC}/kix.chart", work.id)
+            );
+        }
+
+        // The link is the way to the picture as it is, and the bytes never
+        // come back through MCP.
+        let out = c
+            .ok(
+                "docs_image_link",
+                json!({"account": "work", "doc_id": PICTURE_DOC, "image": "image1"}),
+            )
+            .await;
+        assert!(
+            out["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://gmcp.example/dl/"),
+            "{out}"
+        );
+        assert_eq!(out["filename"], "Five screenshots image1.png");
+        assert_eq!(out["mime_type"], "image/png");
+        assert_eq!(out["size"], png().len());
+        // The object id is what the link keeps, so it still names this picture
+        // after somebody adds one above it.
+        let link = db.list_audit(Default::default()).await.unwrap();
+        assert_eq!(link[0].kind, crate::db::AuditKind::LinkCreated);
+    }
+}
+
 #[tokio::test]
 async fn docs_create_previews_the_document_and_writes_nothing() {
     let db = Db::open_memory().await.unwrap();

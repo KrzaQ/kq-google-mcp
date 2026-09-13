@@ -344,6 +344,9 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("drive_read_text", needs(Service::Drive, Level::Read)),
     ("drive_view_image", needs(Service::Drive, Level::Read)),
     ("docs_read", needs(Service::Docs, Level::Read)),
+    ("docs_list_images", needs(Service::Docs, Level::Read)),
+    ("docs_view_image", needs(Service::Docs, Level::Read)),
+    ("docs_image_link", needs(Service::Docs, Level::Read)),
     ("docs_create", needs(Service::Docs, Level::Write)),
     ("docs_append", needs(Service::Docs, Level::Write)),
     ("docs_replace_text", needs(Service::Docs, Level::Write)),
@@ -563,7 +566,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 42);
+        assert_eq!(TOOLS.len(), 45);
     }
 
     #[test]
@@ -585,6 +588,15 @@ mod tests {
             assert!(!name.contains("trash"), "{name}");
         }
         assert!(TOOLS.iter().filter(|(_, s)| s.is_none()).count() == 1);
+        assert_eq!(
+            tools_of_scope(Scope::Service(Service::Docs, Level::Read)),
+            [
+                "docs_read",
+                "docs_list_images",
+                "docs_view_image",
+                "docs_image_link"
+            ]
+        );
         assert_eq!(
             tools_of_scope(Scope::Service(Service::Docs, Level::Write)),
             ["docs_create", "docs_append", "docs_replace_text"]

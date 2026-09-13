@@ -8,14 +8,17 @@
 
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::ErrorData;
+use rmcp::model::{CallToolResult, ErrorData};
 use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
 use super::dto::{self, Confirmable, PreviewOut};
-use super::{Call, Gmcp, bad, cap_text};
+use super::gmail::link_out;
+use super::images::{self, Kind, Source};
+use super::{Call, Gmcp, api_err, bad, cap_text};
 use crate::domain::scope::Service;
 use crate::google::{docs, drive, text};
+use crate::http::links::{self, NewDownload, Target};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocsReadParam {
@@ -25,6 +28,23 @@ pub struct DocsReadParam {
     pub doc_id: String,
     /// Stop after this many characters, with a notice saying what was cut
     pub max_chars: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsImagesParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// The document id, the long string in its Docs URL
+    pub doc_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsImageParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Which picture: the label docs_list_images gives it and the text of the
+    /// document is left with, e.g. "image1", or the object id
+    pub image: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -101,6 +121,131 @@ impl Gmcp {
             truncated_chars: truncated,
             text: body,
         }))
+    }
+
+    #[tool(
+        description = "What pictures a Google Doc holds, in the order they appear in it: the \
+                       label to call each one by, the alt text where the document carries any, \
+                       and how large it is on the page. docs_read leaves the pictures out of the \
+                       text and names them image1, image2 and so on; this says what they are, and \
+                       docs_view_image shows one."
+    )]
+    async fn docs_list_images(
+        &self,
+        Parameters(p): Parameters<DocsImagesParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::DocImagesOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let held = docs::images(&self.google()?.client, connection.id, p.doc_id.trim())
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let note = if held.images.is_empty() {
+            "this document holds no pictures".to_string()
+        } else {
+            "pass one of these as `image` to docs_view_image to look at it, or to \
+             docs_image_link for a URL the person can download"
+                .to_string()
+        };
+        Ok(Json(dto::DocImagesOut {
+            account: connection.label,
+            url: format!(
+                "https://docs.google.com/document/d/{}/edit",
+                held.document_id
+            ),
+            doc_id: held.document_id,
+            title: held.title,
+            count: held.images.len(),
+            images: held.images.into_iter().map(Into::into).collect(),
+            note,
+        }))
+    }
+
+    #[tool(
+        description = "One picture from a Google Doc, downscaled and returned as an image you \
+                       can look at. Name it by its label — image1 is the first picture in the \
+                       document — or by its object id. It is visible only in the turn it is \
+                       fetched; call again to look later."
+    )]
+    async fn docs_view_image(
+        &self,
+        Parameters(p): Parameters<DocsImageParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let held = docs::images(client, connection.id, p.doc_id.trim())
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let picture = held
+            .find(&p.image)
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let download = docs::open_image(client, picture)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let mime_type = download.mime_type().unwrap_or("image/*").to_string();
+        let bytes = download
+            .collect()
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        images::content(
+            call.principal.client_profile(),
+            Source {
+                connection_id: connection.id,
+                kind: Kind::DocsImage,
+                ids: &[&held.document_id, &picture.object_id],
+                filename: &picture.filename(&held.title, Some(&mime_type)),
+                mime_type: &mime_type,
+            },
+            &bytes,
+        )
+    }
+
+    #[tool(
+        description = "A download URL for one picture in a Google Doc, at its original size. \
+                       Name it by its label or its object id, as docs_list_images reports them. \
+                       The link lives 15 minutes and may be fetched a few times; give it to the \
+                       person or curl it. To look at the picture yourself, use docs_view_image."
+    )]
+    async fn docs_image_link(
+        &self,
+        Parameters(p): Parameters<DocsImageParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::LinkOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let held = docs::images(client, connection.id, p.doc_id.trim())
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let picture = held
+            .find(&p.image)
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        // What the picture is and how big it is comes from Google's own
+        // headers, because Docs says neither. The body is never read here: the
+        // bytes leave through the link, and this answer is only what to expect
+        // and whether it is inside the download cap.
+        let head = docs::open_image(client, picture)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let mime_type = head.mime_type().unwrap_or("image/*").to_string();
+        let size = head.size().and_then(|s| i64::try_from(s).ok());
+        let minted = links::mint(
+            &self.state,
+            call.principal.user().id,
+            NewDownload {
+                connection_id: connection.id,
+                token_id: self.token_id(&call)?,
+                target: Target::DocsImage {
+                    doc_id: held.document_id.clone(),
+                    object_id: picture.object_id.clone(),
+                },
+                filename: picture.filename(&held.title, Some(&mime_type)),
+                mime_type,
+                size,
+            },
+        )
+        .await
+        .map_err(api_err)?;
+        Ok(Json(link_out(minted, call.tz)))
     }
 
     #[tool(

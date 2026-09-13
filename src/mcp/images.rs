@@ -32,6 +32,7 @@ use crate::domain::image::{self, ImageError, Profile};
 pub enum Kind {
     GmailAttachment,
     DriveFile,
+    DocsImage,
 }
 
 impl Kind {
@@ -39,6 +40,7 @@ impl Kind {
         match self {
             Kind::GmailAttachment => "gmail",
             Kind::DriveFile => "drive",
+            Kind::DocsImage => "docs",
         }
     }
 }
