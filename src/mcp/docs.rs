@@ -70,7 +70,10 @@ pub struct DocsReplaceParam {
 impl Gmcp {
     #[tool(
         description = "A Google Doc as markdown, with its title, URL and tab list. This is \
-                       drive_read_text for a Doc, plus the tabs."
+                       drive_read_text for a Doc, plus the tabs. Pictures in the document are \
+                       left out and each one says what it was: Drive writes them into the export \
+                       as base64, which no model can see and which crowds the words out of the \
+                       answer."
     )]
     async fn docs_read(
         &self,

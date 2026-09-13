@@ -247,6 +247,8 @@ pub async fn drive_file(
 
 /// A Google Doc, as markdown, through Drive's export. Docs' own API has no
 /// text output, and markdown keeps headings and lists a model can use.
+///
+/// The pictures are taken out on the way through; see [`without_inline_images`].
 pub async fn google_doc(client: &Client, connection_id: i64, file_id: &str) -> Result<String> {
     let bytes = drive::export(
         client,
@@ -257,7 +259,104 @@ pub async fn google_doc(client: &Client, connection_id: i64, file_id: &str) -> R
     .await?
     .collect()
     .await?;
-    Ok(lossy(&bytes))
+    Ok(without_inline_images(&lossy(&bytes)))
+}
+
+/// What one picture cost, and what it was.
+struct Inline {
+    mime: String,
+    bytes: usize,
+}
+
+/// Drive's markdown export writes every picture into the text as a base64
+/// data URI. The bytes are almost all of the document — a doc of five
+/// screenshots exported as 201,000 characters, of which 20,000 were words —
+/// and a model gets nothing from them, because a picture cannot be read by
+/// reading its base64. Worse, they crowd the real text out: the export goes
+/// over the client's output limit and the words never arrive.
+///
+/// So each data URI becomes a short note of what stood there. The reference
+/// keeps its label, so `![][image1]` in the body still resolves to a line
+/// that says what it was, and a closing line says how much was left out.
+fn without_inline_images(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut gone: Vec<Inline> = Vec::new();
+    for (i, line) in markdown.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match reference_definition(line) {
+            Some((label, inline)) => {
+                out.push_str(&format!(
+                    "[{label}]: <a {} of {}, not included>",
+                    kind(&inline.mime),
+                    size(inline.bytes)
+                ));
+                gone.push(inline);
+            }
+            None => out.push_str(line),
+        }
+    }
+    // `lines()` drops the last newline; a document that ended with one still
+    // ends with one, so a doc with no pictures comes back exactly as it went in.
+    if markdown.ends_with('\n') {
+        out.push('\n');
+    }
+    if !gone.is_empty() {
+        let total: usize = gone.iter().map(|i| i.bytes).sum();
+        out.push_str(&format!(
+            "\n\n[{} {} left out of this text, {} in all. A picture cannot be read from its \
+             base64; open the document to see them.]",
+            gone.len(),
+            if gone.len() == 1 {
+                "image was"
+            } else {
+                "images were"
+            },
+            size(total)
+        ));
+    }
+    out
+}
+
+/// `[image1]: <data:image/png;base64,iVBOR...>`, the shape Drive's export
+/// writes, with or without the angle brackets. Anything else is left alone:
+/// a link to a picture on the web is a link, and costs nothing to keep.
+fn reference_definition(line: &str) -> Option<(&str, Inline)> {
+    let rest = line.strip_prefix('[')?;
+    let (label, rest) = rest.split_once("]:")?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix('<')
+        .unwrap_or(rest.trim_start());
+    let payload = rest.strip_prefix("data:")?;
+    let (mime, encoded) = payload.split_once(";base64,")?;
+    let encoded = encoded.trim_end_matches('>');
+    Some((
+        label,
+        Inline {
+            mime: mime.to_string(),
+            // base64 carries three bytes in every four characters, and the
+            // padding is at most two of them.
+            bytes: encoded.len() / 4 * 3,
+        },
+    ))
+}
+
+/// "PNG" out of "image/png", for a line a person reads.
+fn kind(mime: &str) -> String {
+    match mime.rsplit_once('/') {
+        Some((_, sub)) => sub.to_uppercase(),
+        None => mime.to_uppercase(),
+    }
+}
+
+fn size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 /// A Google Sheet, as CSV per tab, through the Sheets API. Drive's XLSX

@@ -124,6 +124,49 @@ async fn a_docx_gives_up_its_paragraphs() {
 }
 
 #[tokio::test]
+async fn a_doc_full_of_screenshots_comes_back_as_words() {
+    // What Drive's markdown export writes: the picture is a base64 data URI
+    // in a reference definition, and the body only points at its label. The
+    // real document that prompted this was 201,000 characters, of which
+    // 20,000 were text.
+    let png = "iVBORw0KGgoAAAANSUhEUg".repeat(4096);
+    let exported = format!(
+        "# Notes\n\nSee the diagram: ![][image1]\n\nAnd the other: ![][image2]\n\n\
+         [image1]: <data:image/png;base64,{png}>\n[image2]: <data:image/jpeg;base64,{png}>\n"
+    );
+    let h = harness().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/drive/v3/files/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc/export",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(exported.as_bytes().to_vec(), "text/markdown"),
+        )
+        .mount(&h.server)
+        .await;
+
+    let doc = text::google_doc(
+        &h.client,
+        CONNECTION,
+        "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc",
+    )
+    .await
+    .unwrap();
+
+    // Not one byte of base64 survives, and what is left is the writing.
+    assert!(!doc.contains("data:image"), "{doc}");
+    assert!(!doc.contains("iVBORw0KGgo"), "{doc}");
+    assert!(doc.contains("# Notes"), "{doc}");
+    assert!(doc.contains("See the diagram: ![][image1]"), "{doc}");
+    // Each label still resolves, to a line saying what stood there.
+    assert!(doc.contains("[image1]: <a PNG of"), "{doc}");
+    assert!(doc.contains("[image2]: <a JPEG of"), "{doc}");
+    assert!(doc.contains("2 images were left out of this text"), "{doc}");
+    // The export was 180 KB of base64 and the text is a few lines.
+    assert!(doc.len() < 500, "{} chars: {doc}", doc.len());
+}
+
+#[tokio::test]
 async fn a_google_doc_is_read_as_markdown_and_a_sheet_as_csv() {
     let h = harness().await;
     Mock::given(method("GET"))
