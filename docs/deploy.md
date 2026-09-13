@@ -303,10 +303,10 @@ WebUI access within that time on its own.
 > image content to its file store and shows it under the message, but the model
 > never receives it; the embedded image resource that gmcp also returns is fed
 > to the model as vision input *only* in Native function-calling mode (since
-> 0.10.0). In Default mode `gmail_view_image` and `drive_view_image` will look
-> like they work — the picture appears in the chat — and the model will not be
-> able to see it. It is per model: Workspace → Models → the model → Advanced
-> Params → **Function Calling: Native**.
+> 0.10.0). In Default mode `gmail_view_image`, `drive_view_image` and
+> `docs_view_image` will look like they work — the picture appears in the chat
+> — and the model will not be able to see it. It is per model: Workspace →
+> Models → the model → Advanced Params → **Function Calling: Native**.
 
 A picture is visible only in the turn it was fetched; a follow-up question
 about it needs the tool called again. The tool descriptions say so.
