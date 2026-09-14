@@ -78,6 +78,10 @@ fn instructions(portal: &str) -> String {
          confirmed=false: nothing is written and you get back exactly what would change. Show that \
          to the person, and pass confirmed=true only after they agree. Gmail drafts need no \
          confirmation, because the draft is itself the thing being confirmed.\n\
+         A Google Doc is changed paragraph by paragraph: call docs_list_paragraphs first, pass \
+         the numbers and the revision_id it answers with to docs_insert_text, \
+         docs_edit_paragraph or docs_style_paragraph, and call it again after \
+         every write, because one write moves both.\n\
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \

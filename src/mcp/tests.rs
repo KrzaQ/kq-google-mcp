@@ -543,6 +543,55 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
     }
     // A draft is its own confirmation, so it has no such argument.
     assert!(by_name("gmail_create_draft")["inputSchema"]["properties"]["confirmed"].is_null());
+
+    // The careful Docs writes cannot be made without both locks, and each one
+    // says that making it invalidates the read it was planned from.
+    let required = |tool: &str| {
+        by_name(tool)["inputSchema"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    for tool in [
+        "docs_insert_text",
+        "docs_edit_paragraph",
+        "docs_style_paragraph",
+    ] {
+        for argument in ["revision_id", "confirmed"] {
+            assert!(
+                required(tool).contains(&json!(argument)),
+                "{tool} does not require {argument}"
+            );
+        }
+        assert!(
+            by_name(tool)["description"]
+                .as_str()
+                .unwrap()
+                .contains("revision id"),
+            "{tool} does not say that a write makes the revision id stale"
+        );
+    }
+    // `expect` is required where a write overwrites and optional where it
+    // inserts, because inserting beside the wrong paragraph is recoverable.
+    for tool in ["docs_edit_paragraph", "docs_style_paragraph"] {
+        assert!(required(tool).contains(&json!("expect")), "{tool}");
+    }
+    assert!(!required("docs_insert_text").contains(&json!("expect")));
+    assert!(by_name("docs_insert_text")["inputSchema"]["properties"]["expect"].is_object());
+    // The one that is careful and the one that is broad each point at the
+    // other, so a model picking between them reads both.
+    assert!(
+        by_name("docs_edit_paragraph")["description"]
+            .as_str()
+            .unwrap()
+            .contains("docs_replace_text")
+    );
+    assert!(
+        by_name("docs_replace_text")["description"]
+            .as_str()
+            .unwrap()
+            .contains("docs_edit_paragraph")
+    );
 }
 
 // ----- resolving `account` ----------------------------------------------------
@@ -3514,6 +3563,35 @@ async fn article_server() -> MockServer {
     server
 }
 
+/// The write endpoint, counted. `times` is verified when the server is
+/// dropped, so a preview that writes is a test that fails.
+async fn expect_batches(server: &MockServer, times: u64) {
+    Mock::given(http_method("POST"))
+        .and(path(format!("/v1/documents/{ARTICLE}:batchUpdate")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_batch_update.json")))
+        .expect(times)
+        .named("one batch per write and none for a preview")
+        .mount(server)
+        .await;
+}
+
+/// The same arguments, answered or approved.
+fn confirming(args: &Value, yes: bool) -> Value {
+    let mut map = args.as_object().unwrap().clone();
+    map.insert("confirmed".into(), json!(yes));
+    Value::Object(map)
+}
+
+fn details(shown: &Value) -> String {
+    shown["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[tokio::test]
 async fn docs_list_paragraphs_numbers_the_body_and_answers_the_revision() {
     let db = Db::open_memory().await.unwrap();
@@ -3625,6 +3703,189 @@ async fn a_long_paragraph_is_cut_until_it_is_asked_for_in_full() {
             .count(),
         chars
     );
+}
+
+#[tokio::test]
+async fn docs_edit_paragraph_previews_the_change_and_then_writes_it_once() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3,
+                      "find": "już", "occurrence": 2, "replace": "jutro",
+                      "expect": "Zażółć", "revision_id": ARTICLE_REVISION});
+
+    let shown = c.ok("docs_edit_paragraph", confirming(&args, false)).await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("Zażółć gęślą jaźń 😀 już i już"), "{lines}");
+    assert!(
+        lines.contains("Zażółć gęślą jaźń 😀 już i jutro"),
+        "{lines}"
+    );
+    assert!(lines.contains("occurrence 2"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0, "a preview wrote something");
+
+    let out = c.ok("docs_edit_paragraph", confirming(&args, true)).await;
+    assert_eq!(out["paragraph"], 3);
+    assert_eq!(out["text"], "Zażółć gęślą jaźń 😀 już i jutro");
+    assert!(
+        out["next"]
+            .as_str()
+            .unwrap()
+            .contains("docs_list_paragraphs"),
+        "{out}"
+    );
+    // The second `już`, at the UTF-16 index the emoji before it decides.
+    let body = last_batch(&server).await;
+    assert_eq!(
+        body["requests"],
+        json!([
+            {"insertText": {"text": "jutro", "location": {"index": 57}}},
+            {"deleteContentRange": {"range": {"startIndex": 62, "endIndex": 65}}}
+        ])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], ARTICLE_REVISION);
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_stale_revision_or_an_expect_that_does_not_match_writes_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let stale = c
+        .refused(
+            "docs_edit_paragraph",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3, "find": "już",
+                   "occurrence": 1, "replace": "jutro", "expect": "Zażółć",
+                   "revision_id": "ALm37BW0Older", "confirmed": true}),
+        )
+        .await;
+    assert!(stale.contains("docs_list_paragraphs"), "{stale}");
+    assert!(stale.contains("ALm37BW0Older"), "{stale}");
+
+    let counted = c
+        .refused(
+            "docs_edit_paragraph",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3, "find": "już",
+                   "occurrence": 1, "replace": "jutro", "expect": "Koniec",
+                   "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(counted.contains("does not start with"), "{counted}");
+    assert!(counted.contains("Zażółć gęślą"), "{counted}");
+
+    let gone = c
+        .refused(
+            "docs_style_paragraph",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 9, "style": "TITLE",
+                   "expect": "Koniec", "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(gone.contains("5 paragraphs"), "{gone}");
+    assert_eq!(batch_calls(&server).await, 0);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_text_puts_a_styled_paragraph_where_it_was_told() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                      "text": "Nowy akapit", "style": "heading_3", "expect": "Część",
+                      "revision_id": ARTICLE_REVISION});
+    let shown = c.ok("docs_insert_text", confirming(&args, false)).await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("Część pierwsza"), "{lines}");
+    assert!(lines.contains("Nowy akapit"), "{lines}");
+    assert!(lines.contains("HEADING_3"), "{lines}");
+
+    let out = c.ok("docs_insert_text", confirming(&args, true)).await;
+    assert_eq!(out["paragraph"], 2);
+    assert_eq!(out["text"], "Nowy akapit");
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([
+            {"insertText": {"text": "Nowy akapit\n", "location": {"index": 30}}},
+            {"updateParagraphStyle": {
+                "range": {"startIndex": 30, "endIndex": 41},
+                "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                "fields": "namedStyleType"
+            }}
+        ])
+    );
+
+    // Where it goes has to be said once and exactly once.
+    for (where_it_goes, wanted) in [
+        (
+            json!({"after_paragraph": 2, "before_paragraph": 3}),
+            "not both",
+        ),
+        (json!({}), "after_paragraph or before_paragraph"),
+    ] {
+        let mut bad = json!({"account": "work", "doc_id": ARTICLE, "text": "Nowy akapit",
+                             "revision_id": ARTICLE_REVISION, "confirmed": true});
+        for (key, value) in where_it_goes.as_object().unwrap() {
+            bad[key] = value.clone();
+        }
+        let refused = c.refused("docs_insert_text", bad).await;
+        assert!(refused.contains(wanted), "{refused}");
+    }
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_style_paragraph_changes_the_style_and_leaves_the_words() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 2,
+                      "style": "HEADING_3", "expect": "Część pierwsza",
+                      "revision_id": ARTICLE_REVISION});
+    let shown = c.ok("docs_style_paragraph", confirming(&args, false)).await;
+    let lines = details(&shown);
+    assert!(lines.contains("HEADING_2"), "{lines}");
+    assert!(lines.contains("HEADING_3"), "{lines}");
+    assert!(lines.contains("Część pierwsza"), "{lines}");
+
+    let out = c.ok("docs_style_paragraph", confirming(&args, true)).await;
+    assert_eq!(out["text"], "Część pierwsza");
+    assert!(
+        out["written"].as_str().unwrap().contains("HEADING_3"),
+        "{out}"
+    );
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([{"updateParagraphStyle": {
+            "range": {"startIndex": 15, "endIndex": 30},
+            "paragraphStyle": {"namedStyleType": "HEADING_3"},
+            "fields": "namedStyleType"
+        }}])
+    );
+
+    // A style Docs does not have never reaches Google.
+    let refused = c
+        .refused(
+            "docs_style_paragraph",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 2, "style": "BODY",
+                   "expect": "Część", "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("NORMAL_TEXT"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
 }
 
 // ----- sheets -----------------------------------------------------------------

@@ -1,11 +1,18 @@
-//! The Docs tools. Reading goes through Drive's markdown export, because
-//! Docs' own API has no text output, with docs_list_paragraphs beside it for
-//! the shape of the document; writing is the two edits this release makes,
-//! appending at the end and replacing text throughout.
+//! The Docs tools: the whole document as markdown, the document as numbered
+//! paragraphs, and the writes.
 //!
-//! Every one of the three writes takes `confirmed`. With `confirmed=false`
-//! nothing is written and the answer says what would be — that is the step
-//! where the person sees the change and agrees to it.
+//! There are two kinds of write here, and they are not rivals. docs_create,
+//! docs_append and docs_replace_text are the broad ones: make a document, add
+//! to the end, change every match. docs_insert_text, docs_edit_paragraph,
+//! docs_style_paragraph and docs_insert_code are the careful ones, and each
+//! takes a paragraph number and the revision id that docs_list_paragraphs
+//! answered with — the two locks that keep a write off the paragraph it was
+//! not meant for.
+//!
+//! Every write takes `confirmed`. With `confirmed=false` nothing is written
+//! and the answer says what would change, the affected paragraph as it is and
+//! as it would read. That is the step where the person sees the change and
+//! agrees to it.
 
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -102,6 +109,73 @@ pub struct DocsParagraphsParam {
     /// Show each paragraph in full rather than cut. Use it with from and to
     /// for the few paragraphs you are about to change.
     pub full: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsInsertParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Put the new paragraph after this one, as docs_list_paragraphs numbers
+    /// them. Give this or before_paragraph, not both.
+    pub after_paragraph: Option<u32>,
+    /// Put the new paragraph before this one instead.
+    pub before_paragraph: Option<u32>,
+    /// The text of the new paragraph, as plain text. Markdown is not
+    /// rendered: a "## " arrives as those characters.
+    pub text: String,
+    /// The named style for what is inserted: NORMAL_TEXT, TITLE, SUBTITLE or
+    /// HEADING_1 to HEADING_6. Without it the new paragraph takes the style
+    /// of the one it is put beside.
+    pub style: Option<String>,
+    /// What the paragraph you named starts with, as docs_list_paragraphs
+    /// reports it. Optional here, and worth passing: it catches a paragraph
+    /// number that has moved.
+    pub expect: Option<String>,
+    /// The revision_id docs_list_paragraphs answered with. The write is
+    /// refused when the document has changed since.
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person what
+    /// comes back.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsEditParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Which paragraph to change, as docs_list_paragraphs numbers them
+    pub paragraph: u32,
+    /// The text to look for inside that one paragraph
+    pub find: String,
+    /// Which match to change, counting from 1: occurrence 2 changes the
+    /// second match in the paragraph and leaves the first alone
+    pub occurrence: u32,
+    /// What to put in its place; empty deletes the match
+    pub replace: String,
+    /// What the paragraph starts with, as docs_list_paragraphs reports it.
+    /// The paragraph is not written to when it says something else.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person the
+    /// paragraph as it is and as it would read.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsStyleParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Which paragraph to restyle, as docs_list_paragraphs numbers them
+    pub paragraph: u32,
+    /// NORMAL_TEXT, TITLE, SUBTITLE or HEADING_1 to HEADING_6
+    pub style: String,
+    /// What the paragraph starts with, as docs_list_paragraphs reports it
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first.
+    pub confirmed: bool,
 }
 
 #[tool_router(router = docs_router, vis = "pub(crate)")]
@@ -321,8 +395,8 @@ impl Gmcp {
     #[tool(
         description = "Add plain text to the end of a Google Doc. Markdown is not rendered here \
                        — the characters arrive as typed — so write prose, or make a new document \
-                       with docs_create instead. Needs confirmed=true after the person has seen \
-                       the text."
+                       with docs_create instead. To put a paragraph anywhere but the end, use \
+                       docs_insert_text. Needs confirmed=true after the person has seen the text."
     )]
     async fn docs_append(
         &self,
@@ -364,8 +438,11 @@ impl Gmcp {
 
     #[tool(
         description = "Replace every occurrence of one string with another throughout a Google \
-                       Doc and report how many were changed. This cannot be undone from here, so \
-                       it needs confirmed=true after the person has seen both strings."
+                       Doc and report how many were changed. This is the broad tool: it changes \
+                       every match in the document at once and cannot be undone from here, so it \
+                       needs confirmed=true after the person has seen both strings. For careful \
+                       work — one occurrence, in one paragraph you have read — use \
+                       docs_edit_paragraph instead."
     )]
     async fn docs_replace_text(
         &self,
@@ -499,6 +576,227 @@ impl Gmcp {
             note,
         }))
     }
+
+    #[tool(
+        description = "Insert plain text as a new paragraph, after or before the paragraph you \
+                       name — the edit docs_append cannot make, because that one only adds at the \
+                       end. Markdown is not rendered: \"## Heading\" arrives as those characters, \
+                       which is what `style` is for. Pass the revision_id docs_list_paragraphs \
+                       answered with; when the document changed since, nothing is written and you \
+                       must read it again. `expect` is optional here — inserting beside the wrong \
+                       paragraph can be undone in a way that overwriting cannot — and worth \
+                       passing anyway. Needs confirmed=true after the person has seen the \
+                       preview. One write moves every paragraph number and changes the revision \
+                       id."
+    )]
+    async fn docs_insert_text(
+        &self,
+        Parameters(p): Parameters<DocsInsertParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let at = match (p.after_paragraph, p.before_paragraph) {
+            (Some(a), None) => docs::At::After(a as usize),
+            (None, Some(b)) => docs::At::Before(b as usize),
+            (Some(_), Some(_)) => {
+                return Err(bad(
+                    "say where the text goes once: after_paragraph or before_paragraph, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(bad(
+                    "say where the text goes: after_paragraph or before_paragraph, \
+                     as docs_list_paragraphs numbers them",
+                ));
+            }
+        };
+        let style = p
+            .style
+            .as_deref()
+            .map(docs::named_style)
+            .transpose()
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_insert(
+            &outline,
+            &p.revision_id,
+            at,
+            &p.text,
+            style,
+            p.expect.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let beside = match at {
+            docs::At::After(n) => format!("after paragraph {n}"),
+            docs::At::Before(n) => format!("before paragraph {n}"),
+        };
+        let styled = match style {
+            Some(style) => format!("as {style}"),
+            None => "in the style of the paragraph beside it".to_string(),
+        };
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "insert a new paragraph {beside} of the Google Doc {doc_id} in `{}`",
+                    connection.label
+                ),
+                vec![
+                    format!(
+                        "paragraph {} reads now: {}",
+                        plan.paragraph,
+                        first_lines(&plan.before)
+                    ),
+                    format!("the new paragraph would read: {}", first_lines(&plan.after)),
+                    format!("it would be set {styled}"),
+                ],
+            ))));
+        }
+        let (paragraph, text, index) = (plan.paragraph, plan.after.clone(), plan.index);
+        docs::apply(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "{} characters inserted {beside} {styled}, at index {index}",
+                text.chars().count()
+            ),
+            text,
+            next: REREAD.to_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Change one occurrence of one string inside one paragraph. This is \
+                       docs_replace_text for careful work: docs_replace_text changes every match \
+                       in the whole document at once, and this changes the one you mean. \
+                       occurrence=1 is the first match in that paragraph, occurrence=2 the second. \
+                       `expect` is required and is the words the paragraph starts with, as \
+                       docs_list_paragraphs reports them: when the paragraph says something else \
+                       nothing is written and the answer quotes what is there. Pass the \
+                       revision_id from the same read, and confirmed=true after the person has \
+                       seen the paragraph as it is and as it would read. One write moves every \
+                       paragraph number and changes the revision id."
+    )]
+    async fn docs_edit_paragraph(
+        &self,
+        Parameters(p): Parameters<DocsEditParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_edit(
+            &outline,
+            &p.revision_id,
+            p.paragraph as usize,
+            &p.find,
+            p.occurrence as usize,
+            &p.replace,
+            &p.expect,
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let change = format!(
+            "occurrence {} of {:?} becomes {:?}",
+            p.occurrence, p.find, p.replace
+        );
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "change paragraph {} of the Google Doc {doc_id} in `{}`",
+                    plan.paragraph, connection.label
+                ),
+                vec![
+                    change.clone(),
+                    format!("it reads now: {}", first_lines(&plan.before)),
+                    format!("it would read: {}", first_lines(&plan.after)),
+                ],
+            ))));
+        }
+        let (paragraph, text) = (plan.paragraph, plan.after.clone());
+        docs::apply(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!("paragraph {paragraph} changed: {change}"),
+            text,
+            next: REREAD.to_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Set the named style of one paragraph: NORMAL_TEXT, TITLE, SUBTITLE or \
+                       HEADING_1 to HEADING_6. That is all this does — not alignment, not \
+                       spacing, not indentation, not font or size. `expect` is required and is \
+                       the words the paragraph starts with, so a number that has moved restyles \
+                       nothing. Pass the revision_id from the same docs_list_paragraphs, and \
+                       confirmed=true after the person has seen which paragraph it is. One write \
+                       moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_style_paragraph(
+        &self,
+        Parameters(p): Parameters<DocsStyleParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_style(
+            &outline,
+            &p.revision_id,
+            p.paragraph as usize,
+            &p.style,
+            &p.expect,
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let text = outline
+            .paragraph(plan.paragraph)
+            .map(|p| p.text.clone())
+            .unwrap_or_default();
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "restyle paragraph {} of the Google Doc {doc_id} in `{}`",
+                    plan.paragraph, connection.label
+                ),
+                vec![
+                    format!("it is {} and would become {}", plan.before, plan.after),
+                    format!("it reads: {}", first_lines(&text)),
+                    "only the named style changes; the words stay as they are".to_string(),
+                ],
+            ))));
+        }
+        let (paragraph, was, now) = (plan.paragraph, plan.before.clone(), plan.after.clone());
+        docs::apply(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!("paragraph {paragraph} is {now} now; it was {was}"),
+            text,
+            next: REREAD.to_string(),
+        })))
+    }
 }
 
 /// How much of one paragraph a listing shows when `full` is not set. Enough
@@ -509,6 +807,12 @@ const PARAGRAPH_CHARS: usize = 400;
 /// it stops and says which paragraph to ask from, because a 20,000-character
 /// article in one answer is what these tools exist to avoid.
 const LISTING_MAX_CHARS: usize = 20_000;
+
+/// What every write says when it is done. One write moves every paragraph
+/// number after it and gives the document a new revision, so the read that
+/// planned it cannot plan the next one.
+const REREAD: &str = "The paragraph numbers and the revision id are stale now. Call \
+                      docs_list_paragraphs again before the next write.";
 
 /// One paragraph of a listing, cut to `max` characters.
 fn cut(text: &str, max: usize) -> (String, bool) {

@@ -1,14 +1,18 @@
-//! Docs: a document read as numbered paragraphs, plus the two edits this
-//! release makes, text appended at the end and a find-and-replace across the
-//! document. The prose read goes through Drive's markdown export;
-//! `documents.get` is what says where each paragraph starts and ends, and it
-//! carries the pictures and the tab list too.
+//! Docs: a document read as numbered paragraphs, and the writes that name one
+//! of those numbers. The prose read goes through Drive's markdown export;
+//! `documents.get` is what says where each paragraph starts and ends, which is
+//! what an edit needs, and it carries the pictures and the tab list too.
 //!
-//! Docs counts positions in UTF-16 code units, which Rust counts in neither,
-//! so every index is computed in [`index`] and nowhere else.
+//! Two things shape every write here. Docs counts positions in UTF-16 code
+//! units, so every index is computed in [`index`] and nowhere else. And a
+//! paragraph number goes stale the moment anything changes, including the
+//! caller's own last write, so every write carries the revision it was planned
+//! against and is refused rather than applied once the document has moved on.
 //!
-//! Structural edits are deliberately out: a model that can only append and
-//! replace cannot rearrange someone's document by accident.
+//! Structural edits are still out: nothing here moves a paragraph, removes
+//! one, or writes to a table. A model that can insert, replace inside one
+//! paragraph and set a named style cannot rearrange someone's article by
+//! accident.
 
 use std::collections::HashMap;
 
@@ -290,6 +294,7 @@ pub async fn append_text(
                 }),
                 ..DocRequest::default()
             }],
+            write_control: None,
         });
     let _: WireBatchReply = client.json(connection_id, request).await?;
     Ok(index)
@@ -327,6 +332,7 @@ pub async fn replace_all_text(
                 }),
                 ..DocRequest::default()
             }],
+            write_control: None,
         });
     let reply: WireBatchReply = client.json(connection_id, request).await?;
     Ok(reply
@@ -349,6 +355,16 @@ pub mod index {
     /// How many UTF-16 code units this text takes.
     pub fn len(text: &str) -> i64 {
         text.chars().map(|c| c.len_utf16() as i64).sum()
+    }
+
+    /// The UTF-16 offset of a byte offset into `text`. A byte offset that is
+    /// not a character boundary, or is past the end, counts the whole text —
+    /// there is no such position to point at.
+    pub fn from_bytes(text: &str, bytes: usize) -> i64 {
+        match text.get(..bytes) {
+            Some(head) => len(head),
+            None => len(text),
+        }
     }
 
     /// How many characters sit before a UTF-16 offset. `None` when the offset
@@ -376,6 +392,27 @@ pub mod index {
 }
 
 // ----- paragraphs ------------------------------------------------------------
+
+/// The named paragraph styles Docs has, in the order a tool lists them.
+/// Alignment, spacing and indentation are deliberately not here: these tools
+/// set a named style and nothing else, because a magazine article needs
+/// headings and not a word processor.
+pub const NAMED_STYLES: [&str; 9] = [
+    "NORMAL_TEXT",
+    "TITLE",
+    "SUBTITLE",
+    "HEADING_1",
+    "HEADING_2",
+    "HEADING_3",
+    "HEADING_4",
+    "HEADING_5",
+    "HEADING_6",
+];
+
+/// What every stale write is told, in one sentence and one place.
+const STALE: &str = "the document changed since it was read, so nothing was written; \
+                     call docs_list_paragraphs again — one write moves the paragraph numbers \
+                     and the revision id both";
 
 /// One paragraph of the body, numbered the way `docs_list_paragraphs` numbers
 /// it: 1-based, in body order, through table cells.
@@ -411,6 +448,53 @@ impl Paragraph {
     pub fn chars(&self) -> usize {
         self.text.chars().count()
     }
+
+    /// The document index of a byte offset into [`Paragraph::text`], or
+    /// `None` when the offset is past the end of the runs.
+    fn index_at(&self, byte: usize) -> Option<i64> {
+        let mut consumed = 0;
+        for run in &self.runs {
+            if byte <= consumed + run.text.len() {
+                return Some(run.start_index + index::from_bytes(&run.text, byte - consumed));
+            }
+            consumed += run.text.len();
+        }
+        None
+    }
+
+    /// The second lock on a write. The caller says what it believes this
+    /// paragraph starts with, and a paragraph that says otherwise is not
+    /// written to. The revision guard catches a document that changed; this
+    /// catches a caller that counted wrong.
+    pub fn check_expect(&self, expect: &str) -> Result<()> {
+        let expect = expect.trim();
+        if expect.is_empty() {
+            return Err(Error::Unsupported(
+                "`expect` is empty; pass the words the paragraph starts with, as \
+                 docs_list_paragraphs reports them"
+                    .into(),
+            ));
+        }
+        if self.text.trim_start().starts_with(expect) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "paragraph {} does not start with {expect:?}; it starts with {:?}. Nothing was \
+             written — read the document again and count once more",
+            self.ordinal,
+            head(&self.text, 80)
+        )))
+    }
+}
+
+/// The beginning of a paragraph, for a message that has to quote it.
+fn head(text: &str, keep: usize) -> String {
+    let start: String = text.chars().take(keep).collect();
+    if text.chars().count() > keep {
+        format!("{start}…")
+    } else {
+        start
+    }
 }
 
 /// A document as a numbered list of paragraphs, with the revision every write
@@ -434,6 +518,87 @@ impl Outline {
             "https://docs.google.com/document/d/{}/edit",
             self.document_id
         )
+    }
+
+    /// The paragraph a caller numbered, or the refusal that says how many
+    /// there are.
+    pub fn paragraph(&self, ordinal: usize) -> Result<&Paragraph> {
+        if ordinal == 0 {
+            return Err(Error::Unsupported(
+                "paragraphs are numbered from 1, so there is no paragraph 0".into(),
+            ));
+        }
+        self.paragraphs.get(ordinal - 1).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "this document has {} paragraph{}, so there is no paragraph {ordinal}",
+                self.paragraphs.len(),
+                if self.paragraphs.len() == 1 { "" } else { "s" }
+            ))
+        })
+    }
+
+    /// The revision the caller planned against, against the one the document
+    /// is at now. This is the guard that fires before anything is sent; the
+    /// same guard travels with the batch for the gap in between.
+    fn check_revision(&self, revision_id: &str) -> Result<()> {
+        let asked = revision_id.trim();
+        if asked.is_empty() {
+            return Err(Error::Unsupported(
+                "this write needs the revision_id that docs_list_paragraphs answered with; \
+                 it is what says the paragraph numbers are still the document's"
+                    .into(),
+            ));
+        }
+        if asked == self.revision_id {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "{STALE}. The write named revision {asked:?} and the document is at {:?}",
+            self.revision_id
+        )))
+    }
+
+    /// Where an insert goes and what is written there. A paragraph is text
+    /// that ends in a newline, so an insert carries its own break: before a
+    /// paragraph the text is followed by one, and after the document's last
+    /// paragraph it is preceded by one instead, because the index after the
+    /// body's final newline is the one place Docs refuses to write at.
+    ///
+    /// The third value is where the caller's own text begins, which is what a
+    /// style or a colour is measured from.
+    fn insertion(&self, at: At, paragraph: &Paragraph, body: &str) -> (i64, String, i64) {
+        match at {
+            At::Before(_) => (
+                paragraph.start_index,
+                format!("{body}\n"),
+                paragraph.start_index,
+            ),
+            At::After(_) if paragraph.end_index >= self.end_index => {
+                let index = (self.end_index - 1).max(1);
+                (index, format!("\n{body}"), index + 1)
+            }
+            At::After(_) => (
+                paragraph.end_index,
+                format!("{body}\n"),
+                paragraph.end_index,
+            ),
+        }
+    }
+
+    /// The range one paragraph covers, as a style request may name it. The
+    /// body's final newline is Docs' own, so the last paragraph's range stops
+    /// one short of it; the paragraph still overlaps the range, which is all
+    /// `updateParagraphStyle` asks for.
+    fn style_range(&self, paragraph: &Paragraph) -> Range {
+        let end = if paragraph.end_index >= self.end_index {
+            (self.end_index - 1).max(paragraph.start_index + 1)
+        } else {
+            paragraph.end_index
+        };
+        Range {
+            start_index: paragraph.start_index,
+            end_index: end,
+        }
     }
 }
 
@@ -498,6 +663,271 @@ fn collect_paragraphs(content: &[WireElement], in_table: bool, out: &mut Vec<Par
                 collect_paragraphs(&cell.content, true, out);
             }
         }
+    }
+}
+
+// ----- planning a write ------------------------------------------------------
+
+/// Where an insert goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    After(usize),
+    Before(usize),
+}
+
+impl At {
+    fn ordinal(self) -> usize {
+        match self {
+            At::After(n) | At::Before(n) => n,
+        }
+    }
+}
+
+/// One document write, worked out in full before anything is sent: which
+/// paragraph it is about, how the text reads now and how it would read
+/// afterwards, and the requests that do it.
+///
+/// A preview and a write build the same plan, so both are refused for the
+/// same reasons in the same words, and a preview that comes back is a write
+/// that would go through.
+#[derive(Debug)]
+pub struct Plan {
+    /// The paragraph the write is about; for an insert, the one it goes next
+    /// to.
+    pub paragraph: usize,
+    /// How that paragraph reads now.
+    pub before: String,
+    /// How the text this write leaves behind reads: the changed paragraph, or
+    /// the inserted one.
+    pub after: String,
+    /// Where the write lands, in Docs' own index.
+    pub index: i64,
+    revision_id: String,
+    requests: Vec<DocRequest>,
+}
+
+/// A named style, as Docs spells it. `heading 2` and `Heading_2` are the same
+/// style; anything that is not one of the nine is refused with the nine.
+pub fn named_style(style: &str) -> Result<&'static str> {
+    let wanted = style.trim().to_ascii_uppercase().replace([' ', '-'], "_");
+    NAMED_STYLES
+        .into_iter()
+        .find(|s| *s == wanted)
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{style:?} is not a paragraph style; Docs has {}",
+                NAMED_STYLES.join(", ")
+            ))
+        })
+}
+
+/// Text as its own new paragraph, before or after the paragraph a caller
+/// numbered, optionally under a named style. Plain text: Docs takes the
+/// string as written, so `## Heading` would arrive as those characters, which
+/// is what the style is for.
+pub fn plan_insert(
+    outline: &Outline,
+    revision_id: &str,
+    at: At,
+    text: &str,
+    style: Option<&str>,
+    expect: Option<&str>,
+) -> Result<Plan> {
+    outline.check_revision(revision_id)?;
+    let body = text.trim_end_matches('\n');
+    if body.trim().is_empty() {
+        return Err(Error::Unsupported(
+            "there is nothing to insert: the text is empty".into(),
+        ));
+    }
+    let style = style.map(named_style).transpose()?;
+    let neighbour = outline.paragraph(at.ordinal())?;
+    if let Some(expect) = expect {
+        neighbour.check_expect(expect)?;
+    }
+    let (index, payload, text_at) = outline.insertion(at, neighbour, body);
+    let mut requests = vec![insert_request(index, &payload)];
+    if let Some(named_style_type) = style {
+        requests.push(DocRequest {
+            update_paragraph_style: Some(UpdateParagraphStyle {
+                range: Range {
+                    start_index: text_at,
+                    end_index: text_at + index::len(body),
+                },
+                paragraph_style: ParagraphStyle { named_style_type },
+                fields: "namedStyleType",
+            }),
+            ..DocRequest::default()
+        });
+    }
+    Ok(Plan {
+        paragraph: neighbour.ordinal,
+        before: neighbour.text.clone(),
+        after: body.to_string(),
+        index,
+        revision_id: revision_id.trim().to_string(),
+        requests,
+    })
+}
+
+/// One occurrence of one string inside one paragraph. This is what
+/// `docs_replace_text` should be for careful work: it changes the words a
+/// caller means and leaves every other copy of them alone.
+pub fn plan_edit(
+    outline: &Outline,
+    revision_id: &str,
+    ordinal: usize,
+    find: &str,
+    occurrence: usize,
+    replace: &str,
+    expect: &str,
+) -> Result<Plan> {
+    outline.check_revision(revision_id)?;
+    let paragraph = outline.paragraph(ordinal)?;
+    paragraph.check_expect(expect)?;
+    if find.is_empty() {
+        return Err(Error::Unsupported(
+            "the text to find is empty; say which words in the paragraph to change".into(),
+        ));
+    }
+    if occurrence == 0 {
+        return Err(Error::Unsupported(
+            "occurrences are counted from 1: occurrence 1 is the first match in the paragraph"
+                .into(),
+        ));
+    }
+    let found: Vec<usize> = paragraph
+        .text
+        .match_indices(find)
+        .map(|(at, _)| at)
+        .collect();
+    let Some(&at) = found.get(occurrence - 1) else {
+        return Err(Error::Unsupported(format!(
+            "paragraph {ordinal} holds {} of {find:?}, so it has no occurrence {occurrence}; \
+             nothing was written",
+            found.len()
+        )));
+    };
+    let (Some(start), Some(end)) = (paragraph.index_at(at), paragraph.index_at(at + find.len()))
+    else {
+        return Err(Error::Malformed(format!(
+            "paragraph {ordinal} does not line up with the indexes Google gave it"
+        )));
+    };
+    let after = format!(
+        "{}{replace}{}",
+        &paragraph.text[..at],
+        &paragraph.text[at + find.len()..]
+    );
+    // The new text goes in first and the old text comes out after it, both in
+    // the one batch: Docs applies the requests in order, so the deletion
+    // names the old words where the insertion has just pushed them. Inserted
+    // this way the text keeps the formatting of what it is put beside, which
+    // a deletion first would lose.
+    let mut requests = Vec::new();
+    let shift = if replace.is_empty() {
+        0
+    } else {
+        requests.push(insert_request(start, replace));
+        index::len(replace)
+    };
+    requests.push(DocRequest {
+        delete_content_range: Some(DeleteContentRange {
+            range: Range {
+                start_index: start + shift,
+                end_index: end + shift,
+            },
+        }),
+        ..DocRequest::default()
+    });
+    Ok(Plan {
+        paragraph: ordinal,
+        before: paragraph.text.clone(),
+        after,
+        index: start,
+        revision_id: revision_id.trim().to_string(),
+        requests,
+    })
+}
+
+/// The named style of one paragraph, and nothing else about it.
+pub fn plan_style(
+    outline: &Outline,
+    revision_id: &str,
+    ordinal: usize,
+    style: &str,
+    expect: &str,
+) -> Result<Plan> {
+    outline.check_revision(revision_id)?;
+    let paragraph = outline.paragraph(ordinal)?;
+    paragraph.check_expect(expect)?;
+    let named_style_type = named_style(style)?;
+    Ok(Plan {
+        paragraph: ordinal,
+        before: paragraph.style.clone(),
+        after: named_style_type.to_string(),
+        index: paragraph.start_index,
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![DocRequest {
+            update_paragraph_style: Some(UpdateParagraphStyle {
+                range: outline.style_range(paragraph),
+                paragraph_style: ParagraphStyle { named_style_type },
+                fields: "namedStyleType",
+            }),
+            ..DocRequest::default()
+        }],
+    })
+}
+
+fn insert_request(index: i64, text: &str) -> DocRequest {
+    DocRequest {
+        insert_text: Some(InsertText {
+            text: text.to_string(),
+            location: Location { index },
+        }),
+        ..DocRequest::default()
+    }
+}
+
+/// The one `batchUpdate` a write tool sends. Everything a plan holds goes in
+/// this single batch: Docs applies a batch in order and as one write, and a
+/// second batch would be a half-applied edit every time the first succeeded
+/// and the second did not.
+pub async fn apply(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    plan: Plan,
+) -> Result<()> {
+    let request = client
+        .service(DOCS)
+        .post(&format!(
+            "v1/documents/{}:batchUpdate",
+            urlencode(document_id)
+        ))?
+        .json(&BatchUpdate {
+            requests: plan.requests,
+            write_control: Some(WriteControl {
+                required_revision_id: plan.revision_id,
+            }),
+        });
+    let _: WireBatchReply = client.json(connection_id, request).await.map_err(stale)?;
+    Ok(())
+}
+
+/// Google's refusal of a batch whose revision has moved on, said the way the
+/// model has to act on it: read the document again. A retry of the same write
+/// would be a write against paragraph numbers that have already moved, so
+/// there is none.
+fn stale(e: Error) -> Error {
+    match &e {
+        Error::Google(g)
+            if matches!(g.status, 400 | 409 | 412)
+                && g.message.to_lowercase().contains("revision") =>
+        {
+            Error::Unsupported(format!("{STALE}. Google refused the write: {}", g.message))
+        }
+        _ => e,
     }
 }
 
@@ -663,8 +1093,20 @@ struct WireReplaceReply {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BatchUpdate {
     requests: Vec<DocRequest>,
+    /// The revision the write was planned against. Google refuses the whole
+    /// batch when the document has moved on, which is what keeps a stale
+    /// paragraph number from editing the wrong words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_control: Option<WriteControl>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteControl {
+    required_revision_id: String,
 }
 
 /// One entry of a `batchUpdate`. Google's shape is an object with exactly
@@ -675,6 +1117,10 @@ struct BatchUpdate {
 struct DocRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     insert_text: Option<InsertText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_content_range: Option<DeleteContentRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_paragraph_style: Option<UpdateParagraphStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replace_all_text: Option<ReplaceAllText>,
 }
@@ -689,6 +1135,37 @@ struct InsertText {
 #[derive(Debug, Serialize)]
 struct Location {
     index: i64,
+}
+
+/// A half-open span of the document, counted the way Docs counts: in UTF-16
+/// code units from the start of the body.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Range {
+    start_index: i64,
+    end_index: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteContentRange {
+    range: Range,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateParagraphStyle {
+    range: Range,
+    paragraph_style: ParagraphStyle,
+    /// Only the named style is written. Alignment, spacing and indentation
+    /// are left exactly as the person set them.
+    fields: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParagraphStyle {
+    named_style_type: &'static str,
 }
 
 #[derive(Debug, Serialize)]

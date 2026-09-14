@@ -316,6 +316,7 @@ async fn a_content_uri_that_is_not_googles_is_refused_and_never_fetched() {
 
 const ARTICLE: &str = "1ArTiClEdOcIdExAmPlE0123456789abcdef";
 const ARTICLE_AT: &str = "/v1/documents/1ArTiClEdOcIdExAmPlE0123456789abcdef";
+const ARTICLE_BATCH: &str = "/v1/documents/1ArTiClEdOcIdExAmPlE0123456789abcdef:batchUpdate";
 /// What `docs_article.json` says the document is at.
 const REVISION: &str = "ALm37BW0Article1";
 /// The one paragraph every index in these tests is measured against. It holds
@@ -328,6 +329,11 @@ async fn article(h: &Harness) -> docs::Outline {
     h.mount_json("GET", ARTICLE_AT, fixture("docs_article.json"))
         .await;
     docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap()
+}
+
+async fn mount_batch(h: &Harness) {
+    h.mount_json("POST", ARTICLE_BATCH, fixture("docs_batch_update.json"))
+        .await;
 }
 
 #[tokio::test]
@@ -362,11 +368,17 @@ async fn paragraphs_are_numbered_in_body_order_through_table_cells() {
         ]
     );
     // The count is of characters, not of bytes and not of UTF-16 units.
-    assert_eq!(outline.paragraphs[2].chars(), 29);
+    assert_eq!(outline.paragraph(3).unwrap().chars(), 29);
+
+    for (ordinal, wanted) in [(6, "5 paragraphs"), (0, "numbered from 1")] {
+        let error = outline.paragraph(ordinal).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert!(error.to_string().contains(wanted), "{error}");
+    }
 }
 
-/// The arithmetic every index in this module rests on, over text that makes
-/// the three counts disagree.
+/// The arithmetic every index in this module rests on, in both directions and
+/// over text that makes the three counts disagree.
 #[test]
 fn indexes_are_utf16_code_units_and_convert_both_ways() {
     use docs::index;
@@ -378,15 +390,307 @@ fn indexes_are_utf16_code_units_and_convert_both_ways() {
     assert_eq!(index::len(""), 0);
     assert_eq!(index::len("😀😀"), 4);
 
-    // `już` starts at character 20 and at code unit 21, because the emoji
-    // before it is two units. A tool that counted characters would edit the
-    // middle of a word.
+    // `już` starts at character 20, byte 32 and code unit 21. A tool that
+    // counted characters or bytes would edit the middle of a word.
     assert_eq!(text.char_indices().nth(20).unwrap().1, 'j');
+    assert_eq!(index::from_bytes(text, 32), 21);
     assert_eq!(index::to_chars(text, 21), Some(20));
+
+    // The end of the text, and nothing past it.
     assert_eq!(index::to_chars(text, 24), Some(23));
     assert_eq!(index::to_chars(text, 25), None);
 
     // The emoji takes units 18 and 19, and 19 is half of a character.
     assert_eq!(index::to_chars(text, 18), Some(18));
     assert_eq!(index::to_chars(text, 19), None);
+}
+
+#[tokio::test]
+async fn an_edit_lands_on_the_utf16_index_of_the_occurrence_it_was_given() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    let plan = docs::plan_edit(&outline, REVISION, 3, "już", 2, "jutro", "Zażółć").unwrap();
+    assert_eq!(plan.paragraph, 3);
+    assert_eq!(plan.before, POLISH);
+    assert_eq!(plan.after, "Zażółć gęślą jaźń 😀 już i jutro");
+    docs::apply(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    // The second `już` starts at character 26 of the paragraph, which is unit
+    // 27, which is index 57 in the document. The deletion names the old word
+    // where the insertion before it has just pushed it: 57 + 5 for `jutro`.
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await,
+        json!({
+            "requests": [
+                {"insertText": {"text": "jutro", "location": {"index": 57}}},
+                {"deleteContentRange": {"range": {"startIndex": 62, "endIndex": 65}}}
+            ],
+            "writeControl": {"requiredRevisionId": REVISION}
+        })
+    );
+
+    // The first occurrence is a different place in the same paragraph, and
+    // the paragraph's two text runs are stitched into one string to find it.
+    let first = docs::plan_edit(&outline, REVISION, 3, "już", 1, "jutro", "Zażółć").unwrap();
+    assert_eq!(first.after, "Zażółć gęślą jaźń 😀 jutro i już");
+    docs::apply(&h.client, CONNECTION, ARTICLE, first)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([
+            {"insertText": {"text": "jutro", "location": {"index": 51}}},
+            {"deleteContentRange": {"range": {"startIndex": 56, "endIndex": 59}}}
+        ])
+    );
+
+    // An empty replacement is a deletion and nothing else.
+    let cut = docs::plan_edit(&outline, REVISION, 3, " i już", 1, "", "Zażółć").unwrap();
+    assert_eq!(cut.after, "Zażółć gęślą jaźń 😀 już");
+    docs::apply(&h.client, CONNECTION, ARTICLE, cut)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 54, "endIndex": 60}}}])
+    );
+
+    // A third occurrence of a word the paragraph holds twice is not written.
+    let error = docs::plan_edit(&outline, REVISION, 3, "już", 3, "jutro", "Zażółć").unwrap_err();
+    assert!(error.to_string().contains("holds 2"), "{error}");
+}
+
+#[tokio::test]
+async fn a_stale_revision_id_is_refused_and_nothing_is_sent() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    // Every write is guarded, and the guard fires before a request is built.
+    let refusals = [
+        docs::plan_edit(&outline, "ALm37BW0Older", 3, "już", 1, "jutro", "Zażółć").unwrap_err(),
+        docs::plan_style(&outline, "ALm37BW0Older", 2, "HEADING_3", "Część").unwrap_err(),
+        docs::plan_insert(
+            &outline,
+            "ALm37BW0Older",
+            docs::At::After(2),
+            "Nowy akapit",
+            None,
+            None,
+        )
+        .unwrap_err(),
+        // A write with no revision id at all is the same refusal.
+        docs::plan_style(&outline, "  ", 2, "HEADING_3", "Część").unwrap_err(),
+    ];
+    for error in &refusals {
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("docs_list_paragraphs"),
+            "{error}"
+        );
+    }
+    assert!(
+        refusals[0].to_string().contains("ALm37BW0Older"),
+        "{}",
+        refusals[0]
+    );
+    assert!(
+        refusals[0].to_string().contains(REVISION),
+        "{}",
+        refusals[0]
+    );
+
+    // The document was read and nothing else happened.
+    let posts: Vec<String> = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(posts.is_empty(), "{posts:?}");
+}
+
+/// The document may also move between the read and the write, which is the
+/// gap `writeControl` closes. Google's refusal is answered in the same words
+/// as the guard above, and never retried.
+#[tokio::test]
+async fn google_refusing_the_revision_asks_for_a_fresh_read_and_does_not_retry() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    Mock::given(method("POST"))
+        .and(path(ARTICLE_BATCH))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": 400,
+                "message": "Revision ID does not match the document's current revision ID.",
+                "status": "FAILED_PRECONDITION"
+            }
+        })))
+        .expect(1)
+        .named("one attempt, and no retry of a write")
+        .mount(&h.server)
+        .await;
+
+    let plan = docs::plan_style(&outline, REVISION, 2, "HEADING_3", "Część").unwrap();
+    let error = docs::apply(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("call docs_list_paragraphs again"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_expect_that_does_not_match_writes_nothing_and_says_what_it_found() {
+    let h = harness().await;
+    let outline = article(&h).await;
+
+    let error = docs::plan_edit(&outline, REVISION, 3, "już", 1, "jutro", "Koniec").unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("paragraph 3"), "{message}");
+    assert!(message.contains("\"Koniec\""), "{message}");
+    assert!(message.contains("Zażółć gęślą"), "{message}");
+
+    // The same lock on a restyle, and an empty `expect` is no lock at all.
+    assert!(docs::plan_style(&outline, REVISION, 2, "TITLE", "Koniec").is_err());
+    let empty = docs::plan_style(&outline, REVISION, 2, "TITLE", " ").unwrap_err();
+    assert!(empty.to_string().contains("`expect` is empty"), "{empty}");
+
+    // What it does match is the paragraph's own first words.
+    assert!(docs::plan_style(&outline, REVISION, 2, "TITLE", "Część pierwsza").is_ok());
+
+    let posts = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .count();
+    assert_eq!(posts, 0);
+}
+
+#[tokio::test]
+async fn a_restyle_writes_the_named_style_and_nothing_else() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    let plan = docs::plan_style(&outline, REVISION, 2, "heading 3", "Część").unwrap();
+    assert_eq!(
+        (plan.before.as_str(), plan.after.as_str()),
+        ("HEADING_2", "HEADING_3")
+    );
+    docs::apply(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await,
+        json!({
+            "requests": [{"updateParagraphStyle": {
+                "range": {"startIndex": 15, "endIndex": 30},
+                "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                "fields": "namedStyleType"
+            }}],
+            "writeControl": {"requiredRevisionId": REVISION}
+        })
+    );
+
+    // The last paragraph's range stops one short of the body's final newline,
+    // which is Docs' own and may not be written over.
+    let last = docs::plan_style(&outline, REVISION, 5, "SUBTITLE", "Koniec").unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, last)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"][0]["updateParagraphStyle"]["range"],
+        json!({"startIndex": 79, "endIndex": 86})
+    );
+
+    // A style Docs does not have is refused with the ones it does.
+    let error = docs::plan_style(&outline, REVISION, 2, "BODY_TEXT", "Część").unwrap_err();
+    assert!(error.to_string().contains("NORMAL_TEXT"), "{error}");
+    assert!(error.to_string().contains("HEADING_6"), "{error}");
+}
+
+#[tokio::test]
+async fn an_insert_carries_its_own_paragraph_break() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    // Before a paragraph: the text goes in at that paragraph's own index and
+    // ends with the break, so what was there stays a paragraph of its own.
+    let before = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::Before(1),
+        "Lead\n",
+        Some("SUBTITLE"),
+        Some("Wywiad"),
+    )
+    .unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, before)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([
+            {"insertText": {"text": "Lead\n", "location": {"index": 1}}},
+            {"updateParagraphStyle": {
+                "range": {"startIndex": 1, "endIndex": 5},
+                "paragraphStyle": {"namedStyleType": "SUBTITLE"},
+                "fields": "namedStyleType"
+            }}
+        ])
+    );
+
+    // After a paragraph in the middle: at the index the next paragraph starts.
+    let middle =
+        docs::plan_insert(&outline, REVISION, docs::At::After(2), "Akapit", None, None).unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, middle)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([{"insertText": {"text": "Akapit\n", "location": {"index": 30}}}])
+    );
+
+    // After the last paragraph the break comes first, because nothing may be
+    // written after the body's final newline.
+    let last = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(5),
+        "Nowy akapit",
+        Some("HEADING_2"),
+        None,
+    )
+    .unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, last)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([
+            {"insertText": {"text": "\nNowy akapit", "location": {"index": 86}}},
+            {"updateParagraphStyle": {
+                "range": {"startIndex": 87, "endIndex": 98},
+                "paragraphStyle": {"namedStyleType": "HEADING_2"},
+                "fields": "namedStyleType"
+            }}
+        ])
+    );
+
+    // Nothing to insert, and a paragraph that is not there.
+    assert!(docs::plan_insert(&outline, REVISION, docs::At::After(2), "\n\n", None, None).is_err());
+    assert!(
+        docs::plan_insert(&outline, REVISION, docs::At::After(9), "Akapit", None, None).is_err()
+    );
 }

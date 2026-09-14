@@ -351,6 +351,9 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("docs_create", needs(Service::Docs, Level::Write)),
     ("docs_append", needs(Service::Docs, Level::Write)),
     ("docs_replace_text", needs(Service::Docs, Level::Write)),
+    ("docs_insert_text", needs(Service::Docs, Level::Write)),
+    ("docs_edit_paragraph", needs(Service::Docs, Level::Write)),
+    ("docs_style_paragraph", needs(Service::Docs, Level::Write)),
     ("sheets_list_tabs", needs(Service::Sheets, Level::Read)),
     ("sheets_read_range", needs(Service::Sheets, Level::Read)),
     ("sheets_append_rows", needs(Service::Sheets, Level::Write)),
@@ -567,7 +570,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 46);
+        assert_eq!(TOOLS.len(), 49);
     }
 
     #[test]
@@ -601,7 +604,14 @@ mod tests {
         );
         assert_eq!(
             tools_of_scope(Scope::Service(Service::Docs, Level::Write)),
-            ["docs_create", "docs_append", "docs_replace_text"]
+            [
+                "docs_create",
+                "docs_append",
+                "docs_replace_text",
+                "docs_insert_text",
+                "docs_edit_paragraph",
+                "docs_style_paragraph",
+            ]
         );
     }
 

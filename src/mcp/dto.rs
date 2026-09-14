@@ -561,6 +561,25 @@ pub struct DocParagraphOut {
     pub truncated: bool,
 }
 
+/// What one paragraph write did, and what it invalidated by doing it.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocEditOut {
+    pub account: String,
+    pub doc_id: String,
+    pub url: String,
+    /// The paragraph the write was aimed at, as it was numbered when the
+    /// write was planned.
+    pub paragraph: usize,
+    /// What was written, in one line the model can repeat to the person.
+    pub written: String,
+    /// The text this write leaves behind: the changed paragraph, or the
+    /// inserted one.
+    pub text: String,
+    /// Always the same sentence: read the document again before writing to it
+    /// again.
+    pub next: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DocWriteOut {
     pub account: String,
