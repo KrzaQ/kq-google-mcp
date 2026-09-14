@@ -209,6 +209,9 @@ pub struct DocsCodeParam {
     pub code: String,
     /// The monospace font to set it in; Courier New by default
     pub font: Option<String>,
+    /// The point size for the whole listing, 1 to 400. Left out, the listing
+    /// takes the document's own size, which is usually 11
+    pub size_pt: Option<f64>,
     /// What to colour, and how. Offsets count characters from the start of
     /// `code`, spans may not overlap, and you work the tokens out yourself:
     /// this server highlights nothing.
@@ -1020,13 +1023,15 @@ impl Gmcp {
 
     #[tool(
         description = "Insert a code listing after the paragraph you name and colour it in one \
-                       write: the code as plain text, a monospace font over all of it, and one \
+                       write: the code as plain text, a monospace font at the size you name over \
+                       all of it, and one \
                        colour, bold or italic per span. A span is {start, end, colour, bold, \
                        italic}, where start and end count characters from the beginning of \
                        `code`. You work out where the tokens are: this server highlights nothing \
                        and takes no language. Spans may not overlap, may not be empty and may not \
                        run past the end of the code, and a colour is #rrggbb — a listing that \
-                       cannot be coloured completely is refused rather than half written. Pass \
+                       cannot be coloured completely is refused rather than half written. size_pt sets the whole listing, 1 to 400 \
+                       points; left out, it takes the document's own size. Pass \
                        the revision_id from docs_list_paragraphs and confirmed=true. One write \
                        moves every paragraph number and changes the revision id."
     )]
@@ -1054,7 +1059,10 @@ impl Gmcp {
             &p.revision_id,
             p.after_paragraph as usize,
             &p.code,
-            Some(&font),
+            docs::CodeStyle {
+                font: Some(&font),
+                size_pt: p.size_pt,
+            },
             &spans,
             p.expect.as_deref(),
         )

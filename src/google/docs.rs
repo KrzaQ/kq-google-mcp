@@ -1073,6 +1073,31 @@ pub fn plan_style(
     })
 }
 
+/// A point size Docs will take. The API refuses nothing here and simply
+/// renders what it is given, so an 800 pt listing would arrive as an 800 pt
+/// listing; the bounds are this server's, and they are the ones a magazine
+/// page can hold.
+fn font_size(points: f64) -> Result<Dimension> {
+    if !points.is_finite() || !(1.0..=400.0).contains(&points) {
+        return Err(Error::Unsupported(format!(
+            "{points} is not a font size this writes; give a size between 1 and 400 points"
+        )));
+    }
+    Ok(Dimension {
+        magnitude: points,
+        unit: "PT",
+    })
+}
+
+/// How a listing is set: the monospace font and the point size, both over
+/// the whole of it. They travel together because they are written together,
+/// in the one style request that covers the listing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CodeStyle<'a> {
+    pub font: Option<&'a str>,
+    pub size_pt: Option<f64>,
+}
+
 /// A code listing: the text, the monospace font over the whole of it, and one
 /// `updateTextStyle` per coloured span — all in the one batch, because a
 /// listing that arrived and was not coloured is worse than one that was
@@ -1082,10 +1107,11 @@ pub fn plan_code(
     revision_id: &str,
     after_paragraph: usize,
     code: &str,
-    font: Option<&str>,
+    style: CodeStyle<'_>,
     spans: &[Span],
     expect: Option<&str>,
 ) -> Result<Plan> {
+    let CodeStyle { font, size_pt } = style;
     outline.check_revision(revision_id)?;
     let body = code.trim_end_matches('\n');
     if body.trim().is_empty() {
@@ -1097,6 +1123,8 @@ pub fn plan_code(
         .map(str::trim)
         .filter(|f| !f.is_empty())
         .unwrap_or(CODE_FONT);
+    let size = size_pt;
+    let size_pt = size_pt.map(font_size).transpose()?;
     let neighbour = outline.paragraph(after_paragraph)?;
     if let Some(expect) = expect {
         neighbour.check_expect(expect)?;
@@ -1118,9 +1146,16 @@ pub fn plan_code(
                     weighted_font_family: Some(WeightedFontFamily {
                         font_family: font.to_string(),
                     }),
+                    font_size: size_pt,
                     ..TextStyle::default()
                 },
-                fields: "weightedFontFamily".to_string(),
+                // The size travels with the font: one style over the whole
+                // listing, so a listing is never half the size it asked for.
+                fields: match size {
+                    Some(_) => "weightedFontFamily,fontSize",
+                    None => "weightedFontFamily",
+                }
+                .to_string(),
             }),
             ..DocRequest::default()
         },
@@ -2059,6 +2094,8 @@ struct TextStyle {
     bold: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    font_size: Option<Dimension>,
 }
 
 #[derive(Debug, Serialize)]

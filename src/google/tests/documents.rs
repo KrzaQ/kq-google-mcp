@@ -492,7 +492,16 @@ async fn a_stale_revision_id_is_refused_and_nothing_is_sent() {
             None,
         )
         .unwrap_err(),
-        docs::plan_code(&outline, "ALm37BW0Older", 2, "let x = 1;", None, &[], None).unwrap_err(),
+        docs::plan_code(
+            &outline,
+            "ALm37BW0Older",
+            2,
+            "let x = 1;",
+            docs::CodeStyle::default(),
+            &[],
+            None,
+        )
+        .unwrap_err(),
         // A write with no revision id at all is the same refusal.
         docs::plan_style(&outline, "  ", 2, "HEADING_3", "Część").unwrap_err(),
     ];
@@ -745,7 +754,8 @@ async fn a_code_listing_is_written_and_coloured_in_one_batch() {
             italic: Some(true),
         },
     ];
-    let plan = docs::plan_code(&outline, REVISION, 2, CODE, None, &spans, Some("Część")).unwrap();
+    let plan =
+        docs::plan_code(&outline, REVISION, 2, CODE, pt(8.0), &spans, Some("Część")).unwrap();
     assert_eq!(plan.requests(), 4, "the text, the font and one per span");
     docs::apply(&h.client, CONNECTION, ARTICLE, plan)
         .await
@@ -761,8 +771,11 @@ async fn a_code_listing_is_written_and_coloured_in_one_batch() {
                 {"insertText": {"text": "let ż = \"😀\";\n", "location": {"index": 30}}},
                 {"updateTextStyle": {
                     "range": {"startIndex": 30, "endIndex": 43},
-                    "textStyle": {"weightedFontFamily": {"fontFamily": "Courier New"}},
-                    "fields": "weightedFontFamily"
+                    "textStyle": {
+                        "weightedFontFamily": {"fontFamily": "Courier New"},
+                        "fontSize": {"magnitude": 8.0, "unit": "PT"}
+                    },
+                    "fields": "weightedFontFamily,fontSize"
                 }},
                 {"updateTextStyle": {
                     "range": {"startIndex": 30, "endIndex": 33},
@@ -799,7 +812,16 @@ async fn a_listing_that_cannot_be_coloured_completely_is_refused() {
     let h = harness().await;
     let outline = article(&h).await;
     let plan = |spans: Vec<docs::Span>| {
-        docs::plan_code(&outline, REVISION, 2, CODE, None, &spans, None).unwrap_err()
+        docs::plan_code(
+            &outline,
+            REVISION,
+            2,
+            CODE,
+            docs::CodeStyle::default(),
+            &spans,
+            None,
+        )
+        .unwrap_err()
     };
 
     let overlap = plan(vec![span(0, 5), span(3, 8)]);
@@ -855,15 +877,42 @@ async fn a_listing_that_cannot_be_coloured_completely_is_refused() {
             REVISION,
             2,
             CODE,
-            None,
+            docs::CodeStyle::default(),
             &[span(0, 3), span(3, 8)],
             None
         )
         .is_ok()
     );
-    let plain =
-        docs::plan_code(&outline, REVISION, 2, CODE, Some("Roboto Mono"), &[], None).unwrap();
+    // A size Docs would render but no page could hold is refused here, and
+    // so is one that is not a number at all.
+    for bad in [0.0, 400.5, f64::NAN] {
+        assert!(
+            docs::plan_code(&outline, REVISION, 2, CODE, pt(bad), &[], None).is_err(),
+            "{bad} was accepted"
+        );
+    }
+    let plain = docs::plan_code(
+        &outline,
+        REVISION,
+        2,
+        CODE,
+        docs::CodeStyle {
+            font: Some("Roboto Mono"),
+            size_pt: Some(8.0),
+        },
+        &[],
+        None,
+    )
+    .unwrap();
     assert_eq!(plain.requests(), 2);
+}
+
+/// A listing set at a size and left to the default font.
+fn pt(size: f64) -> docs::CodeStyle<'static> {
+    docs::CodeStyle {
+        font: None,
+        size_pt: Some(size),
+    }
 }
 
 // ----- reading the formatting back -------------------------------------------
