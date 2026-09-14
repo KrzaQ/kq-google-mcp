@@ -224,3 +224,75 @@ async fn a_doc_is_made_out_of_markdown_in_one_multipart_upload() {
     assert!(body.contains("Content-Type: text/csv"), "{body}");
     assert!(body.contains("\"parents\":[]"), "{body}");
 }
+
+#[tokio::test]
+async fn comments_are_asked_for_with_the_replies_and_the_quoted_text() {
+    let h = harness().await;
+    h.mount_json(
+        "GET",
+        "/drive/v3/files/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc/comments",
+        fixture("drive_comments.json"),
+    )
+    .await;
+
+    let read = drive::comments(
+        &h.client,
+        CONNECTION,
+        "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc",
+    )
+    .await
+    .unwrap();
+    assert!(!read.more, "the fixture is one whole page");
+    assert_eq!(read.threads.len(), 3);
+
+    let first = &read.threads[0];
+    assert_eq!(first.author.as_deref(), Some("marta@example.test"));
+    assert_eq!(first.text, "Is this the number before or after the refund?");
+    assert_eq!(
+        first.quoted_text.as_deref(),
+        Some("Revenue held up in September.")
+    );
+    assert!(!first.resolved);
+    // The replies come back in the order the thread reads.
+    let replies: Vec<&str> = first.replies.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(replies, ["After.", "Then say so in the sentence."]);
+    assert_eq!(
+        first.replies[0].author.as_deref(),
+        Some("anna@example.test")
+    );
+    assert_eq!(
+        first.replies[1].created_time.unwrap().to_rfc3339(),
+        "2026-09-03T10:05:00+00:00"
+    );
+
+    assert!(read.threads[1].resolved);
+    // A comment on the whole file is anchored to nothing, and an author Google
+    // gives no address for is named the way a person is.
+    assert_eq!(read.threads[2].quoted_text, None);
+    assert_eq!(read.threads[2].author.as_deref(), Some("Redakcja"));
+
+    // Drive's default projection carries neither the replies nor the text a
+    // comment is anchored to, so the call names the fields it needs.
+    let query: std::collections::HashMap<_, _> = h
+        .last(
+            "GET",
+            "/drive/v3/files/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789doc/comments",
+        )
+        .await
+        .url
+        .query_pairs()
+        .into_owned()
+        .collect();
+    let fields = &query["fields"];
+    assert!(fields.contains("replies("), "{fields}");
+    assert!(fields.contains("quotedFileContent"), "{fields}");
+    assert!(fields.contains("resolved"), "{fields}");
+    assert!(
+        fields.contains("author(displayName,emailAddress)"),
+        "{fields}"
+    );
+    assert!(fields.contains("nextPageToken"), "{fields}");
+    assert_eq!(query["pageSize"], "100");
+    // Nothing here asks for the deleted comments, whose content Google strips.
+    assert!(!query.contains_key("includeDeleted"));
+}

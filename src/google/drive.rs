@@ -25,6 +25,19 @@ const FILE_FIELDS: &str =
 /// How many files a search returns when the caller does not say.
 pub const DEFAULT_MAX_FILES: u32 = 25;
 
+/// The fields a comment thread is asked for. Two of them are the reason this
+/// list exists at all: the default projection carries neither the replies nor
+/// `quotedFileContent`, which is the text the comment is anchored to. Drive
+/// also refuses `comments.list` outright when no `fields` is given.
+const COMMENT_FIELDS: &str = "id,createdTime,modifiedTime,resolved,\
+     author(displayName,emailAddress),content,quotedFileContent(value),\
+     replies(id,createdTime,author(displayName,emailAddress),content)";
+
+/// How many comment threads one page carries. Drive's own maximum, asked for
+/// whatever the caller wants, because the resolved threads are dropped after
+/// the page arrives and a small page would hide the open ones behind them.
+const COMMENT_PAGE_SIZE: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileMeta {
     pub id: String,
@@ -207,6 +220,63 @@ pub async fn get(client: &Client, connection_id: i64, file_id: &str) -> Result<F
     Ok(wire.into())
 }
 
+/// One comment thread in the margin of a file, with the replies under it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Comment {
+    pub id: String,
+    /// Who wrote it, as an address where Google gives one and as the display
+    /// name otherwise, which is how a file's owners are reported too.
+    pub author: Option<String>,
+    pub created_time: Option<DateTime<Utc>>,
+    pub modified_time: Option<DateTime<Utc>>,
+    pub text: String,
+    /// The text of the file the comment is anchored to. Absent on a comment
+    /// somebody left on the file as a whole.
+    pub quoted_text: Option<String>,
+    /// True when one of the replies resolved the thread.
+    pub resolved: bool,
+    pub replies: Vec<Reply>,
+}
+
+/// One reply under a comment, oldest first as Drive answers them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Reply {
+    pub id: String,
+    pub author: Option<String>,
+    pub created_time: Option<DateTime<Utc>>,
+    pub text: String,
+}
+
+/// One page of comment threads, and whether Drive had more to give.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comments {
+    pub threads: Vec<Comment>,
+    /// True when the file has more threads than the one page this read. The
+    /// tool says so rather than letting a model believe it has the whole
+    /// margin.
+    pub more: bool,
+}
+
+/// `comments.list`: the margin of a file, read and never written. Deleted
+/// comments are left out, because Google answers them with their content
+/// stripped and a thread with no text in it is nothing to read.
+pub async fn comments(client: &Client, connection_id: i64, file_id: &str) -> Result<Comments> {
+    let request = client
+        .get(&format!("drive/v3/files/{}/comments", urlencode(file_id)))?
+        .query(&[
+            (
+                "fields",
+                format!("comments({COMMENT_FIELDS}),nextPageToken"),
+            ),
+            ("pageSize", COMMENT_PAGE_SIZE.to_string()),
+        ]);
+    let wire: WireCommentList = client.json(connection_id, request).await?;
+    Ok(Comments {
+        more: wire.next_page_token.is_some(),
+        threads: wire.comments.into_iter().map(Into::into).collect(),
+    })
+}
+
 /// `files.get?alt=media`, the bytes of a file that has bytes. The response is
 /// handed back unread so the download route can stream it.
 pub async fn download(client: &Client, connection_id: i64, file_id: &str) -> Result<Download> {
@@ -355,6 +425,74 @@ struct WireOwner {
     email_address: Option<String>,
 }
 
+impl WireOwner {
+    /// The address if Google gave one, and the display name otherwise.
+    fn name(self) -> Option<String> {
+        self.email_address.or(self.display_name)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireCommentList {
+    comments: Vec<WireComment>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireComment {
+    id: String,
+    created_time: Option<DateTime<Utc>>,
+    modified_time: Option<DateTime<Utc>>,
+    resolved: bool,
+    author: Option<WireOwner>,
+    content: String,
+    quoted_file_content: Option<WireQuoted>,
+    replies: Vec<WireReply>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireQuoted {
+    value: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireReply {
+    id: String,
+    created_time: Option<DateTime<Utc>>,
+    author: Option<WireOwner>,
+    content: String,
+}
+
+impl From<WireComment> for Comment {
+    fn from(w: WireComment) -> Self {
+        Comment {
+            id: w.id,
+            author: w.author.and_then(WireOwner::name),
+            created_time: w.created_time,
+            modified_time: w.modified_time,
+            text: w.content,
+            quoted_text: w.quoted_file_content.map(|q| q.value),
+            resolved: w.resolved,
+            replies: w.replies.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<WireReply> for Reply {
+    fn from(w: WireReply) -> Self {
+        Reply {
+            id: w.id,
+            author: w.author.and_then(WireOwner::name),
+            created_time: w.created_time,
+            text: w.content,
+        }
+    }
+}
+
 impl From<WireFile> for FileMeta {
     fn from(w: WireFile) -> Self {
         FileMeta {
@@ -363,11 +501,7 @@ impl From<WireFile> for FileMeta {
             mime_type: w.mime_type,
             modified_time: w.modified_time,
             size: w.size.and_then(|s| s.parse().ok()),
-            owners: w
-                .owners
-                .into_iter()
-                .filter_map(|o| o.email_address.or(o.display_name))
-                .collect(),
+            owners: w.owners.into_iter().filter_map(WireOwner::name).collect(),
             web_view_link: w.web_view_link,
             parents: w.parents,
         }

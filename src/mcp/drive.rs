@@ -55,6 +55,16 @@ pub struct ExportParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommentsParam {
+    pub account: String,
+    pub file_id: String,
+    /// Also return the threads somebody has already resolved; default false
+    pub include_resolved: Option<bool>,
+    /// How many threads to return; default 50, at most 100
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadTextParam {
     pub account: String,
     pub file_id: String,
@@ -266,6 +276,81 @@ impl Gmcp {
             &bytes,
         )
     }
+
+    #[tool(
+        description = "The comments on a Google Doc, Sheet or any other Drive file: for each \
+                       thread who wrote it and when, the text it is anchored to, and its replies \
+                       oldest first. Read the margin before you edit a document somebody else is \
+                       also writing. Threads somebody has resolved are left out unless \
+                       include_resolved is true. This reads only: no tool here writes a comment, \
+                       a reply or a suggestion, so answer a comment by telling the person what it \
+                       says and what you changed."
+    )]
+    async fn drive_list_comments(
+        &self,
+        Parameters(p): Parameters<CommentsParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::CommentsOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Drive).await?;
+        let file_id = p.file_id.trim();
+        let include_resolved = p.include_resolved.unwrap_or(false);
+        let max = capped(p.max, 50, 100) as usize;
+        let read = drive::comments(&self.google()?.client, connection.id, file_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+
+        let all = read.threads.len();
+        let mut threads: Vec<drive::Comment> = read
+            .threads
+            .into_iter()
+            .filter(|c| include_resolved || !c.resolved)
+            .collect();
+        let resolved = all - threads.len();
+        let over = threads.len().saturating_sub(max);
+        threads.truncate(max);
+        Ok(Json(dto::CommentsOut {
+            account: connection.label,
+            file_id: file_id.to_string(),
+            count: threads.len(),
+            comments: threads
+                .into_iter()
+                .map(|c| dto::CommentOut::new(c, call.tz))
+                .collect(),
+            note: comments_note(resolved, over, read.more),
+        }))
+    }
+}
+
+/// What the answer leaves out, in the one line a model reads before it decides
+/// it has the whole margin.
+fn comments_note(resolved: usize, over: usize, more: bool) -> Option<String> {
+    let mut said: Vec<String> = Vec::new();
+    if resolved > 0 {
+        said.push(format!(
+            "{resolved} resolved {} not shown; pass include_resolved=true to read {}",
+            plural(resolved, "thread is", "threads are"),
+            plural(resolved, "it", "them")
+        ));
+    }
+    if over > 0 {
+        said.push(format!(
+            "{over} more {} left out by `max`; raise it to see {}",
+            plural(over, "thread was", "threads were"),
+            plural(over, "it", "them")
+        ));
+    }
+    if more {
+        said.push(
+            "this file has more comments than one call reads, and only the first hundred \
+             threads were looked at"
+                .to_string(),
+        );
+    }
+    (!said.is_empty()).then(|| said.join(". "))
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 /// A time argument, once it has been read, and the one thing the tool's reply

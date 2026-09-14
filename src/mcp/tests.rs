@@ -3187,6 +3187,109 @@ async fn drive_view_image_downscales_the_file_it_was_pointed_at() {
     assert!(refused.contains("drive_read_text"), "{refused}");
 }
 
+#[tokio::test]
+async fn drive_list_comments_reads_the_margin_on_the_persons_clock() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{DOC}/comments"),
+        fixture("drive_comments.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["drive:read"]).await;
+
+    let out = c
+        .ok(
+            "drive_list_comments",
+            json!({"account": "work", "file_id": DOC}),
+        )
+        .await;
+    // The resolved thread is left out, and the answer says so rather than
+    // letting a model believe the margin holds two comments.
+    assert_eq!(out["count"], 2);
+    assert_eq!(out["file_id"], DOC);
+    let note = out["note"].as_str().unwrap();
+    assert!(note.contains("1 resolved thread is not shown"), "{note}");
+    assert!(note.contains("include_resolved=true"), "{note}");
+
+    let first = &out["comments"][0];
+    assert_eq!(first["author"], "marta@example.test");
+    assert_eq!(
+        first["text"],
+        "Is this the number before or after the refund?"
+    );
+    assert_eq!(first["quoted_text"], "Revenue held up in September.");
+    assert_eq!(first["resolved"], false);
+    // Stored as UTC, read on the person's clock: September in Warsaw is +02:00.
+    assert_eq!(first["created_time"], "2026-09-03T11:12:00+02:00");
+    assert_eq!(first["modified_time"], "2026-09-03T12:05:00+02:00");
+
+    // The replies are the thread as it reads, oldest first.
+    let replies = first["replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["text"], "After.");
+    assert_eq!(replies[0]["author"], "anna@example.test");
+    assert_eq!(replies[0]["created_time"], "2026-09-03T11:40:00+02:00");
+    assert_eq!(replies[1]["text"], "Then say so in the sentence.");
+    assert_eq!(replies[1]["created_time"], "2026-09-03T12:05:00+02:00");
+
+    // A comment on the whole file is anchored to nothing at all.
+    assert!(out["comments"][1]["quoted_text"].is_null(), "{out}");
+    assert_eq!(out["comments"][1]["author"], "Redakcja");
+
+    // Asked for, the resolved thread comes back with the rest and nothing is
+    // left to say.
+    let all = c
+        .ok(
+            "drive_list_comments",
+            json!({"account": "work", "file_id": DOC, "include_resolved": true}),
+        )
+        .await;
+    assert_eq!(all["count"], 3);
+    assert_eq!(all["comments"][1]["resolved"], true);
+    assert_eq!(all["comments"][1]["text"], "Title case here, please.");
+    assert!(all["note"].is_null(), "{all}");
+
+    // `max` cuts the list and says how much it cut.
+    let one = c
+        .ok(
+            "drive_list_comments",
+            json!({"account": "work", "file_id": DOC, "max": 1}),
+        )
+        .await;
+    assert_eq!(one["count"], 1);
+    let note = one["note"].as_str().unwrap();
+    assert!(note.contains("1 more thread was left out"), "{note}");
+}
+
+#[tokio::test]
+async fn drive_list_comments_is_refused_before_google_without_the_drive_service() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let anna = user(&db, "anna", "anna@example.test").await;
+    connect(&db, &anna, "work", &["gmail"], true).await;
+    let (_, secret) = token(&db, &["drive:read"], Some(&anna), ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    let refused = c
+        .refused(
+            "drive_list_comments",
+            json!({"account": "work", "file_id": DOC}),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        "connection `work` has no `drive` service; it was connected with `gmail`. \
+         The person can add it by reconnecting the account at https://gmcp.example/connections"
+    );
+    // Refused here and not by Google: nothing was sent at all, not even the
+    // refresh every call starts with.
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 // ----- docs -------------------------------------------------------------------
 
 #[tokio::test]

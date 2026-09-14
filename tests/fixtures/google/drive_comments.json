@@ -1,0 +1,74 @@
+{
+  "comments": [
+    {
+      "id": "AAABc1comment",
+      "createdTime": "2026-09-03T09:12:00.000Z",
+      "modifiedTime": "2026-09-03T10:05:00.000Z",
+      "resolved": false,
+      "author": {
+        "displayName": "Marta Nowak",
+        "emailAddress": "marta@example.test"
+      },
+      "content": "Is this the number before or after the refund?",
+      "quotedFileContent": {
+        "value": "Revenue held up in September."
+      },
+      "replies": [
+        {
+          "id": "AAABc1reply1",
+          "createdTime": "2026-09-03T09:40:00.000Z",
+          "author": {
+            "displayName": "Anna Kowalska",
+            "emailAddress": "anna@example.test"
+          },
+          "content": "After."
+        },
+        {
+          "id": "AAABc1reply2",
+          "createdTime": "2026-09-03T10:05:00.000Z",
+          "author": {
+            "displayName": "Marta Nowak",
+            "emailAddress": "marta@example.test"
+          },
+          "content": "Then say so in the sentence."
+        }
+      ]
+    },
+    {
+      "id": "AAABc2comment",
+      "createdTime": "2026-09-02T07:00:00.000Z",
+      "modifiedTime": "2026-09-02T08:30:00.000Z",
+      "resolved": true,
+      "author": {
+        "displayName": "Anna Kowalska",
+        "emailAddress": "anna@example.test"
+      },
+      "content": "Title case here, please.",
+      "quotedFileContent": {
+        "value": "Q3 report"
+      },
+      "replies": [
+        {
+          "id": "AAABc2reply1",
+          "createdTime": "2026-09-02T08:30:00.000Z",
+          "author": {
+            "displayName": "Marta Nowak",
+            "emailAddress": "marta@example.test"
+          },
+          "content": "Done."
+        }
+      ]
+    },
+    {
+      "id": "AAABc3comment",
+      "createdTime": "2026-09-01T06:15:00.000Z",
+      "modifiedTime": "2026-09-01T06:15:00.000Z",
+      "resolved": false,
+      "author": {
+        "displayName": "Redakcja"
+      },
+      "content": "The whole piece needs a deck.",
+      "replies": []
+    }
+  ]
+}

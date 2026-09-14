@@ -449,6 +449,76 @@ impl FileOut {
     }
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CommentsOut {
+    pub account: String,
+    pub file_id: String,
+    /// How many threads are in `comments`, after the resolved ones were left
+    /// out.
+    pub count: usize,
+    pub comments: Vec<CommentOut>,
+    /// Present when there is something about this answer a model must not
+    /// assume away: threads that were hidden, or more of them than one read
+    /// can carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CommentOut {
+    pub comment_id: String,
+    /// Who wrote it: the Google address, or the display name when Google
+    /// gives no address.
+    pub author: Option<String>,
+    pub created_time: Option<String>,
+    pub modified_time: Option<String>,
+    /// The text of the file this comment is anchored to. Absent on a comment
+    /// about the whole file.
+    pub quoted_text: Option<String>,
+    pub resolved: bool,
+    pub text: String,
+    /// Oldest first, as the thread reads.
+    pub replies: Vec<CommentReplyOut>,
+}
+
+impl CommentOut {
+    pub fn new(c: drive::Comment, tz: Tz) -> Self {
+        Self {
+            comment_id: c.id,
+            author: c.author,
+            created_time: instant(c.created_time, tz),
+            modified_time: instant(c.modified_time, tz),
+            quoted_text: c.quoted_text,
+            resolved: c.resolved,
+            text: c.text,
+            replies: c
+                .replies
+                .into_iter()
+                .map(|r| CommentReplyOut::new(r, tz))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CommentReplyOut {
+    pub reply_id: String,
+    pub author: Option<String>,
+    pub created_time: Option<String>,
+    pub text: String,
+}
+
+impl CommentReplyOut {
+    pub fn new(r: drive::Reply, tz: Tz) -> Self {
+        Self {
+            reply_id: r.id,
+            author: r.author,
+            created_time: instant(r.created_time, tz),
+            text: r.text,
+        }
+    }
+}
+
 // ----- docs ------------------------------------------------------------------
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
