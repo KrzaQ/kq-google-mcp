@@ -83,7 +83,9 @@ fn instructions(portal: &str) -> String {
          docs_edit_paragraph, docs_style_paragraph or docs_insert_code, and call it again after \
          every write, because one write moves both. docs_read answers the words and no \
          formatting at all, so read a colour, a font or a weight back with \
-         docs_read_formatting.\n\
+         docs_read_formatting. A picture goes into a document the same way a file goes into a \
+         draft: mint a URL with docs_upload_link, POST the picture to it yourself, and pass the \
+         upload_id to docs_insert_image.\n\
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \

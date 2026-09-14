@@ -951,3 +951,118 @@ async fn a_listing_reads_back_with_its_colours_and_its_font() {
         assert_eq!(run.style.size, Some(10.0));
     }
 }
+
+// ----- a picture ---------------------------------------------------------------
+
+/// The URL Google is handed. In production this server mints it and Google
+/// fetches it while the batch is in flight; the plan only carries it.
+const PICTURE_URL: &str = "https://gmcp.example/dl/heldUpload0000000000";
+
+fn picture(width_pt: Option<f64>, height_pt: Option<f64>) -> docs::NewImage<'static> {
+    docs::NewImage {
+        uri: PICTURE_URL,
+        width_pt,
+        height_pt,
+        label: "wykres.png",
+    }
+}
+
+#[tokio::test]
+async fn a_picture_is_inserted_into_a_paragraph_of_its_own() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    // After a paragraph in the middle: the break goes in at the index the
+    // next paragraph starts, and the picture goes inside the paragraph the
+    // break has just made.
+    let middle = docs::plan_image(
+        &outline,
+        REVISION,
+        2,
+        &picture(Some(300.0), None),
+        Some("Część"),
+    )
+    .unwrap();
+    assert_eq!(middle.after, "wykres.png");
+    docs::apply(&h.client, CONNECTION, ARTICLE, middle)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([
+            {"insertText": {"text": "\n", "location": {"index": 30}}},
+            {"insertInlineImage": {
+                "uri": PICTURE_URL,
+                "location": {"index": 30},
+                "objectSize": {"width": {"magnitude": 300.0, "unit": "PT"}}
+            }}
+        ])
+    );
+
+    // After the last paragraph the break comes first, because nothing may be
+    // written after the body's final newline.
+    let last = docs::plan_image(
+        &outline,
+        REVISION,
+        5,
+        &picture(Some(300.0), Some(200.0)),
+        None,
+    )
+    .unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, last)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([
+            {"insertText": {"text": "\n", "location": {"index": 86}}},
+            {"insertInlineImage": {
+                "uri": PICTURE_URL,
+                "location": {"index": 87},
+                "objectSize": {
+                    "width": {"magnitude": 300.0, "unit": "PT"},
+                    "height": {"magnitude": 200.0, "unit": "PT"}
+                }
+            }}
+        ])
+    );
+
+    // Neither side given is no objectSize at all, which is Docs' own way of
+    // saying the picture keeps the size it is.
+    let own_size = docs::plan_image(&outline, REVISION, 2, &picture(None, None), None).unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, own_size)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"][1]["insertInlineImage"],
+        json!({"uri": PICTURE_URL, "location": {"index": 30}})
+    );
+
+    // The two locks and a measurement Docs would refuse, each of them before
+    // anything is sent.
+    let sent = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.url.path() == ARTICLE_BATCH)
+        .count();
+    for refused in [
+        docs::plan_image(&outline, "ALm37BW0Older", 2, &picture(None, None), None),
+        docs::plan_image(&outline, REVISION, 2, &picture(None, None), Some("Koniec")),
+        docs::plan_image(&outline, REVISION, 9, &picture(None, None), None),
+        docs::plan_image(&outline, REVISION, 2, &picture(Some(0.0), None), None),
+        docs::plan_image(&outline, REVISION, 2, &picture(Some(-10.0), None), None),
+        docs::plan_image(&outline, REVISION, 2, &picture(None, Some(f64::NAN)), None),
+    ] {
+        assert!(matches!(refused, Err(Error::Unsupported(_))), "{refused:?}");
+    }
+    assert_eq!(
+        h.requests()
+            .await
+            .iter()
+            .filter(|r| r.url.path() == ARTICLE_BATCH)
+            .count(),
+        sent
+    );
+}

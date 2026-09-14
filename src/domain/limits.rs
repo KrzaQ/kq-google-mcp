@@ -35,6 +35,14 @@ pub const UPLOAD_TTL_MINUTES: i64 = 60;
 /// carry. Gmail's own limit for a whole message.
 pub const ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
+/// The largest picture Docs will fetch for `insertInlineImage`, and the most
+/// pixels it will take. Google's own two numbers, checked here so a picture
+/// past either is refused before a call is spent on it. The staging route's
+/// [`ATTACHMENT_MAX_BYTES`] is the smaller of the two byte caps and so is
+/// what a file actually meets first.
+pub const INSERT_IMAGE_MAX_BYTES: usize = 50 * 1024 * 1024;
+pub const INSERT_IMAGE_MAX_PIXELS: u64 = 25_000_000;
+
 /// Serialised tool arguments are cut to this before they reach the log.
 pub const AUDIT_ARGS_MAX_BYTES: usize = 4096;
 /// How long a browser session lasts, and how recently a delegate token's

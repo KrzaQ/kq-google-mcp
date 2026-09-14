@@ -96,6 +96,24 @@ pub struct StagedFile {
     pub bytes: Vec<u8>,
 }
 
+/// A staged file taken out of reach of the draft tools and held for a
+/// download link to serve.
+///
+/// The Docs API cannot take image bytes: `insertInlineImage` takes a URI and
+/// Google fetches it, so a picture has to be reachable from Google's own
+/// servers for the length of the call. [`Staging::hold`] is how a staged file
+/// becomes that: the entry leaves `staged`, so the upload id is spent exactly
+/// as attaching it to a draft would spend it, and the bytes stay on disk under
+/// a new id that only the link row knows, until the link's own life runs out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldUpload {
+    /// What the link's target names. Not the upload id: that one is spent.
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: usize,
+}
+
 /// Why a draft could not have the files it asked for. Nothing is taken when
 /// one of these is answered: a draft carries all of its files or none.
 #[derive(Debug)]
@@ -116,9 +134,10 @@ impl fmt::Display for TakeError {
         match self {
             Self::Unknown(id) => write!(
                 f,
-                "there is no staged upload `{id}`; it was never uploaded, it has expired, or it \
-                 belongs to somebody else. Mint a fresh link with gmail_upload_link, post the \
-                 file to it again and use the upload_id it answers"
+                "there is no staged upload `{id}`; it was never uploaded, it has expired, it was \
+                 already used, or it belongs to somebody else. Mint a fresh link with \
+                 gmail_upload_link for a draft or docs_upload_link for a document, post the file \
+                 to it again and use the upload_id it answers"
             ),
             Self::TooLarge { files } => {
                 let total: usize = files.iter().map(|(_, size)| size).sum();
@@ -156,6 +175,9 @@ pub struct Staging {
     dir: PathBuf,
     tickets: Mutex<HashMap<String, Ticket>>,
     staged: Mutex<HashMap<String, Staged>>,
+    /// The files a download link is serving, keyed by the id in its target.
+    /// They are out of `staged` and so out of reach of every draft tool.
+    held: Mutex<HashMap<String, Staged>>,
 }
 
 impl Staging {
@@ -187,6 +209,7 @@ impl Staging {
             dir,
             tickets: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
         }
     }
 
@@ -302,6 +325,80 @@ impl Staging {
         Ok(files)
     }
 
+    /// One staged file, read without being spent. A tool that has to look at
+    /// the bytes before it decides — at an image header, to see how many
+    /// pixels it really has — reads it this way, so that a refusal leaves the
+    /// upload id good for the next attempt.
+    pub fn peek(&self, user_id: i64, id: &str) -> Result<StagedFile, TakeError> {
+        let entry = {
+            let staged = self.staged.lock().expect("the staged lock");
+            one(&staged, user_id, id, Utc::now())?.1
+        };
+        let bytes = std::fs::read(&entry.path).map_err(|e| TakeError::Io(e.to_string()))?;
+        Ok(StagedFile {
+            filename: entry.filename,
+            mime_type: entry.mime_type,
+            bytes,
+        })
+    }
+
+    /// Take one staged file out of reach of the draft tools and hold it for a
+    /// download link to serve. The upload id is spent, exactly as attaching
+    /// the file to a draft spends it, and the bytes stay where they are under
+    /// the fresh id this answers.
+    ///
+    /// The hold lives as long as the link does. Nothing renews it: Google
+    /// fetches the picture while the `batchUpdate` that names it is in flight,
+    /// which is the same tool call that minted the link.
+    pub fn hold(&self, user_id: i64, id: &str) -> Result<HeldUpload, TakeError> {
+        let now = Utc::now();
+        self.sweep(now);
+        let (staged_id, mut entry) = {
+            let mut staged = self.staged.lock().expect("the staged lock");
+            let found = one(&staged, user_id, id, now)?;
+            staged.remove(&found.0);
+            found
+        };
+        entry.expires_at = link::expires_at(now);
+        let held = HeldUpload {
+            id: link::new_id(),
+            filename: entry.filename.clone(),
+            mime_type: entry.mime_type.clone(),
+            size: entry.size,
+        };
+        tracing::info!(
+            "holding {} ({}) for a download link as {}",
+            entry.filename,
+            staged_id,
+            held.id
+        );
+        self.held
+            .lock()
+            .expect("the held lock")
+            .insert(held.id.clone(), entry);
+        Ok(held)
+    }
+
+    /// The bytes behind a held upload, for the download route. Reading does
+    /// not remove it: the link's own use counter is what spends it, and
+    /// Google may well ask twice.
+    pub fn held(&self, id: &str) -> Option<StagedFile> {
+        let entry = {
+            let held = self.held.lock().expect("the held lock");
+            held.get(id.trim())
+                .filter(|entry| entry.expires_at > Utc::now())
+                .cloned()?
+        };
+        let bytes = std::fs::read(&entry.path)
+            .inspect_err(|e| tracing::warn!("reading the held upload {id}: {e}"))
+            .ok()?;
+        Some(StagedFile {
+            filename: entry.filename,
+            mime_type: entry.mime_type,
+            bytes,
+        })
+    }
+
     /// What the named uploads weigh, and what they are called, without taking
     /// them. A draft that is rebuilt around the files it already carries has
     /// to know what the new ones add up to before it writes anything, and
@@ -315,25 +412,15 @@ impl Staging {
             .collect())
     }
 
-    /// Everything past its time: tickets nobody used, and files nobody
-    /// attached.
+    /// Everything past its time: tickets nobody used, files nobody attached,
+    /// and files a link finished with or never served.
     fn sweep(&self, now: DateTime<Utc>) {
         self.tickets
             .lock()
             .expect("the ticket lock")
             .retain(|_, ticket| ticket.expires_at > now);
-        let gone: Vec<Staged> = {
-            let mut staged = self.staged.lock().expect("the staged lock");
-            let expired: Vec<String> = staged
-                .iter()
-                .filter(|(_, entry)| entry.expires_at <= now)
-                .map(|(id, _)| id.clone())
-                .collect();
-            expired
-                .iter()
-                .filter_map(|id| staged.remove(id))
-                .collect::<Vec<_>>()
-        };
+        let mut gone = expired(&self.staged, now);
+        gone.extend(expired(&self.held, now));
         for entry in gone {
             remove(&entry.path);
         }
@@ -376,6 +463,30 @@ fn find(
         }
     }
     Ok(found)
+}
+
+/// Everything in one of the two maps whose time has run out, taken out of it.
+fn expired(entries: &Mutex<HashMap<String, Staged>>, now: DateTime<Utc>) -> Vec<Staged> {
+    let mut entries = entries.lock().expect("a staging lock");
+    let past: Vec<String> = entries
+        .iter()
+        .filter(|(_, entry)| entry.expires_at <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    past.iter().filter_map(|id| entries.remove(id)).collect()
+}
+
+/// The one entry an id stands for, for the two callers that take a single
+/// upload rather than a draft's worth of them. Nothing is removed here.
+fn one(
+    staged: &HashMap<String, Staged>,
+    user_id: i64,
+    id: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, Staged), TakeError> {
+    find(staged, user_id, std::slice::from_ref(&id.to_string()), now)?
+        .pop()
+        .ok_or_else(|| TakeError::Unknown(id.trim().to_string()))
 }
 
 fn remove(path: &FsPath) {
@@ -678,6 +789,53 @@ mod tests {
         let restarted = dir.staging();
         assert!(files_in(restarted.dir()).is_empty());
         assert!(restarted.take(7, &[id]).is_err());
+    }
+
+    /// The path a picture takes into a document: read without being spent,
+    /// then held for the link Google fetches it from.
+    #[test]
+    fn a_held_upload_leaves_the_staging_store_and_waits_for_its_link() {
+        use crate::domain::limits::LINK_TTL_MINUTES;
+
+        let dir = TempDir::new();
+        let staging = dir.staging();
+        let now = Utc::now();
+        let ticket = staging.mint(new_upload(7, "wykres.png"), now);
+        let ticket = staging.take_ticket(&ticket.id, now).unwrap();
+        let (id, _) = staging.store(ticket, b"the picture".to_vec(), now).unwrap();
+
+        // Reading is not taking: a tool that has to look at the header before
+        // it decides leaves the id good for the next attempt.
+        let seen = staging.peek(7, &id).unwrap();
+        assert_eq!(seen.bytes, b"the picture");
+        assert_eq!(seen.filename, "wykres.png");
+        assert_eq!(seen.mime_type, "image/png");
+        assert!(staging.peek(8, &id).is_err(), "not somebody else's to read");
+        assert!(staging.peek(7, &id).is_ok(), "and still there afterwards");
+
+        // Holding is taking: the upload id is spent exactly as attaching the
+        // file to a draft spends it, and the link's id is a different one.
+        let held = staging.hold(7, &id).unwrap();
+        assert_ne!(held.id, id);
+        assert_eq!(held.filename, "wykres.png");
+        assert_eq!(held.size, 11);
+        assert!(staging.peek(7, &id).is_err());
+        assert!(staging.take(7, std::slice::from_ref(&id)).is_err());
+
+        // The bytes stay where they were, and the link may read them more
+        // than once: its own use counter is what spends it.
+        assert_eq!(files_in(staging.dir()).len(), 1);
+        assert_eq!(staging.held(&held.id).unwrap().bytes, b"the picture");
+        assert_eq!(staging.held(&held.id).unwrap().filename, "wykres.png");
+        assert!(staging.held("neverheld00000000000").is_none());
+
+        // And a hold does not outlive the link it was made for.
+        staging.mint(
+            new_upload(7, "next.png"),
+            now + TimeDelta::minutes(LINK_TTL_MINUTES + 1),
+        );
+        assert!(staging.held(&held.id).is_none());
+        assert!(files_in(staging.dir()).is_empty());
     }
 
     #[test]

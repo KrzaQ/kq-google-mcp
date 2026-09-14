@@ -935,10 +935,14 @@ impl Attaching {
     /// Mint a URL with the tool and POST the bytes to it, the way an agent
     /// does with curl. The upload id is what a draft tool takes.
     async fn upload(&mut self, filename: &str, bytes: &[u8]) -> Value {
-        let minted = self
-            .client
-            .ok("gmail_upload_link", json!({"filename": filename}))
-            .await;
+        self.upload_with("gmail_upload_link", json!({"filename": filename}), bytes)
+            .await
+    }
+
+    /// The same three steps, for whichever tool mints the ticket and whatever
+    /// the file is called.
+    async fn upload_with(&mut self, tool: &str, args: Value, bytes: &[u8]) -> Value {
+        let minted = self.client.ok(tool, args).await;
         let url = minted["url"].as_str().expect("a URL").to_string();
         let path = url.strip_prefix("https://gmcp.example").expect(&url);
         let request = Request::builder()
@@ -956,6 +960,23 @@ impl Attaching {
         std::fs::read_dir(&self.dir)
             .map(|entries| entries.count())
             .unwrap_or(0)
+    }
+
+    /// GET one of this server's own URLs, the way the person with the link
+    /// does — or, for a picture on its way into a document, the way Google
+    /// does.
+    async fn fetch(&self, url: &str) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+        let path = url.strip_prefix("https://gmcp.example").expect(url);
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec(), headers)
     }
 }
 
@@ -4056,6 +4077,246 @@ async fn docs_read_formatting_answers_runs_a_span_can_be_written_from() {
         )
         .await;
     assert!(refused.contains("once"), "{refused}");
+    drop(server);
+}
+
+// ----- a picture in a document ------------------------------------------------
+
+/// A small PNG, the size a diagram actually is. `png()` is 1600x1200 and slow
+/// to encode; nothing about these tests needs it to be large.
+fn small_png(width: u32, height: u32) -> Vec<u8> {
+    use image::{ImageFormat, Rgb, RgbImage};
+    let img = RgbImage::from_fn(width, height, |x, y| {
+        Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    bytes.into_inner()
+}
+
+/// The article, on a router whose staging directory this test owns.
+async fn inserting(db: &Db, server: &MockServer) -> Attaching {
+    Attaching::new(db, server, &["docs:read", "docs:write"]).await
+}
+
+async fn upload_picture(a: &mut Attaching, filename: &str, bytes: &[u8]) -> Value {
+    a.upload_with("docs_upload_link", json!({"filename": filename}), bytes)
+        .await
+}
+
+/// The whole path: a ticket, the bytes, a preview that writes nothing, and
+/// then one batchUpdate whose picture Google can actually fetch.
+#[tokio::test]
+async fn docs_insert_image_puts_a_staged_picture_where_google_can_fetch_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut a = inserting(&db, &server).await;
+    let picture = small_png(320, 240);
+
+    let uploaded = upload_picture(&mut a, "wykres.png", &picture).await;
+    assert_eq!(uploaded["mime_type"], "image/png");
+    assert_eq!(a.staged_files(), 1);
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                      "upload_id": uploaded["upload_id"], "width_pt": 300,
+                      "expect": "Część", "revision_id": ARTICLE_REVISION});
+
+    let shown = a
+        .client
+        .ok("docs_insert_image", confirming(&args, false))
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("wykres.png"), "{lines}");
+    assert!(lines.contains("320×240 pixels"), "{lines}");
+    assert!(lines.contains("300 points wide"), "{lines}");
+    assert!(lines.contains("no alt text"), "{lines}");
+    // A preview spends nothing: the file is still staged and the id still works.
+    assert_eq!(a.staged_files(), 1);
+    assert_eq!(batch_calls(&server).await, 0);
+
+    let out = a
+        .client
+        .ok("docs_insert_image", confirming(&args, true))
+        .await;
+    assert_eq!(out["paragraph"], 2);
+    assert_eq!(out["text"], "wykres.png");
+    assert!(
+        out["written"].as_str().unwrap().contains("wykres.png"),
+        "{out}"
+    );
+
+    // The batch is the break and the picture, in that order, in one write
+    // guarded by the revision the read answered with.
+    let body = last_batch(&server).await;
+    let requests = body["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2, "{body}");
+    assert_eq!(
+        requests[0]["insertText"],
+        json!({"text": "\n", "location": {"index": 30}})
+    );
+    assert_eq!(
+        requests[1]["insertInlineImage"]["location"],
+        json!({"index": 30})
+    );
+    assert_eq!(
+        requests[1]["insertInlineImage"]["objectSize"],
+        json!({"width": {"magnitude": 300.0, "unit": "PT"}})
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], ARTICLE_REVISION);
+
+    // And the URI Google was handed is a download link on this server that
+    // serves the bytes that were staged.
+    let uri = requests[1]["insertInlineImage"]["uri"].as_str().unwrap();
+    assert!(uri.starts_with("https://gmcp.example/dl/"), "{uri}");
+    let (status, body, headers) = a.fetch(uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, picture);
+    assert_eq!(headers.get("content-type").unwrap(), "image/png");
+
+    // The link is spent like any other: three fetches and then nothing, and
+    // the upload id is gone whether or not it is fetched again.
+    for _ in 0..2 {
+        assert_eq!(a.fetch(uri).await.0, StatusCode::OK);
+    }
+    assert_eq!(a.fetch(uri).await.0, StatusCode::NOT_FOUND);
+    let refused = a
+        .client
+        .refused("docs_insert_image", confirming(&args, true))
+        .await;
+    assert!(refused.contains("there is no staged upload"), "{refused}");
+    assert!(refused.contains("docs_upload_link"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+/// A file Docs would not fetch, refused before a call is spent on it.
+#[tokio::test]
+async fn a_file_docs_cannot_hold_is_refused_before_any_call() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut a = inserting(&db, &server).await;
+
+    // A PDF, named as one by the uploader.
+    let pdf = upload_picture(&mut a, "raport.pdf", b"%PDF-1.7 not a picture").await;
+    let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                      "upload_id": pdf["upload_id"], "revision_id": ARTICLE_REVISION,
+                      "confirmed": true});
+    let refused = a.client.refused("docs_insert_image", args).await;
+    assert!(refused.contains("application/pdf"), "{refused}");
+    assert!(refused.contains("image/png"), "{refused}");
+    // The upload survives a refusal, so the same file can be converted and
+    // the id used again.
+    assert_eq!(a.staged_files(), 1);
+
+    // A picture whose header claims more pixels than Docs takes. The bytes
+    // are a real PNG header and nothing else: the count is read from it
+    // rather than from what the caller said.
+    let vast = upload_picture(&mut a, "mapa.png", &png_claiming(6000, 5000)).await;
+    let refused = a
+        .client
+        .refused(
+            "docs_insert_image",
+            json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                   "upload_id": vast["upload_id"], "revision_id": ARTICLE_REVISION,
+                   "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("6000×5000"), "{refused}");
+    assert!(refused.contains("25 megapixels"), "{refused}");
+    drop(server);
+}
+
+/// A PNG header claiming a size, and nothing behind it. Small enough to be a
+/// test and large enough to be refused.
+fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+    let mut ihdr = b"IHDR".to_vec();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    for chunk in [ihdr, b"IDAT".to_vec(), b"IEND".to_vec()] {
+        out.extend_from_slice(&((chunk.len() - 4) as u32).to_be_bytes());
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&crc32(&chunk).to_be_bytes());
+    }
+    out
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+/// The two locks, and somebody else's file. None of the three writes, and
+/// none of them spends the upload.
+#[tokio::test]
+async fn a_picture_is_not_inserted_on_a_stale_read_or_somebody_elses_upload() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut anna = inserting(&db, &server).await;
+    let uploaded = upload_picture(&mut anna, "wykres.png", &small_png(64, 48)).await;
+
+    // A revision that has moved on: the document is read, the plan is built
+    // and refused, and nothing is sent.
+    let stale = anna
+        .client
+        .refused(
+            "docs_insert_image",
+            json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                   "upload_id": uploaded["upload_id"], "revision_id": "ALm37BW0Older",
+                   "confirmed": true}),
+        )
+        .await;
+    assert!(stale.contains("changed since it was read"), "{stale}");
+    assert_eq!(anna.staged_files(), 1, "a refusal spends no upload");
+
+    // `expect` against the wrong paragraph, the same.
+    let wrong = anna
+        .client
+        .refused(
+            "docs_insert_image",
+            json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                   "upload_id": uploaded["upload_id"], "expect": "Koniec",
+                   "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(wrong.contains("does not start with"), "{wrong}");
+    assert_eq!(anna.staged_files(), 1);
+
+    // And a second person, on the same server and so the same staging store,
+    // cannot put Anna's file in their own document.
+    let marta = user(&db, "marta", "marta@example.test").await;
+    connect(&db, &marta, "marta-work", &["docs"], false).await;
+    let (_, secret) = token(
+        &db,
+        &["docs:read", "docs:write"],
+        Some(&marta),
+        ClientProfile::Generic,
+    )
+    .await;
+    let mut hers = Client::new(anna.app.clone(), secret);
+    hers.initialize().await;
+    let refused = hers
+        .refused(
+            "docs_insert_image",
+            json!({"account": "marta-work", "doc_id": ARTICLE, "after_paragraph": 2,
+                   "upload_id": uploaded["upload_id"], "revision_id": ARTICLE_REVISION,
+                   "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("there is no staged upload"), "{refused}");
+    assert_eq!(anna.staged_files(), 1, "and it is still Anna's");
     drop(server);
 }
 

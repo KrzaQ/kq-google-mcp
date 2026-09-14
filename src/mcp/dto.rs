@@ -645,8 +645,8 @@ pub struct DocEditOut {
     pub paragraph: usize,
     /// What was written, in one line the model can repeat to the person.
     pub written: String,
-    /// The text this write leaves behind: the changed paragraph, or the
-    /// inserted one.
+    /// The text this write leaves behind: the changed paragraph, the
+    /// inserted one, or the name of the picture that was put in.
     pub text: String,
     /// Always the same sentence: read the document again before writing to it
     /// again.

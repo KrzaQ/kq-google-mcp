@@ -87,6 +87,8 @@ text_enum! {
         DriveDownload => "drive_download",
         DriveExport => "drive_export",
         DocsImage => "docs_image",
+        // A file the agent staged, held for the moment Google fetches it.
+        Upload => "upload",
     }
 }
 

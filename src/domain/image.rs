@@ -15,10 +15,11 @@ use std::io::Cursor;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageFormat, RgbImage};
+use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 
 use super::limits::{
     IMAGE_LONG_SIDE, IMAGE_LONG_SIDE_CLAUDE_CODE, IMAGE_MAX_BYTES, IMAGE_MAX_BYTES_CLAUDE_CODE,
+    INSERT_IMAGE_MAX_BYTES, INSERT_IMAGE_MAX_PIXELS,
 };
 use crate::db::ClientProfile;
 
@@ -227,6 +228,53 @@ fn link_only(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+// ----- what a document may hold ----------------------------------------------
+
+/// Why a staged file cannot be put into a document. Google fetches the
+/// picture itself and answers one unhelpful error for every reason it will
+/// not take it, so each of these is decided here, before the call is spent.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InsertError {
+    #[error("{0:?} is not a kind of picture a document can hold")]
+    Format(String),
+    #[error("the picture is {} bytes", .0)]
+    TooLarge(usize),
+    #[error("the picture is {0}×{1} pixels")]
+    TooManyPixels(u32, u32),
+    #[error("the picture could not be read: {0}")]
+    Unreadable(String),
+}
+
+/// What Docs fetches for a picture in a document, in the order a person reads
+/// them out. Google takes these three and refuses everything else.
+pub const INSERTABLE: [&str; 3] = ["image/png", "image/jpeg", "image/gif"];
+
+/// Whether a staged file may go into a document, and how large it is in
+/// pixels when it may.
+///
+/// The type is what the upload said it was; the pixel count is read from the
+/// picture's own header rather than believed, because nothing the caller says
+/// about a file's dimensions has to be true. Only the header is decoded, so a
+/// picture is never held twice in memory to be measured.
+pub fn insertable(mime_type: &str, bytes: &[u8]) -> Result<(u32, u32), InsertError> {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    if !INSERTABLE.contains(&mime_type.as_str()) {
+        return Err(InsertError::Format(mime_type));
+    }
+    if bytes.len() > INSERT_IMAGE_MAX_BYTES {
+        return Err(InsertError::TooLarge(bytes.len()));
+    }
+    let (width, height) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| InsertError::Unreadable(e.to_string()))?
+        .into_dimensions()
+        .map_err(|e| InsertError::Unreadable(e.to_string()))?;
+    if u64::from(width) * u64::from(height) > INSERT_IMAGE_MAX_PIXELS {
+        return Err(InsertError::TooManyPixels(width, height));
+    }
+    Ok((width, height))
+}
+
 fn label(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Avif => "AVIF",
@@ -392,6 +440,83 @@ mod tests {
                 .to_string()
                 .contains("link only")
         );
+    }
+
+    /// A PNG whose header claims a size, and nothing behind the header. The
+    /// pixel check reads the header and stops there, so this is what a
+    /// picture too large to make in a test looks like on the wire.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        // 8 bits a channel, truecolour, and no interlacing.
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        for chunk in [ihdr, b"IDAT".to_vec(), b"IEND".to_vec()] {
+            let length = (chunk.len() - 4) as u32;
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(&chunk);
+            out.extend_from_slice(&crc32(&chunk).to_be_bytes());
+        }
+        out
+    }
+
+    /// The one PNG chunks are checked with. Written out here because the
+    /// header above has to be a real one: a decoder that refuses the chunk
+    /// would never reach the size the test is about.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    /// What a document may hold, decided before a call is spent on it.
+    #[test]
+    fn a_picture_docs_would_refuse_is_refused_here_first() {
+        let png = png_claiming(800, 600);
+        assert_eq!(insertable("image/png", &png), Ok((800, 600)));
+        // The type is folded and trimmed, because an uploader writes it.
+        assert_eq!(insertable("  IMAGE/PNG ", &png), Ok((800, 600)));
+
+        // Docs fetches three kinds of picture and nothing else, whatever this
+        // server can decode: WebP and PDF both go out here.
+        for kind in ["image/webp", "application/pdf", "image/svg+xml", ""] {
+            assert_eq!(
+                insertable(kind, &png),
+                Err(InsertError::Format(kind.to_string())),
+                "{kind}"
+            );
+        }
+
+        // Over 25 megapixels, read from the header rather than believed.
+        assert_eq!(
+            insertable("image/png", &png_claiming(5001, 5001)),
+            Err(InsertError::TooManyPixels(5001, 5001))
+        );
+        assert_eq!(
+            insertable("image/png", &png_claiming(5000, 5000)),
+            Ok((5000, 5000))
+        );
+
+        // Over 50 MB, before anything is decoded. The staging route's own
+        // 25 MB cap is what a file meets first in practice, so this one is
+        // the belt rather than the braces.
+        let huge = vec![0u8; INSERT_IMAGE_MAX_BYTES + 1];
+        assert_eq!(
+            insertable("image/png", &huge),
+            Err(InsertError::TooLarge(huge.len()))
+        );
+
+        // Bytes that are not the picture the upload called them.
+        assert!(matches!(
+            insertable("image/png", b"not a picture at all"),
+            Err(InsertError::Unreadable(_))
+        ));
     }
 
     #[test]

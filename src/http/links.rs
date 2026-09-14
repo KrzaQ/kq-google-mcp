@@ -56,6 +56,15 @@ pub enum Target {
         doc_id: String,
         object_id: String,
     },
+    /// A file the agent staged, held by this process for as long as the link
+    /// lives. Nothing here lives in Google: the Docs API cannot take image
+    /// bytes, `insertInlineImage` takes a URI and Google fetches it, so a
+    /// picture on its way into a document needs a URL Google's own servers
+    /// can reach for the length of the call, and this is it. The id names the
+    /// held file, never the upload id the model saw, which is spent by then.
+    Upload {
+        upload_id: String,
+    },
 }
 
 impl Target {
@@ -65,6 +74,7 @@ impl Target {
             Self::DriveDownload { .. } => LinkKind::DriveDownload,
             Self::DriveExport { .. } => LinkKind::DriveExport,
             Self::DocsImage { .. } => LinkKind::DocsImage,
+            Self::Upload { .. } => LinkKind::Upload,
         }
     }
 
@@ -81,6 +91,7 @@ impl Target {
             Self::DocsImage { doc_id, object_id } => {
                 json!({ "doc_id": doc_id, "object_id": object_id })
             }
+            Self::Upload { upload_id } => json!({ "upload_id": upload_id }),
         }
     }
 
@@ -111,6 +122,9 @@ impl Target {
             LinkKind::DocsImage => Ok(Self::DocsImage {
                 doc_id: field("doc_id")?,
                 object_id: field("object_id")?,
+            }),
+            LinkKind::Upload => Ok(Self::Upload {
+                upload_id: field("upload_id")?,
             }),
         }
     }
@@ -313,8 +327,12 @@ async fn stream(
     user_id: Option<i64>,
     ip: Option<String>,
 ) -> ApiResult<Response> {
-    let google = state.google().ok_or_else(ApiError::google_unconfigured)?;
+    // Google is looked up where it is needed rather than once at the top: a
+    // link to a staged file is served out of this process and a deployment
+    // with no Google credentials must still be able to serve one.
+    let google = || state.google().ok_or_else(ApiError::google_unconfigured);
     let target = Target::from_row(link).map_err(ApiError::internal)?;
+    let from_google = !matches!(target, Target::Upload { .. });
     let (body, length) = match target {
         // Gmail hands attachments back base64 inside JSON, so there is nothing
         // to stream: the bytes are whole before the first one is sent.
@@ -323,7 +341,7 @@ async fn stream(
             attachment_id,
         } => {
             let bytes = gmail::get_attachment(
-                &google.client,
+                &google()?.client,
                 link.connection_id,
                 &message_id,
                 &attachment_id,
@@ -333,11 +351,12 @@ async fn stream(
             (Body::from(bytes), Some(length))
         }
         Target::DriveDownload { file_id } => {
-            let file = drive::download(&google.client, link.connection_id, &file_id).await?;
+            let file = drive::download(&google()?.client, link.connection_id, &file_id).await?;
             streamed(file)?
         }
         Target::DriveExport { file_id, format } => {
-            let file = drive::export(&google.client, link.connection_id, &file_id, format).await?;
+            let file =
+                drive::export(&google()?.client, link.connection_id, &file_id, format).await?;
             streamed(file)?
         }
         // The picture is found again on every hit. Google's `contentUri` lives
@@ -346,12 +365,26 @@ async fn stream(
         // object id is what stays true, so the current URL is read out of the
         // document each time rather than stored with the link.
         Target::DocsImage { doc_id, object_id } => {
+            let google = google()?;
             let held = docs::images(&google.client, link.connection_id, &doc_id).await?;
             let picture = docs::open_image(&google.client, held.find(&object_id)?).await?;
             streamed(picture)?
         }
+        // The one target that is not in Google at all. The bytes are on this
+        // host, staged by the agent and held for this link; a hit after the
+        // process restarted finds nothing, which is the same 404 as a link
+        // that expired.
+        Target::Upload { upload_id } => {
+            let file = state
+                .staging
+                .held(&upload_id)
+                .ok_or_else(ApiError::not_found)?;
+            let length = file.bytes.len() as u64;
+            (Body::from(file.bytes), Some(length))
+        }
     };
-    if let Err(e) = state.db.touch_connection_used(link.connection_id).await {
+    // Only a hit that actually reached Google says the connection was used.
+    if from_google && let Err(e) = state.db.touch_connection_used(link.connection_id).await {
         tracing::warn!("connection {}: {e}", link.connection_id);
     }
     audit::record(
@@ -531,6 +564,9 @@ mod tests {
             Target::DocsImage {
                 doc_id: "1PiC".into(),
                 object_id: "kix.chart".into(),
+            },
+            Target::Upload {
+                upload_id: "heldUpload0000000000".into(),
             },
         ] {
             let row = Link {

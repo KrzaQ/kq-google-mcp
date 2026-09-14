@@ -24,9 +24,12 @@ use super::dto::{self, Confirmable, PreviewOut};
 use super::gmail::link_out;
 use super::images::{self, Kind, Source};
 use super::{Call, Gmcp, api_err, bad, cap_text};
+use crate::domain::image;
+use crate::domain::limits::{INSERT_IMAGE_MAX_BYTES, INSERT_IMAGE_MAX_PIXELS};
 use crate::domain::scope::Service;
 use crate::google::{docs, drive, text};
 use crate::http::links::{self, NewDownload, Target};
+use crate::http::uploads;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocsReadParam {
@@ -216,6 +219,41 @@ pub struct DocsCodeParam {
     pub revision_id: String,
     /// Must be true to write. Call with false first and show the person the
     /// code.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsUploadLinkParam {
+    /// What to call the file, e.g. "wykres.png". Docs gives a picture no name
+    /// of its own, so this names it only while it is on its way in.
+    pub filename: String,
+    /// What the file is: image/png, image/jpeg or image/gif. Left out, the
+    /// filename decides
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsInsertImageParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Put the picture after this paragraph, as docs_list_paragraphs numbers
+    /// them
+    pub after_paragraph: u32,
+    /// The upload_id you read back from POSTing the file to a docs_upload_link
+    /// URL
+    pub upload_id: String,
+    /// How wide on the page, in points; 72 points is an inch. Left out, Docs
+    /// uses the picture's own size.
+    pub width_pt: Option<f64>,
+    /// How tall on the page, in points. Give one of the two and Docs works
+    /// the other out from the picture.
+    pub height_pt: Option<f64>,
+    /// What the paragraph you named starts with. Optional, and worth passing.
+    pub expect: Option<String>,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person which
+    /// picture goes where.
     pub confirmed: bool,
 }
 
@@ -1039,6 +1077,220 @@ impl Gmcp {
             next: REREAD.to_string(),
         })))
     }
+
+    #[tool(
+        description = "A URL to upload one picture to, so a Google Doc can hold it. Putting a \
+                       picture in a document takes three steps and you do the middle one \
+                       yourself: call this, then POST the bytes to the `url` it answers \
+                       (`curl --data-binary @picture.png URL`), then pass the `upload_id` you \
+                       read back to docs_insert_image. This server cannot read a file on your \
+                       machine, so uploading it is the only way. Docs holds PNG, JPEG and GIF and \
+                       nothing else. There is no `account` here because a staged file belongs to \
+                       you and not to a document: docs_insert_image decides which document it \
+                       lands in. The URL takes one upload and lives 15 minutes; the file itself \
+                       waits an hour to be used and is forgotten once it is. This is the Docs \
+                       twin of gmail_upload_link — same staging, its own name — and either one's \
+                       upload_id works only with the tools of its own service."
+    )]
+    async fn docs_upload_link(
+        &self,
+        Parameters(p): Parameters<DocsUploadLinkParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::UploadLinkOut>, ErrorData> {
+        let filename = p.filename.trim();
+        if filename.is_empty() {
+            return Err(bad("filename is empty; name the file you are uploading"));
+        }
+        let minted = uploads::mint(
+            &self.state,
+            uploads::NewUpload {
+                user_id: call.principal.user().id,
+                token_id: self.token_id(&call)?,
+                filename: filename.to_string(),
+                mime_type: p.content_type.clone(),
+            },
+        );
+        Ok(Json(dto::UploadLinkOut {
+            url: minted.url,
+            filename: minted.filename,
+            expires_at: dto::at_zone(minted.expires_at, call.tz),
+            note: "POST the picture to this URL as the whole request body — \
+                   `curl --data-binary @/path/to/picture.png URL` — and pass the upload_id it \
+                   answers to docs_insert_image. The URL works once and for 15 minutes."
+                .into(),
+        }))
+    }
+
+    #[tool(
+        description = "Put a picture into a Google Doc, as its own new paragraph after the \
+                       paragraph you name. Upload it first with docs_upload_link and pass the \
+                       upload_id here. PNG, JPEG and GIF only, at most 25 megapixels — Docs takes \
+                       nothing else and the picture is measured here rather than believed, so a \
+                       file Docs would refuse is refused before any call is made. width_pt and \
+                       height_pt say how large it is on the page, 72 points to the inch; give one \
+                       and Docs works the other out, give neither and the picture keeps its own \
+                       size. There is no alt text: the Docs API has no request that sets it, so \
+                       the person adds it in Docs. The Docs API cannot take image bytes either — \
+                       it takes a URL and Google fetches it — so this server mints an \
+                       unguessable download link for the length of the one call and the picture \
+                       is served from there. Pass the revision_id from docs_list_paragraphs and \
+                       confirmed=true after the person has seen the preview. The upload is spent \
+                       by a confirmed call, so upload the picture again to insert it twice. One \
+                       write moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_insert_image(
+        &self,
+        Parameters(p): Parameters<DocsInsertImageParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let upload_id = p.upload_id.trim().to_string();
+        let user_id = call.principal.user().id;
+        // The picture is read without being spent, so that a refusal below
+        // leaves the upload_id good for the next attempt. What it is comes
+        // from its own header and not from what the upload was called.
+        let staged = self
+            .state
+            .staging
+            .peek(user_id, &upload_id)
+            .map_err(|e| bad(e.to_string()))?;
+        let (width, height) = image::insertable(&staged.mime_type, &staged.bytes)
+            .map_err(|e| refuse_picture(&staged.filename, e))?;
+        let described = format!(
+            "{} ({}, {}, {width}×{height} pixels)",
+            staged.filename,
+            staged.mime_type,
+            uploads::megabytes(staged.bytes.len())
+        );
+        let sized = match (p.width_pt, p.height_pt) {
+            (None, None) => "at the size the picture itself is".to_string(),
+            (Some(w), None) => format!("{w} points wide"),
+            (None, Some(h)) => format!("{h} points tall"),
+            (Some(w), Some(h)) => format!("{w} by {h} points"),
+        };
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        // The whole plan is built once before the upload is spent on it, so a
+        // stale revision or an `expect` that does not match refuses with the
+        // file still staged. The URI is empty here because this plan is never
+        // sent: the confirmed write builds it again around the real link.
+        let checked = docs::plan_image(
+            &outline,
+            &p.revision_id,
+            p.after_paragraph as usize,
+            &docs::NewImage {
+                uri: "",
+                width_pt: p.width_pt,
+                height_pt: p.height_pt,
+                label: &staged.filename,
+            },
+            p.expect.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "insert a picture after paragraph {} of the Google Doc {doc_id} in `{}`",
+                    checked.paragraph, connection.label
+                ),
+                vec![
+                    format!(
+                        "paragraph {} reads now: {}",
+                        checked.paragraph,
+                        first_lines(&checked.before)
+                    ),
+                    format!("the picture is {described}"),
+                    format!("it goes in {sized}, with no alt text, as its own new paragraph"),
+                    "Google fetches the picture from a short-lived link this server mints for \
+                     that one call; nothing is written now"
+                        .to_string(),
+                ],
+            ))));
+        }
+        // From here the upload is spent: it leaves the staging store and is
+        // held for the link, which is the only thing that can read it.
+        let held = self
+            .state
+            .staging
+            .hold(user_id, &upload_id)
+            .map_err(|e| bad(e.to_string()))?;
+        let minted = links::mint(
+            &self.state,
+            user_id,
+            NewDownload {
+                connection_id: connection.id,
+                token_id: self.token_id(&call)?,
+                target: Target::Upload {
+                    upload_id: held.id.clone(),
+                },
+                filename: held.filename.clone(),
+                mime_type: held.mime_type.clone(),
+                size: i64::try_from(held.size).ok(),
+            },
+        )
+        .await
+        .map_err(api_err)?;
+        let plan = docs::plan_image(
+            &outline,
+            &p.revision_id,
+            p.after_paragraph as usize,
+            &docs::NewImage {
+                uri: &minted.url,
+                width_pt: p.width_pt,
+                height_pt: p.height_pt,
+                label: &held.filename,
+            },
+            p.expect.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let (paragraph, index) = (plan.paragraph, plan.index);
+        docs::apply(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "the picture {described} was inserted after paragraph {paragraph} at index \
+                 {index}, {sized}"
+            ),
+            text: held.filename,
+            next: REREAD.to_string(),
+        })))
+    }
+}
+
+/// Why a staged file cannot go into a document, in the words that say what to
+/// do about it. The three caps are Google's own; this server checks them so
+/// that a call is never spent on a picture Docs was going to refuse, and so
+/// that the answer names the one thing that was wrong.
+fn refuse_picture(filename: &str, e: image::InsertError) -> ErrorData {
+    let cap = match &e {
+        image::InsertError::Format(_) => format!(
+            "a document holds {} and nothing else; upload it again, converted, and say which \
+             with docs_upload_link's content_type",
+            image::INSERTABLE.join(", ")
+        ),
+        image::InsertError::TooLarge(_) => format!(
+            "Docs fetches at most {}",
+            uploads::megabytes(INSERT_IMAGE_MAX_BYTES)
+        ),
+        image::InsertError::TooManyPixels(..) => format!(
+            "Docs takes at most {} megapixels; scale the picture down and upload it again",
+            INSERT_IMAGE_MAX_PIXELS / 1_000_000
+        ),
+        image::InsertError::Unreadable(_) => {
+            "the bytes are not the picture the upload said they were".to_string()
+        }
+    };
+    bad(format!(
+        "{filename}: {e}. {cap}. Nothing was written and no call was made to Google"
+    ))
 }
 
 /// How much of one paragraph a listing shows when `full` is not set. Enough

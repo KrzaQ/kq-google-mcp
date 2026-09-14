@@ -1089,6 +1089,92 @@ pub fn plan_code(
     })
 }
 
+/// A picture on its way into a document.
+///
+/// Docs has no request that takes image bytes and none that sets alt text, so
+/// there are exactly three things to say about a picture: where Google may
+/// fetch it and how large it should be on the page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewImage<'a> {
+    /// A URL Google's own servers can reach while the batch is in flight.
+    pub uri: &'a str,
+    /// How large on the page, in points. Docs works the other side out from
+    /// the picture itself when only one is given, and uses the picture's own
+    /// size when neither is.
+    pub width_pt: Option<f64>,
+    pub height_pt: Option<f64>,
+    /// What to call it in the plan. This never reaches Google.
+    pub label: &'a str,
+}
+
+/// A picture as a new paragraph after the paragraph a caller numbered: the
+/// break, then `insertInlineImage` inside it, in the one batch.
+///
+/// Google fetches `uri` itself while this call is in flight, so the URL has to
+/// be reachable from outside for that moment. It is not checked here — this
+/// server mints it — and a preview passes an empty one, because a preview
+/// builds the same plan and sends none of it.
+pub fn plan_image(
+    outline: &Outline,
+    revision_id: &str,
+    after_paragraph: usize,
+    image: &NewImage<'_>,
+    expect: Option<&str>,
+) -> Result<Plan> {
+    outline.check_revision(revision_id)?;
+    let neighbour = outline.paragraph(after_paragraph)?;
+    if let Some(expect) = expect {
+        neighbour.check_expect(expect)?;
+    }
+    let size = object_size(image)?;
+    // The body is empty: what this insert carries is the paragraph break, and
+    // the picture goes inside the paragraph the break makes.
+    let (index, payload, image_at) = outline.insertion(At::After(after_paragraph), neighbour, "");
+    Ok(Plan {
+        paragraph: after_paragraph,
+        before: neighbour.text.clone(),
+        after: image.label.to_string(),
+        index: image_at,
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![
+            insert_request(index, &payload),
+            DocRequest {
+                insert_inline_image: Some(InsertInlineImage {
+                    uri: image.uri.to_string(),
+                    location: Location { index: image_at },
+                    object_size: size,
+                }),
+                ..DocRequest::default()
+            },
+        ],
+    })
+}
+
+/// How large the picture is told to be, or nothing at all when the caller
+/// said nothing. A measurement Docs would refuse is refused here instead.
+fn object_size(image: &NewImage<'_>) -> Result<Option<ObjectSize>> {
+    for (magnitude, side) in [(image.width_pt, "width_pt"), (image.height_pt, "height_pt")] {
+        if let Some(magnitude) = magnitude
+            && !(magnitude.is_finite() && magnitude > 0.0)
+        {
+            return Err(Error::Unsupported(format!(
+                "{side} is {magnitude}; a picture is measured in points and has to be more than \
+                 zero. Leave both out to keep the picture's own size"
+            )));
+        }
+    }
+    let dimension = |magnitude: Option<f64>| {
+        magnitude.map(|magnitude| Dimension {
+            magnitude,
+            unit: "PT",
+        })
+    };
+    match (dimension(image.width_pt), dimension(image.height_pt)) {
+        (None, None) => Ok(None),
+        (width, height) => Ok(Some(ObjectSize { width, height })),
+    }
+}
+
 /// Each span as a pair of UTF-16 offsets into the code, or the first reason
 /// the set of them cannot be written: a span that is empty, one that runs
 /// past the end of the code, or two that overlap. Nothing is built until they
@@ -1474,6 +1560,36 @@ struct DocRequest {
     update_text_style: Option<UpdateTextStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replace_all_text: Option<ReplaceAllText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert_inline_image: Option<InsertInlineImage>,
+}
+
+/// Docs fetches `uri` itself while the batch runs, so the picture has to be
+/// reachable from Google for that moment. There is no request that sets alt
+/// text on an inserted picture, which is why no tool here offers one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertInlineImage {
+    uri: String,
+    location: Location,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_size: Option<ObjectSize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObjectSize {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<Dimension>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<Dimension>,
+}
+
+/// Docs measures in points and takes the unit with every magnitude.
+#[derive(Debug, Serialize)]
+struct Dimension {
+    magnitude: f64,
+    unit: &'static str,
 }
 
 #[derive(Debug, Serialize)]
