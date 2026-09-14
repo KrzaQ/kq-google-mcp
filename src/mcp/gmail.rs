@@ -382,7 +382,7 @@ impl Gmcp {
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        let attachment = find_attachment(&message, p.attachment_id.trim())?.clone();
+        let attachment = find_attachment(&message, p.attachment_id.trim())?;
         let extraction = text::gmail_attachment(
             client,
             connection.id,
@@ -1113,30 +1113,66 @@ fn label_ids(labels: &[gmail::Label], wanted: &[String]) -> Result<Vec<String>, 
     Ok(out)
 }
 
-fn find_attachment<'a>(
-    message: &'a gmail::Message,
+/// The part a caller named, wherever Gmail filed it.
+///
+/// A file attached inline — a PDF dropped into a reply, or a forwarded one —
+/// carries a `Content-ID`, so Gmail puts it among the inline parts rather
+/// than the attachments. It is still a file with an attachment id, and
+/// `messages.attachments.get` fetches it the same way, so refusing it here
+/// only meant a supplier's invoice could not be read at all. Anything with an
+/// attachment id is fetchable, whichever array it was listed under, and a
+/// `Content-ID` is taken too because that is the only name an HTML body uses.
+fn find_attachment(
+    message: &gmail::Message,
     attachment_id: &str,
-) -> Result<&'a gmail::Attachment, ErrorData> {
-    message
-        .attachments
-        .iter()
-        .find(|a| a.id == attachment_id)
-        .ok_or_else(|| {
-            let known: Vec<String> = message
+) -> Result<gmail::Attachment, ErrorData> {
+    if let Some(found) = message.attachments.iter().find(|a| a.id == attachment_id) {
+        return Ok(found.clone());
+    }
+    let inline = message.inline_images.iter().find(|i| {
+        i.attachment_id.as_deref() == Some(attachment_id) || i.content_id == attachment_id
+    });
+    if let Some(inline) = inline
+        && let Some(id) = &inline.attachment_id
+    {
+        return Ok(gmail::Attachment {
+            id: id.clone(),
+            filename: inline.filename.clone(),
+            mime_type: inline.mime_type.clone(),
+            size: inline.size,
+        });
+    }
+    // Naming both counts matters: "it has none" was the old answer to a
+    // message carrying two inline files, which sent the caller looking for
+    // the wrong problem.
+    let names = |ids: Vec<String>| match ids.is_empty() {
+        true => "none".to_string(),
+        false => ids.join(", "),
+    };
+    Err(bad(format!(
+        "message {} has no part {attachment_id:?}. Its {} attachments: {}. Its {} inline parts: {}",
+        message.id,
+        message.attachments.len(),
+        names(
+            message
                 .attachments
                 .iter()
                 .map(|a| format!("{} ({})", a.filename, a.id))
-                .collect();
-            bad(format!(
-                "message {} has no attachment {attachment_id:?}; it has {}",
-                message.id,
-                if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                }
-            ))
-        })
+                .collect()
+        ),
+        message.inline_images.len(),
+        names(
+            message
+                .inline_images
+                .iter()
+                .map(|i| format!(
+                    "{} ({})",
+                    i.filename,
+                    i.attachment_id.as_deref().unwrap_or(&i.content_id)
+                ))
+                .collect()
+        ),
+    )))
 }
 
 /// A picture named either by attachment id or by `Content-ID`, which is how an

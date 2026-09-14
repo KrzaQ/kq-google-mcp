@@ -2253,6 +2253,62 @@ async fn an_attachment_link_is_minted_against_the_token_and_expires() {
     );
 }
 
+/// A file attached inline is still a file. Gmail files anything carrying a
+/// Content-ID among the inline parts, so a PDF dropped into a reply is not in
+/// `attachments` at all — and until this was fixed, the two tools that fetch
+/// a file refused the very id gmail_get_message had just reported. A
+/// supplier's invoice could not be read through this server at all.
+#[tokio::test]
+async fn a_file_attached_inline_is_fetched_like_any_other() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(http_method("GET"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("gmail_message_full.json")))
+        .mount(&server)
+        .await;
+    let (_, _, secret) = one_of_everything(&db, &["gmail:read"], ClientProfile::ClaudeCode).await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    // chart.png is an inline part: it has a Content-ID and is not in the
+    // message's `attachments` at all.
+    let out = c
+        .ok(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6",
+                   "attachment_id": "ANGjdJ8chartPNG"}),
+        )
+        .await;
+    assert_eq!(out["filename"], "chart.png");
+    assert_eq!(out["mime_type"], "image/png");
+
+    // The body names it by Content-ID, so that works as well.
+    let by_content_id = c
+        .ok(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6",
+                   "attachment_id": "chart-q3@example.test"}),
+        )
+        .await;
+    assert_eq!(by_content_id["filename"], "chart.png");
+
+    // And an id that really is not there says what the message does hold,
+    // counting both kinds. "it has none" was the old answer, to a message
+    // carrying two files.
+    let refused = c
+        .refused(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6",
+                   "attachment_id": "ANGjdJ8nothing"}),
+        )
+        .await;
+    assert!(refused.contains("1 attachments"), "{refused}");
+    assert!(refused.contains("1 inline parts"), "{refused}");
+    assert!(refused.contains("chart.png"), "{refused}");
+}
+
 /// The whole point of the `Arc` around the extractor: one server instance,
 /// cloned per session, serves every token.
 #[tokio::test]
