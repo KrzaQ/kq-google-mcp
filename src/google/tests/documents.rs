@@ -311,3 +311,82 @@ async fn a_content_uri_that_is_not_googles_is_refused_and_never_fetched() {
         .collect();
     assert_eq!(paths, ["/token", IMAGES_AT]);
 }
+
+// ----- the document as numbered paragraphs -----------------------------------
+
+const ARTICLE: &str = "1ArTiClEdOcIdExAmPlE0123456789abcdef";
+const ARTICLE_AT: &str = "/v1/documents/1ArTiClEdOcIdExAmPlE0123456789abcdef";
+/// What `docs_article.json` says the document is at.
+const REVISION: &str = "ALm37BW0Article1";
+/// The one paragraph every index in these tests is measured against. It holds
+/// Polish letters, which are one UTF-16 unit and two UTF-8 bytes each, and an
+/// emoji, which is two units and four bytes.
+const POLISH: &str = "Zażółć gęślą jaźń 😀 już i już";
+
+/// The article, read the way every write reads it.
+async fn article(h: &Harness) -> docs::Outline {
+    h.mount_json("GET", ARTICLE_AT, fixture("docs_article.json"))
+        .await;
+    docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap()
+}
+
+#[tokio::test]
+async fn paragraphs_are_numbered_in_body_order_through_table_cells() {
+    let h = harness().await;
+    let outline = article(&h).await;
+
+    assert_eq!(outline.revision_id, REVISION);
+    assert_eq!(outline.title, "Wywiad z Anną");
+    assert_eq!(outline.end_index, 87);
+    assert_eq!(
+        outline
+            .paragraphs
+            .iter()
+            .map(|p| (
+                p.ordinal,
+                p.style.as_str(),
+                p.text.as_str(),
+                p.in_table,
+                p.start_index,
+                p.end_index
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (1, "TITLE", "Wywiad z Anną", false, 1, 15),
+            (2, "HEADING_2", "Część pierwsza", false, 15, 30),
+            (3, "NORMAL_TEXT", POLISH, false, 30, 61),
+            // The cell's paragraph is numbered where the body meets it:
+            // after the paragraph before the table and before the one after.
+            (4, "NORMAL_TEXT", "Komórka tabeli", true, 63, 78),
+            (5, "NORMAL_TEXT", "Koniec.", false, 79, 87),
+        ]
+    );
+    // The count is of characters, not of bytes and not of UTF-16 units.
+    assert_eq!(outline.paragraphs[2].chars(), 29);
+}
+
+/// The arithmetic every index in this module rests on, over text that makes
+/// the three counts disagree.
+#[test]
+fn indexes_are_utf16_code_units_and_convert_both_ways() {
+    use docs::index;
+
+    let text = "Zażółć gęślą jaźń 😀 już";
+    assert_eq!(text.chars().count(), 23);
+    assert_eq!(text.len(), 36, "bytes");
+    assert_eq!(index::len(text), 24, "UTF-16 code units");
+    assert_eq!(index::len(""), 0);
+    assert_eq!(index::len("😀😀"), 4);
+
+    // `już` starts at character 20 and at code unit 21, because the emoji
+    // before it is two units. A tool that counted characters would edit the
+    // middle of a word.
+    assert_eq!(text.char_indices().nth(20).unwrap().1, 'j');
+    assert_eq!(index::to_chars(text, 21), Some(20));
+    assert_eq!(index::to_chars(text, 24), Some(23));
+    assert_eq!(index::to_chars(text, 25), None);
+
+    // The emoji takes units 18 and 19, and 19 is half of a character.
+    assert_eq!(index::to_chars(text, 18), Some(18));
+    assert_eq!(index::to_chars(text, 19), None);
+}

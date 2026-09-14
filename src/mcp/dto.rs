@@ -525,6 +525,42 @@ impl From<docs::InlineImage> for DocImageOut {
     }
 }
 
+/// A document as numbered paragraphs: the read every careful write starts
+/// from.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocParagraphsOut {
+    pub account: String,
+    pub doc_id: String,
+    pub title: String,
+    pub url: String,
+    /// What the document is at right now. Every write takes it as
+    /// `revision_id`, and one write makes it stale.
+    pub revision_id: String,
+    /// How many paragraphs the document has, whatever this answer shows.
+    pub count: usize,
+    /// The range shown, 1-based and inclusive.
+    pub from: usize,
+    pub to: usize,
+    pub paragraphs: Vec<DocParagraphOut>,
+    pub note: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocParagraphOut {
+    /// What to pass as `paragraph`, `after_paragraph` or `before_paragraph`.
+    pub paragraph: usize,
+    /// Docs' own name for the style: NORMAL_TEXT, HEADING_2, TITLE.
+    pub style: String,
+    /// How many characters the paragraph holds, before any cut below.
+    pub chars: usize,
+    /// True when the paragraph sits in a table cell.
+    pub in_table: bool,
+    pub text: String,
+    /// True when `text` was cut to keep the answer small; ask for this
+    /// paragraph again with full=true to read all of it.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DocWriteOut {
     pub account: String,

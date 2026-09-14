@@ -1,14 +1,14 @@
-//! Docs, the two edits this release makes: text appended at the end and a
-//! find-and-replace across the document. Reads go through Drive's markdown
-//! export, so `documents.get` is asked only for the end index an insert needs
-//! and for the tab list the read tool reports alongside the text.
+//! Docs: a document read as numbered paragraphs, plus the two edits this
+//! release makes, text appended at the end and a find-and-replace across the
+//! document. The prose read goes through Drive's markdown export;
+//! `documents.get` is what says where each paragraph starts and ends, and it
+//! carries the pictures and the tab list too.
+//!
+//! Docs counts positions in UTF-16 code units, which Rust counts in neither,
+//! so every index is computed in [`index`] and nowhere else.
 //!
 //! Structural edits are deliberately out: a model that can only append and
 //! replace cannot rearrange someone's document by accident.
-//!
-//! The pictures are the one thing `documents.get` is read properly for. The
-//! markdown export leaves them out of the text, so this is where a model finds
-//! out what they are and where their bytes come from.
 
 use std::collections::HashMap;
 
@@ -196,12 +196,12 @@ fn inline_images(wire: &WireDocument) -> Vec<InlineImage> {
 /// carries content of its own, so the walk goes through its cells.
 fn walk(content: &[WireElement], out: &mut Vec<String>) {
     for element in content {
-        for run in &element.paragraph.elements {
+        for run in element.paragraph.iter().flat_map(|p| &p.elements) {
             if let Some(inline) = &run.inline_object_element {
                 out.push(inline.inline_object_id.clone());
             }
         }
-        for row in &element.table.table_rows {
+        for row in element.table.iter().flat_map(|t| &t.table_rows) {
             for cell in &row.table_cells {
                 walk(&cell.content, out);
             }
@@ -337,11 +337,179 @@ pub async fn replace_all_text(
         .sum())
 }
 
+// ----- indexes ---------------------------------------------------------------
+
+/// Docs counts every position in UTF-16 code units; Rust counts strings in
+/// bytes and in characters. The three disagree the moment a document is not
+/// plain English: `ą` is one UTF-16 unit and two UTF-8 bytes, `😀` is two
+/// units and four bytes. Every index this module sends Google is computed
+/// here and nowhere else, because an index that is off by one edits the
+/// middle of a word and says it succeeded.
+pub mod index {
+    /// How many UTF-16 code units this text takes.
+    pub fn len(text: &str) -> i64 {
+        text.chars().map(|c| c.len_utf16() as i64).sum()
+    }
+
+    /// How many characters sit before a UTF-16 offset. `None` when the offset
+    /// is past the end of the text or halfway through a surrogate pair, which
+    /// is no character at all.
+    ///
+    /// Nothing in the server converts this way — Google is told indexes and
+    /// never asked for them — but the tests walk both directions over the
+    /// same Polish and emoji text, because an index that is wrong one way is
+    /// wrong the other.
+    #[allow(dead_code)]
+    pub fn to_chars(text: &str, units: i64) -> Option<usize> {
+        let mut left = units;
+        for (seen, c) in text.chars().enumerate() {
+            if left == 0 {
+                return Some(seen);
+            }
+            left -= c.len_utf16() as i64;
+            if left < 0 {
+                return None;
+            }
+        }
+        (left == 0).then_some(text.chars().count())
+    }
+}
+
+// ----- paragraphs ------------------------------------------------------------
+
+/// One paragraph of the body, numbered the way `docs_list_paragraphs` numbers
+/// it: 1-based, in body order, through table cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Paragraph {
+    pub ordinal: usize,
+    /// Docs' own name for the style: `NORMAL_TEXT`, `HEADING_2`, `TITLE`.
+    pub style: String,
+    /// Where the paragraph starts, in UTF-16 code units from the start of the
+    /// body, as Docs counts.
+    pub start_index: i64,
+    /// One past the newline that ends the paragraph.
+    pub end_index: i64,
+    /// The text, without the newline that ends it.
+    pub text: String,
+    /// True when the paragraph sits in a table cell. It is numbered like any
+    /// other, because the body meets it like any other.
+    pub in_table: bool,
+    /// The text runs, each with the index Docs gave it. An offset into `text`
+    /// becomes a document index only through these: an inline picture takes
+    /// an index and carries no text, so the two do not run in step.
+    runs: Vec<Run>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Run {
+    start_index: i64,
+    text: String,
+}
+
+impl Paragraph {
+    /// How many characters the paragraph holds, as a person counts them.
+    pub fn chars(&self) -> usize {
+        self.text.chars().count()
+    }
+}
+
+/// A document as a numbered list of paragraphs, with the revision every write
+/// against those numbers has to name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outline {
+    pub document_id: String,
+    pub title: String,
+    /// What the document was at when it was read. A write carries it back as
+    /// `writeControl.requiredRevisionId`, so a document that moved in between
+    /// refuses the whole batch rather than editing the wrong words.
+    pub revision_id: String,
+    /// Where the body ends; the last index is Docs' own final newline.
+    pub end_index: i64,
+    pub paragraphs: Vec<Paragraph>,
+}
+
+impl Outline {
+    pub fn url(&self) -> String {
+        format!(
+            "https://docs.google.com/document/d/{}/edit",
+            self.document_id
+        )
+    }
+}
+
+/// The document as numbered paragraphs. One `documents.get`, which is the
+/// same read every write starts with.
+pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> Result<Outline> {
+    let wire = fetch(client, connection_id, document_id).await?;
+    let mut paragraphs = Vec::new();
+    collect_paragraphs(&wire.body.content, false, &mut paragraphs);
+    Ok(Outline {
+        document_id: wire.document_id,
+        title: wire.title,
+        revision_id: wire.revision_id,
+        end_index: wire
+            .body
+            .content
+            .iter()
+            .filter_map(|e| e.end_index)
+            .max()
+            .unwrap_or(1),
+        paragraphs,
+    })
+}
+
+/// Every paragraph under this content, in the order the body meets it. A
+/// table carries content of its own, so the walk goes through its cells and
+/// the paragraphs in them are numbered where they are met — the same walk the
+/// pictures take, for the same reason.
+fn collect_paragraphs(content: &[WireElement], in_table: bool, out: &mut Vec<Paragraph>) {
+    for element in content {
+        if let Some(wire) = &element.paragraph {
+            let start_index = element.start_index.unwrap_or_default();
+            let mut cursor = start_index;
+            let mut runs: Vec<Run> = Vec::new();
+            for part in &wire.elements {
+                let at = part.start_index.unwrap_or(cursor);
+                if let Some(run) = &part.text_run {
+                    runs.push(Run {
+                        start_index: at,
+                        text: run.content.clone(),
+                    });
+                    cursor = at + index::len(&run.content);
+                } else {
+                    // A picture takes one index and carries no text.
+                    cursor = at + 1;
+                }
+            }
+            let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+            out.push(Paragraph {
+                ordinal: out.len() + 1,
+                style: some(&wire.paragraph_style.named_style_type)
+                    .unwrap_or_else(|| "NORMAL_TEXT".to_string()),
+                start_index,
+                end_index: element.end_index.unwrap_or(start_index),
+                text: joined.strip_suffix('\n').unwrap_or(&joined).to_string(),
+                in_table,
+                runs,
+            });
+        }
+        for row in element.table.iter().flat_map(|t| &t.table_rows) {
+            for cell in &row.table_cells {
+                collect_paragraphs(&cell.content, true, out);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireDocument {
     document_id: String,
     title: String,
+    /// What the document is at right now. Every write names it back, which is
+    /// how a paragraph number that has gone stale is refused rather than
+    /// followed.
+    revision_id: String,
     body: WireBody,
     tabs: Vec<WireTab>,
     /// Keyed by object id, in whatever order the JSON happens to carry. The
@@ -358,21 +526,40 @@ struct WireBody {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireElement {
+    start_index: Option<i64>,
     end_index: Option<i64>,
-    paragraph: WireParagraph,
-    table: WireTable,
+    /// Absent on a section break and on a table, which is why both of these
+    /// are optional: the body holds three kinds of element and only the
+    /// paragraphs are numbered.
+    paragraph: Option<WireParagraph>,
+    table: Option<WireTable>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireParagraph {
     elements: Vec<WireParagraphElement>,
+    paragraph_style: WireParagraphStyle,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireParagraphStyle {
+    named_style_type: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireParagraphElement {
+    start_index: Option<i64>,
     inline_object_element: Option<WireInlineObjectElement>,
+    text_run: Option<WireTextRun>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireTextRun {
+    content: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

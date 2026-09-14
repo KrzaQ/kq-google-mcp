@@ -1,6 +1,7 @@
 //! The Docs tools. Reading goes through Drive's markdown export, because
-//! Docs' own API has no text output; writing is the two edits this release
-//! makes, appending at the end and replacing text throughout.
+//! Docs' own API has no text output, with docs_list_paragraphs beside it for
+//! the shape of the document; writing is the two edits this release makes,
+//! appending at the end and replacing text throughout.
 //!
 //! Every one of the three writes takes `confirmed`. With `confirmed=false`
 //! nothing is written and the answer says what would be — that is the step
@@ -84,6 +85,23 @@ pub struct DocsReplaceParam {
     /// Must be true to write. Call with false first and show the person both
     /// strings; this changes every occurrence at once.
     pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsParagraphsParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// The document id, the long string in its Docs URL
+    pub doc_id: String,
+    /// The first paragraph to show, counting from 1; the start of the
+    /// document by default
+    pub from: Option<u32>,
+    /// The last paragraph to show, counting from 1 and included; the end of
+    /// the document by default
+    pub to: Option<u32>,
+    /// Show each paragraph in full rather than cut. Use it with from and to
+    /// for the few paragraphs you are about to change.
+    pub full: Option<bool>,
 }
 
 #[tool_router(router = docs_router, vis = "pub(crate)")]
@@ -401,6 +419,103 @@ impl Gmcp {
             replacements: Some(count),
         })))
     }
+
+    #[tool(
+        description = "A Google Doc as numbered paragraphs: for each one its number, its named \
+                       style (HEADING_2, NORMAL_TEXT, …), how many characters it holds and its \
+                       text, and the document's revision_id once at the top. This is the read \
+                       every careful edit starts from — docs_insert_text, docs_edit_paragraph, \
+                       docs_style_paragraph and docs_insert_code all take a paragraph number and \
+                       that revision_id. The text of each paragraph is cut unless full=true, and \
+                       from and to narrow the range, so one paragraph can be read exactly without \
+                       pulling a whole article. Numbering follows the body, table cells included. \
+                       One write moves every number and changes the revision id, so read again \
+                       after each write."
+    )]
+    async fn docs_list_paragraphs(
+        &self,
+        Parameters(p): Parameters<DocsParagraphsParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::DocParagraphsOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let outline = docs::outline(&self.google()?.client, connection.id, p.doc_id.trim())
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let count = outline.paragraphs.len();
+        let from = (p.from.unwrap_or(1) as usize).max(1);
+        let to = p.to.map(|t| t as usize).unwrap_or(count).min(count);
+        let full = p.full.unwrap_or(false);
+        let mut budget = LISTING_MAX_CHARS;
+        let mut stopped = None;
+        let mut paragraphs = Vec::new();
+        for paragraph in outline.paragraphs.iter().skip(from.saturating_sub(1)) {
+            if paragraph.ordinal > to {
+                break;
+            }
+            if budget == 0 {
+                stopped = Some(paragraph.ordinal);
+                break;
+            }
+            let (text, truncated) = cut(
+                &paragraph.text,
+                if full {
+                    budget
+                } else {
+                    PARAGRAPH_CHARS.min(budget)
+                },
+            );
+            budget -= text.chars().count().min(budget);
+            paragraphs.push(dto::DocParagraphOut {
+                paragraph: paragraph.ordinal,
+                style: paragraph.style.clone(),
+                chars: paragraph.chars(),
+                in_table: paragraph.in_table,
+                text,
+                truncated,
+            });
+        }
+        let note = match stopped {
+            Some(at) => format!(
+                "stopped at paragraph {at} to keep this answer small; ask again with from={at}. \
+                 Pass revision_id to every write and read again afterwards"
+            ),
+            None if paragraphs.is_empty() => format!(
+                "this document has {count} paragraphs, so there is nothing to show from {from}"
+            ),
+            None => "pass revision_id to every write. One write moves every number here and \
+                     changes the revision id, so call this again before the next write"
+                .to_string(),
+        };
+        Ok(Json(dto::DocParagraphsOut {
+            account: connection.label,
+            url: outline.url(),
+            doc_id: outline.document_id,
+            title: outline.title,
+            revision_id: outline.revision_id,
+            count,
+            from,
+            to: paragraphs.last().map(|p| p.paragraph).unwrap_or(to),
+            paragraphs,
+            note,
+        }))
+    }
+}
+
+/// How much of one paragraph a listing shows when `full` is not set. Enough
+/// to recognise a paragraph and to count the ones before it; a model that is
+/// about to edit one asks for that one in full.
+const PARAGRAPH_CHARS: usize = 400;
+/// How much text one listing answers with at most, `full` or not. Past this
+/// it stops and says which paragraph to ask from, because a 20,000-character
+/// article in one answer is what these tools exist to avoid.
+const LISTING_MAX_CHARS: usize = 20_000;
+
+/// One paragraph of a listing, cut to `max` characters.
+fn cut(text: &str, max: usize) -> (String, bool) {
+    if text.chars().count() <= max {
+        return (text.to_string(), false);
+    }
+    (text.chars().take(max).collect(), true)
 }
 
 /// The beginning of what would be written, for the person to recognise. A

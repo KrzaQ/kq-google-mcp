@@ -3495,6 +3495,138 @@ async fn docs_replace_text_reports_how_many_occurrences_it_changed() {
     drop(server);
 }
 
+// ----- docs, paragraph by paragraph -------------------------------------------
+
+const ARTICLE: &str = "1ArTiClEdOcIdExAmPlE0123456789abcdef";
+/// What `docs_article.json` says the document is at.
+const ARTICLE_REVISION: &str = "ALm37BW0Article1";
+
+/// The Polish article every test below reads before it writes.
+async fn article_server() -> MockServer {
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{ARTICLE}"),
+        fixture("docs_article.json"),
+    )
+    .await;
+    server
+}
+
+#[tokio::test]
+async fn docs_list_paragraphs_numbers_the_body_and_answers_the_revision() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let out = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE}),
+        )
+        .await;
+    assert_eq!(out["revision_id"], ARTICLE_REVISION);
+    assert_eq!(out["title"], "Wywiad z Anną");
+    assert_eq!(out["count"], 5);
+    assert_eq!(
+        out["url"],
+        format!("https://docs.google.com/document/d/{ARTICLE}/edit")
+    );
+    let rows = out["paragraphs"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0]["style"], "TITLE");
+    assert_eq!(rows[1]["paragraph"], 2);
+    assert_eq!(rows[1]["style"], "HEADING_2");
+    assert_eq!(rows[1]["text"], "Część pierwsza");
+    // Characters, not bytes and not the UTF-16 units Docs counts in.
+    assert_eq!(rows[2]["chars"], 29);
+    assert_eq!(rows[2]["text"], "Zażółć gęślą jaźń 😀 już i już");
+    // The paragraph in the table cell is numbered where the body meets it.
+    assert_eq!(rows[3]["paragraph"], 4);
+    assert_eq!(rows[3]["in_table"], true);
+    assert_eq!(rows[4]["text"], "Koniec.");
+    assert!(
+        out["note"].as_str().unwrap().contains("revision_id"),
+        "{out}"
+    );
+
+    // A range answers that range and still says how long the document is.
+    let one = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 3, "to": 3}),
+        )
+        .await;
+    assert_eq!(one["count"], 5);
+    assert_eq!(one["from"], 3);
+    assert_eq!(one["to"], 3);
+    let only = one["paragraphs"].as_array().unwrap();
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0]["paragraph"], 3);
+
+    // Past the end is not an error: it says what the document holds.
+    let past = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 9}),
+        )
+        .await;
+    assert!(past["paragraphs"].as_array().unwrap().is_empty());
+    assert!(
+        past["note"].as_str().unwrap().contains("5 paragraphs"),
+        "{past}"
+    );
+}
+
+#[tokio::test]
+async fn a_long_paragraph_is_cut_until_it_is_asked_for_in_full() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let long = "Dłuższy akapit. ".repeat(60);
+    let chars = long.chars().count();
+    let mut document = fixture("docs_article.json");
+    document["body"]["content"][5]["endIndex"] = json!(79 + chars + 1);
+    document["body"]["content"][5]["paragraph"]["elements"][0]["endIndex"] = json!(79 + chars + 1);
+    document["body"]["content"][5]["paragraph"]["elements"][0]["textRun"]["content"] =
+        json!(format!("{long}\n"));
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{ARTICLE}"),
+        document,
+    )
+    .await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let out = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE}),
+        )
+        .await;
+    let cut = &out["paragraphs"][4];
+    assert_eq!(cut["chars"], chars);
+    assert_eq!(cut["truncated"], true);
+    assert_eq!(cut["text"].as_str().unwrap().chars().count(), 400);
+
+    let whole = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 5, "full": true}),
+        )
+        .await;
+    assert_eq!(whole["paragraphs"][0]["truncated"], false);
+    assert_eq!(
+        whole["paragraphs"][0]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        chars
+    );
+}
+
 // ----- sheets -----------------------------------------------------------------
 
 #[tokio::test]
