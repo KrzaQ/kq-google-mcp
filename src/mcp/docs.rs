@@ -178,6 +178,58 @@ pub struct DocsStyleParam {
     pub confirmed: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsCodeParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Put the listing after this paragraph, as docs_list_paragraphs numbers
+    /// them
+    pub after_paragraph: u32,
+    /// The code itself, as plain text and with its own line breaks
+    pub code: String,
+    /// The monospace font to set it in; Courier New by default
+    pub font: Option<String>,
+    /// What to colour, and how. Offsets count characters from the start of
+    /// `code`, spans may not overlap, and you work the tokens out yourself:
+    /// this server highlights nothing.
+    pub spans: Option<Vec<DocsSpanParam>>,
+    /// What the paragraph you named starts with. Optional, and worth passing.
+    pub expect: Option<String>,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person the
+    /// code.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsSpanParam {
+    /// The first character of the span, counting from 0
+    pub start: u32,
+    /// One past the last character of the span
+    pub end: u32,
+    /// The colour, as #rrggbb
+    // Spelled the British way, and the American spelling is taken too: a
+    // model that writes `color` means this field and should not be refused
+    // over a vowel.
+    #[serde(alias = "color")]
+    pub colour: Option<String>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+}
+
+impl From<&DocsSpanParam> for docs::Span {
+    fn from(s: &DocsSpanParam) -> Self {
+        Self {
+            start: s.start as usize,
+            end: s.end as usize,
+            colour: s.colour.clone(),
+            bold: s.bold,
+            italic: s.italic,
+        }
+    }
+}
+
 #[tool_router(router = docs_router, vis = "pub(crate)")]
 impl Gmcp {
     #[tool(
@@ -793,6 +845,88 @@ impl Gmcp {
             doc_id,
             paragraph,
             written: format!("paragraph {paragraph} is {now} now; it was {was}"),
+            text,
+            next: REREAD.to_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Insert a code listing after the paragraph you name and colour it in one \
+                       write: the code as plain text, a monospace font over all of it, and one \
+                       colour, bold or italic per span. A span is {start, end, colour, bold, \
+                       italic}, where start and end count characters from the beginning of \
+                       `code`. You work out where the tokens are: this server highlights nothing \
+                       and takes no language. Spans may not overlap, may not be empty and may not \
+                       run past the end of the code, and a colour is #rrggbb — a listing that \
+                       cannot be coloured completely is refused rather than half written. Pass \
+                       the revision_id from docs_list_paragraphs and confirmed=true. One write \
+                       moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_insert_code(
+        &self,
+        Parameters(p): Parameters<DocsCodeParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let spans: Vec<docs::Span> = p.spans.iter().flatten().map(Into::into).collect();
+        let font = p
+            .font
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .unwrap_or(docs::CODE_FONT)
+            .to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_code(
+            &outline,
+            &p.revision_id,
+            p.after_paragraph as usize,
+            &p.code,
+            Some(&font),
+            &spans,
+            p.expect.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "insert a code listing after paragraph {} of the Google Doc {doc_id} in `{}`",
+                    plan.paragraph, connection.label
+                ),
+                vec![
+                    format!(
+                        "paragraph {} reads now: {}",
+                        plan.paragraph,
+                        first_lines(&plan.before)
+                    ),
+                    format!(
+                        "{} characters of code, in {font}, with {} spans coloured",
+                        plan.after.chars().count(),
+                        spans.len()
+                    ),
+                    first_lines(&plan.after),
+                ],
+            ))));
+        }
+        let (paragraph, text, requests) = (plan.paragraph, plan.after.clone(), plan.requests());
+        docs::apply(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "{} characters of code inserted after paragraph {paragraph} in one batch of \
+                 {requests} requests: the text, the {font} font and {} spans",
+                text.chars().count(),
+                spans.len()
+            ),
             text,
             next: REREAD.to_string(),
         })))

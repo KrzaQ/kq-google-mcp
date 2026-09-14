@@ -367,9 +367,24 @@ pub mod index {
         }
     }
 
-    /// How many characters sit before a UTF-16 offset. `None` when the offset
-    /// is past the end of the text or halfway through a surrogate pair, which
-    /// is no character at all.
+    /// The UTF-16 offset of a character offset into `text`, and `None` when
+    /// the text has fewer characters than that. This is the conversion a
+    /// code listing's spans need: the caller counts characters, Google counts
+    /// code units.
+    pub fn from_chars(text: &str, chars: usize) -> Option<i64> {
+        let mut units = 0;
+        for (seen, c) in text.chars().enumerate() {
+            if seen == chars {
+                return Some(units);
+            }
+            units += c.len_utf16() as i64;
+        }
+        (chars == text.chars().count()).then_some(units)
+    }
+
+    /// How many characters sit before a UTF-16 offset: [`from_chars`] the
+    /// other way round. `None` when the offset is past the end of the text or
+    /// halfway through a surrogate pair, which is no character at all.
     ///
     /// Nothing in the server converts this way — Google is told indexes and
     /// never asked for them — but the tests walk both directions over the
@@ -408,6 +423,9 @@ pub const NAMED_STYLES: [&str; 9] = [
     "HEADING_5",
     "HEADING_6",
 ];
+
+/// The font a code listing is set in when the caller names none.
+pub const CODE_FONT: &str = "Courier New";
 
 /// What every stale write is told, in one sentence and one place.
 const STALE: &str = "the document changed since it was read, so nothing was written; \
@@ -683,6 +701,19 @@ impl At {
     }
 }
 
+/// One coloured run of a code listing, measured in characters from the start
+/// of the code. The calling model works out where the tokens are: this server
+/// does no syntax highlighting and knows no languages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    /// `#rrggbb`, and nothing else.
+    pub colour: Option<String>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+}
+
 /// One document write, worked out in full before anything is sent: which
 /// paragraph it is about, how the text reads now and how it would read
 /// afterwards, and the requests that do it.
@@ -704,6 +735,14 @@ pub struct Plan {
     pub index: i64,
     revision_id: String,
     requests: Vec<DocRequest>,
+}
+
+impl Plan {
+    /// How many requests the one batch carries. A code listing reports it, so
+    /// a person can see the text, the font and every colour go in together.
+    pub fn requests(&self) -> usize {
+        self.requests.len()
+    }
 }
 
 /// A named style, as Docs spells it. `heading 2` and `Heading_2` are the same
@@ -876,6 +915,169 @@ pub fn plan_style(
             }),
             ..DocRequest::default()
         }],
+    })
+}
+
+/// A code listing: the text, the monospace font over the whole of it, and one
+/// `updateTextStyle` per coloured span — all in the one batch, because a
+/// listing that arrived and was not coloured is worse than one that was
+/// refused.
+pub fn plan_code(
+    outline: &Outline,
+    revision_id: &str,
+    after_paragraph: usize,
+    code: &str,
+    font: Option<&str>,
+    spans: &[Span],
+    expect: Option<&str>,
+) -> Result<Plan> {
+    outline.check_revision(revision_id)?;
+    let body = code.trim_end_matches('\n');
+    if body.trim().is_empty() {
+        return Err(Error::Unsupported(
+            "there is nothing to insert: the code is empty".into(),
+        ));
+    }
+    let font = font
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .unwrap_or(CODE_FONT);
+    let neighbour = outline.paragraph(after_paragraph)?;
+    if let Some(expect) = expect {
+        neighbour.check_expect(expect)?;
+    }
+    // Every span is checked before the first request is built. A listing
+    // half-coloured because the fourth span was nonsense would have to be
+    // repaired by hand.
+    let ranges = span_ranges(body, spans)?;
+    let (index, payload, text_at) = outline.insertion(At::After(after_paragraph), neighbour, body);
+    let mut requests = vec![
+        insert_request(index, &payload),
+        DocRequest {
+            update_text_style: Some(UpdateTextStyle {
+                range: Range {
+                    start_index: text_at,
+                    end_index: text_at + index::len(body),
+                },
+                text_style: TextStyle {
+                    weighted_font_family: Some(WeightedFontFamily {
+                        font_family: font.to_string(),
+                    }),
+                    ..TextStyle::default()
+                },
+                fields: "weightedFontFamily".to_string(),
+            }),
+            ..DocRequest::default()
+        },
+    ];
+    for (span, (start, end)) in spans.iter().zip(ranges) {
+        let mut fields: Vec<&str> = Vec::new();
+        let mut text_style = TextStyle::default();
+        if let Some(colour) = &span.colour {
+            text_style.foreground_color = Some(OptionalColor {
+                color: Color {
+                    rgb_color: rgb(colour)?,
+                },
+            });
+            fields.push("foregroundColor");
+        }
+        if let Some(bold) = span.bold {
+            text_style.bold = Some(bold);
+            fields.push("bold");
+        }
+        if let Some(italic) = span.italic {
+            text_style.italic = Some(italic);
+            fields.push("italic");
+        }
+        if fields.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "the span {}..{} says nothing to change; give it a colour, bold or italic",
+                span.start, span.end
+            )));
+        }
+        requests.push(DocRequest {
+            update_text_style: Some(UpdateTextStyle {
+                range: Range {
+                    start_index: text_at + start,
+                    end_index: text_at + end,
+                },
+                text_style,
+                fields: fields.join(","),
+            }),
+            ..DocRequest::default()
+        });
+    }
+    Ok(Plan {
+        paragraph: after_paragraph,
+        before: neighbour.text.clone(),
+        after: body.to_string(),
+        index,
+        revision_id: revision_id.trim().to_string(),
+        requests,
+    })
+}
+
+/// Each span as a pair of UTF-16 offsets into the code, or the first reason
+/// the set of them cannot be written: a span that is empty, one that runs
+/// past the end of the code, or two that overlap. Nothing is built until they
+/// all pass.
+fn span_ranges(code: &str, spans: &[Span]) -> Result<Vec<(i64, i64)>> {
+    let characters = code.chars().count();
+    let mut ranges = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.end <= span.start {
+            return Err(Error::Unsupported(format!(
+                "the span {}..{} is empty; a span must cover at least one character",
+                span.start, span.end
+            )));
+        }
+        if span.end > characters {
+            return Err(Error::Unsupported(format!(
+                "the span {}..{} runs past the end of the code, which is {characters} characters",
+                span.start, span.end
+            )));
+        }
+        let (Some(start), Some(end)) = (
+            index::from_chars(code, span.start),
+            index::from_chars(code, span.end),
+        ) else {
+            return Err(Error::Unsupported(format!(
+                "the span {}..{} does not land on characters of the code",
+                span.start, span.end
+            )));
+        };
+        ranges.push((start, end));
+    }
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|i| spans[*i].start);
+    for pair in order.windows(2) {
+        let (first, next) = (&spans[pair[0]], &spans[pair[1]]);
+        if next.start < first.end {
+            return Err(Error::Unsupported(format!(
+                "the spans {}..{} and {}..{} overlap; each character of a listing takes its \
+                 colour from one span",
+                first.start, first.end, next.start, next.end
+            )));
+        }
+    }
+    Ok(ranges)
+}
+
+/// `#rrggbb` and nothing else. A colour Docs would read as black is a listing
+/// that looks broken, so the refusal comes before the write.
+fn rgb(colour: &str) -> Result<RgbColor> {
+    let digits = colour.trim().strip_prefix('#').unwrap_or_default();
+    if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Unsupported(format!(
+            "{colour:?} is not a colour; write it as #rrggbb, for example #1a7f37"
+        )));
+    }
+    let channel =
+        |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).unwrap_or_default() as f32 / 255.0;
+    Ok(RgbColor {
+        red: channel(0),
+        green: channel(2),
+        blue: channel(4),
     })
 }
 
@@ -1122,6 +1324,8 @@ struct DocRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     update_paragraph_style: Option<UpdateParagraphStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    update_text_style: Option<UpdateTextStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     replace_all_text: Option<ReplaceAllText>,
 }
 
@@ -1166,6 +1370,56 @@ struct UpdateParagraphStyle {
 #[serde(rename_all = "camelCase")]
 struct ParagraphStyle {
     named_style_type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTextStyle {
+    range: Range,
+    text_style: TextStyle,
+    /// The fields this request writes, comma-separated, which is how Google
+    /// tells a value that was set from one that was left alone.
+    fields: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weighted_font_family: Option<WeightedFontFamily>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreground_color: Option<OptionalColor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    italic: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WeightedFontFamily {
+    font_family: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OptionalColor {
+    color: Color,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Color {
+    rgb_color: RgbColor,
+}
+
+/// Docs takes each channel as a fraction of one, not as a byte.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RgbColor {
+    red: f32,
+    green: f32,
+    blue: f32,
 }
 
 #[derive(Debug, Serialize)]

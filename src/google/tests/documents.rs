@@ -393,16 +393,27 @@ fn indexes_are_utf16_code_units_and_convert_both_ways() {
     // `już` starts at character 20, byte 32 and code unit 21. A tool that
     // counted characters or bytes would edit the middle of a word.
     assert_eq!(text.char_indices().nth(20).unwrap().1, 'j');
+    assert_eq!(index::from_chars(text, 20), Some(21));
     assert_eq!(index::from_bytes(text, 32), 21);
     assert_eq!(index::to_chars(text, 21), Some(20));
 
-    // The end of the text, and nothing past it.
+    // The ends of the text both ways, and nothing past them.
+    assert_eq!(index::from_chars(text, 23), Some(24));
+    assert_eq!(index::from_chars(text, 24), None);
     assert_eq!(index::to_chars(text, 24), Some(23));
     assert_eq!(index::to_chars(text, 25), None);
 
     // The emoji takes units 18 and 19, and 19 is half of a character.
+    assert_eq!(index::from_chars(text, 18), Some(18));
     assert_eq!(index::to_chars(text, 18), Some(18));
     assert_eq!(index::to_chars(text, 19), None);
+    assert_eq!(index::from_chars(text, 19), Some(20));
+
+    // Every character offset goes out and comes back.
+    for chars in 0..=text.chars().count() {
+        let units = index::from_chars(text, chars).unwrap();
+        assert_eq!(index::to_chars(text, units), Some(chars), "{chars}");
+    }
 }
 
 #[tokio::test]
@@ -481,6 +492,7 @@ async fn a_stale_revision_id_is_refused_and_nothing_is_sent() {
             None,
         )
         .unwrap_err(),
+        docs::plan_code(&outline, "ALm37BW0Older", 2, "let x = 1;", None, &[], None).unwrap_err(),
         // A write with no revision id at all is the same refusal.
         docs::plan_style(&outline, "  ", 2, "HEADING_3", "Część").unwrap_err(),
     ];
@@ -693,4 +705,163 @@ async fn an_insert_carries_its_own_paragraph_break() {
     assert!(
         docs::plan_insert(&outline, REVISION, docs::At::After(9), "Akapit", None, None).is_err()
     );
+}
+
+// ----- a code listing --------------------------------------------------------
+
+/// Twelve characters and thirteen UTF-16 units: the emoji is the difference,
+/// and the span over the string literal is where that shows.
+const CODE: &str = "let ż = \"😀\";";
+
+fn span(start: usize, end: usize) -> docs::Span {
+    docs::Span {
+        start,
+        end,
+        colour: Some("#ff0000".into()),
+        bold: None,
+        italic: None,
+    }
+}
+
+#[tokio::test]
+async fn a_code_listing_is_written_and_coloured_in_one_batch() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    let spans = vec![
+        docs::Span {
+            start: 0,
+            end: 3,
+            colour: Some("#ff0000".into()),
+            bold: Some(true),
+            italic: None,
+        },
+        docs::Span {
+            start: 8,
+            end: 11,
+            colour: Some("#00ff00".into()),
+            bold: None,
+            italic: Some(true),
+        },
+    ];
+    let plan = docs::plan_code(&outline, REVISION, 2, CODE, None, &spans, Some("Część")).unwrap();
+    assert_eq!(plan.requests(), 4, "the text, the font and one per span");
+    docs::apply(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    // The listing goes in at 30, so it covers units 30 to 43. The second span
+    // is characters 8 to 11 of the code — the quoted emoji — which is units 8
+    // to 12, because the emoji is two of them.
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await,
+        json!({
+            "requests": [
+                {"insertText": {"text": "let ż = \"😀\";\n", "location": {"index": 30}}},
+                {"updateTextStyle": {
+                    "range": {"startIndex": 30, "endIndex": 43},
+                    "textStyle": {"weightedFontFamily": {"fontFamily": "Courier New"}},
+                    "fields": "weightedFontFamily"
+                }},
+                {"updateTextStyle": {
+                    "range": {"startIndex": 30, "endIndex": 33},
+                    "textStyle": {
+                        "foregroundColor": {"color": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
+                        "bold": true
+                    },
+                    "fields": "foregroundColor,bold"
+                }},
+                {"updateTextStyle": {
+                    "range": {"startIndex": 38, "endIndex": 42},
+                    "textStyle": {
+                        "foregroundColor": {"color": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}}},
+                        "italic": true
+                    },
+                    "fields": "foregroundColor,italic"
+                }}
+            ],
+            "writeControl": {"requiredRevisionId": REVISION}
+        })
+    );
+    // One batch for the whole listing, and no second call to finish it off.
+    let batches = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.url.path() == ARTICLE_BATCH)
+        .count();
+    assert_eq!(batches, 1);
+}
+
+#[tokio::test]
+async fn a_listing_that_cannot_be_coloured_completely_is_refused() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    let plan = |spans: Vec<docs::Span>| {
+        docs::plan_code(&outline, REVISION, 2, CODE, None, &spans, None).unwrap_err()
+    };
+
+    let overlap = plan(vec![span(0, 5), span(3, 8)]);
+    assert!(overlap.to_string().contains("overlap"), "{overlap}");
+    // Overlapping the other way round is the same refusal.
+    assert!(
+        plan(vec![span(3, 8), span(0, 5)])
+            .to_string()
+            .contains("overlap")
+    );
+
+    let past = plan(vec![span(8, 13)]);
+    assert!(past.to_string().contains("past the end"), "{past}");
+    assert!(past.to_string().contains("12 characters"), "{past}");
+
+    let empty = plan(vec![span(4, 4)]);
+    assert!(empty.to_string().contains("empty"), "{empty}");
+
+    let colour = plan(vec![docs::Span {
+        colour: Some("red".into()),
+        ..span(0, 3)
+    }]);
+    assert!(colour.to_string().contains("#rrggbb"), "{colour}");
+    for bad in ["#ff000", "#gggggg", "ff0000", "#ff0000ff", ""] {
+        let error = plan(vec![docs::Span {
+            colour: Some(bad.into()),
+            ..span(0, 3)
+        }]);
+        assert!(error.to_string().contains("not a colour"), "{bad}: {error}");
+    }
+
+    let nothing = plan(vec![docs::Span {
+        colour: None,
+        ..span(0, 3)
+    }]);
+    assert!(nothing.to_string().contains("says nothing"), "{nothing}");
+
+    // Every one of them refused before a request was built.
+    assert_eq!(
+        h.requests()
+            .await
+            .iter()
+            .filter(|r| r.url.path() == ARTICLE_BATCH)
+            .count(),
+        0
+    );
+
+    // Spans touching end to end are not overlapping, and a listing with no
+    // spans at all is just monospace text.
+    assert!(
+        docs::plan_code(
+            &outline,
+            REVISION,
+            2,
+            CODE,
+            None,
+            &[span(0, 3), span(3, 8)],
+            None
+        )
+        .is_ok()
+    );
+    let plain =
+        docs::plan_code(&outline, REVISION, 2, CODE, Some("Roboto Mono"), &[], None).unwrap();
+    assert_eq!(plain.requests(), 2);
 }

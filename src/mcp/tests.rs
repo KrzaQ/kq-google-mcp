@@ -556,6 +556,7 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
         "docs_insert_text",
         "docs_edit_paragraph",
         "docs_style_paragraph",
+        "docs_insert_code",
     ] {
         for argument in ["revision_id", "confirmed"] {
             assert!(
@@ -576,8 +577,10 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
     for tool in ["docs_edit_paragraph", "docs_style_paragraph"] {
         assert!(required(tool).contains(&json!("expect")), "{tool}");
     }
-    assert!(!required("docs_insert_text").contains(&json!("expect")));
-    assert!(by_name("docs_insert_text")["inputSchema"]["properties"]["expect"].is_object());
+    for tool in ["docs_insert_text", "docs_insert_code"] {
+        assert!(!required(tool).contains(&json!("expect")), "{tool}");
+        assert!(by_name(tool)["inputSchema"]["properties"]["expect"].is_object());
+    }
     // The one that is careful and the one that is broad each point at the
     // other, so a model picking between them reads both.
     assert!(
@@ -3884,6 +3887,93 @@ async fn docs_style_paragraph_changes_the_style_and_leaves_the_words() {
         )
         .await;
     assert!(refused.contains("NORMAL_TEXT"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+    "code": "let ż = \"😀\";", "expect": "Część",
+    "revision_id": ARTICLE_REVISION,
+    "spans": [
+        {"start": 0, "end": 3, "colour": "#ff0000", "bold": true},
+        {"start": 8, "end": 11, "color": "#00ff00", "italic": true}
+    ]});
+
+    let shown = c.ok("docs_insert_code", confirming(&args, false)).await;
+    let lines = details(&shown);
+    assert!(
+        lines.contains("2 spans"),
+        "the preview counts the spans: {lines}"
+    );
+    assert!(lines.contains("Courier New"), "{lines}");
+    assert!(
+        lines.contains("let ż = \"😀\";"),
+        "the preview shows the code: {lines}"
+    );
+    assert!(
+        !lines.contains("#ff0000"),
+        "the preview lists no spans: {lines}"
+    );
+
+    let out = c.ok("docs_insert_code", confirming(&args, true)).await;
+    assert!(
+        out["written"].as_str().unwrap().contains("one batch"),
+        "{out}"
+    );
+    let body = last_batch(&server).await;
+    let requests = body["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 4, "the text, the font and one per span");
+    assert_eq!(
+        requests[0]["insertText"],
+        json!({"text": "let ż = \"😀\";\n", "location": {"index": 30}})
+    );
+    assert_eq!(
+        requests[1]["updateTextStyle"]["textStyle"]["weightedFontFamily"]["fontFamily"],
+        "Courier New"
+    );
+    assert_eq!(
+        requests[1]["updateTextStyle"]["range"],
+        json!({"startIndex": 30, "endIndex": 43})
+    );
+    assert_eq!(
+        requests[2]["updateTextStyle"]["range"],
+        json!({"startIndex": 30, "endIndex": 33})
+    );
+    // Characters 8 to 11 of the code are the quoted emoji, which is units 8
+    // to 12: the American spelling of `colour` is taken too.
+    assert_eq!(
+        requests[3]["updateTextStyle"]["range"],
+        json!({"startIndex": 38, "endIndex": 42})
+    );
+    assert_eq!(
+        requests[3]["updateTextStyle"]["textStyle"]["foregroundColor"]["color"]["rgbColor"],
+        json!({"red": 0.0, "green": 1.0, "blue": 0.0})
+    );
+    assert_eq!(
+        requests[3]["updateTextStyle"]["fields"],
+        "foregroundColor,italic"
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], ARTICLE_REVISION);
+
+    // A listing that cannot be coloured completely is not written at all.
+    let mut overlapping = args.as_object().unwrap().clone();
+    overlapping.insert(
+        "spans".into(),
+        json!([{"start": 0, "end": 5, "colour": "#ff0000"},
+               {"start": 3, "end": 8, "colour": "#00ff00"}]),
+    );
+    overlapping.insert("confirmed".into(), json!(true));
+    let refused = c
+        .refused("docs_insert_code", Value::Object(overlapping))
+        .await;
+    assert!(refused.contains("overlap"), "{refused}");
     assert_eq!(batch_calls(&server).await, 1);
     drop(server);
 }
