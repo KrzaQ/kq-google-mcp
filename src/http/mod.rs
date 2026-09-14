@@ -192,6 +192,10 @@ pub async fn serve(config: Config) -> Result<()> {
     if let AuthMode::Dev = state.config.auth {
         tracing::warn!("GMCP_AUTH=dev: every request is the dev user");
     }
+    // Expired tickets, staged files and held uploads go on their own timer as
+    // well as on the next mint, so a server that stages one file and then goes
+    // quiet does not keep its bytes until the next restart.
+    let sweeper = uploads::spawn_sweeper(&state.staging);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
@@ -204,6 +208,7 @@ pub async fn serve(config: Config) -> Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    sweeper.abort();
     Ok(())
 }
 

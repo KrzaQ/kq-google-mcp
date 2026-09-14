@@ -34,6 +34,11 @@ pub const UPLOAD_TTL_MINUTES: i64 = 60;
 /// The largest file that may be staged, and the largest total one draft may
 /// carry. Gmail's own limit for a whole message.
 pub const ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
+/// How often the server clears what has expired out of the staging store.
+/// Shorter than every life it clears, so nothing waits a whole life again
+/// after its own has run out, and long enough that a quiet server does almost
+/// nothing all day.
+pub const STAGING_SWEEP_MINUTES: u64 = 5;
 
 /// The largest picture Docs will fetch for `insertInlineImage`, and the most
 /// pixels it will take. Google's own two numbers, checked here so a picture

@@ -24,17 +24,21 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
+use tokio::task::JoinHandle;
 use utoipa::ToSchema;
 
 use super::AppState;
 use super::error::{ApiError, ApiResult};
-use crate::domain::limits::{ATTACHMENT_MAX_BYTES, UPLOAD_TICKET_TTL_MINUTES, UPLOAD_TTL_MINUTES};
+use crate::domain::limits::{
+    ATTACHMENT_MAX_BYTES, STAGING_SWEEP_MINUTES, UPLOAD_TICKET_TTL_MINUTES, UPLOAD_TTL_MINUTES,
+};
 use crate::domain::link;
 
 /// The name a file is stored under when nothing of the one the caller gave
@@ -218,9 +222,9 @@ impl Staging {
     }
 
     /// Mint a ticket. Expired tickets and staged files are swept on the way
-    /// past, which is what link minting does: this is the one moment there is
-    /// certainly something happening, and it keeps the sweep from being a
-    /// background job's problem.
+    /// past, which is what link minting does: the sweep is cheap and this is a
+    /// moment something is certainly happening. [`spawn_sweeper`] does the same
+    /// thing on a timer, for the hours when nothing is.
     fn mint(&self, new: NewUpload, now: DateTime<Utc>) -> Ticket {
         self.sweep(now);
         let ticket = Ticket {
@@ -436,6 +440,42 @@ impl Staging {
             std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
+    }
+}
+
+/// Sweep the staging store every [`STAGING_SWEEP_MINUTES`], for as long as the
+/// server holds it.
+///
+/// The sweep on minting is not enough on its own. A server that puts one
+/// picture into a document and then goes quiet mints nothing again, so the
+/// bytes of that picture sit in the upload directory until the next mint or the
+/// next restart. The download link they were held for died fifteen minutes in,
+/// so nobody can reach them — but nobody asked to keep them either.
+///
+/// The task takes a weak handle and nothing else. It does not keep the staging
+/// store alive, and the first tick after the server drops it ends the task, so
+/// there is no handle left over a store nothing else is using.
+pub fn spawn_sweeper(staging: &Arc<Staging>) -> JoinHandle<()> {
+    let weak = Arc::downgrade(staging);
+    tokio::spawn(sweep_every(
+        weak,
+        Duration::from_secs(STAGING_SWEEP_MINUTES * 60),
+    ))
+}
+
+/// The loop itself, with the period as an argument so a test can run it in
+/// milliseconds rather than in minutes.
+async fn sweep_every(staging: Weak<Staging>, period: Duration) {
+    let mut ticker = tokio::time::interval(period);
+    // The first tick of an interval is immediate, and the store was emptied
+    // when it was built, so there is nothing to sweep yet.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match staging.upgrade() {
+            Some(staging) => staging.sweep(Utc::now()),
+            None => break,
+        }
     }
 }
 
@@ -856,6 +896,53 @@ mod tests {
         );
         assert!(files_in(staging.dir()).is_empty());
         assert!(staging.take(7, &[id]).is_err());
+    }
+
+    /// What the sweep on minting leaves behind: a server that puts one picture
+    /// into a document and then goes quiet never mints anything again, so the
+    /// timer is the only thing that clears those bytes.
+    #[tokio::test]
+    async fn a_held_upload_past_its_life_is_swept_with_no_mint_at_all() {
+        let dir = TempDir::new();
+        let staging = Arc::new(dir.staging());
+        let now = Utc::now();
+        let ticket = staging.mint(new_upload(7, "wykres.png"), now);
+        let ticket = staging.take_ticket(&ticket.id, now).unwrap();
+        let (id, _) = staging.store(ticket, b"the picture".to_vec(), now).unwrap();
+        let held = staging.hold(7, &id).unwrap();
+        assert_eq!(files_in(staging.dir()).len(), 1);
+
+        // The link the picture was held for has run out. Nothing is minted
+        // from here on, and nothing else touches the store.
+        for entry in staging.held.lock().expect("the held lock").values_mut() {
+            entry.expires_at = Utc::now() - TimeDelta::minutes(1);
+        }
+
+        // The same loop the server starts, running in milliseconds so that the
+        // test does not wait five minutes for a tick.
+        let sweeper = tokio::spawn(sweep_every(
+            Arc::downgrade(&staging),
+            Duration::from_millis(5),
+        ));
+        for _ in 0..200 {
+            if files_in(staging.dir()).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            files_in(staging.dir()).is_empty(),
+            "the bytes are still here"
+        );
+        assert!(staging.held(&held.id).is_none());
+
+        // And the task holds nothing of its own: when the server lets the
+        // store go, the next tick ends the sweep.
+        drop(staging);
+        tokio::time::timeout(Duration::from_secs(5), sweeper)
+            .await
+            .expect("the sweep stops when the staging store goes")
+            .expect("the sweep ends without panicking");
     }
 
     #[test]
