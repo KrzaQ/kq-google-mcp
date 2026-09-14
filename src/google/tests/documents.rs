@@ -1066,3 +1066,281 @@ async fn a_picture_is_inserted_into_a_paragraph_of_its_own() {
         sent
     );
 }
+
+// ----- a table ---------------------------------------------------------------
+
+/// What `docs_article_table.json` says the document is at: the article with
+/// the empty two-by-two table in it, which is what the second batch of a
+/// table write is planned against.
+const TABLE_REVISION: &str = "ALm37BW0Article2";
+
+/// The two reads a table write makes, in the order it makes them: the article
+/// as it is, and then the article with the empty table Google has just put in
+/// it. The second fixture is a table as the Docs API describes one — rows,
+/// cells, and a paragraph of its own in every cell — so the indexes the code
+/// fills at are Google's and not this test's arithmetic.
+async fn article_then_table(h: &Harness) -> docs::Outline {
+    Mock::given(method("GET"))
+        .and(path(ARTICLE_AT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_article.json")))
+        .up_to_n_times(1)
+        .mount(&h.server)
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap();
+    h.mount_json("GET", ARTICLE_AT, fixture("docs_article_table.json"))
+        .await;
+    outline
+}
+
+/// Every `batchUpdate` the server saw, oldest first.
+async fn batches(h: &Harness) -> Vec<Value> {
+    h.requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == ARTICLE_BATCH)
+        .map(|r| serde_json::from_slice(&r.body).expect("a batch body is JSON"))
+        .collect()
+}
+
+fn grid(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| row.iter().map(|c| c.to_string()).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_table_is_filled_at_the_indexes_the_re_read_answered_with() {
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    mount_batch(&h).await;
+
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, false, Some("Część")).unwrap();
+    assert_eq!(plan.rows, 2);
+    assert_eq!(plan.columns, 2);
+    assert_eq!(plan.lines(), ["Model | Parametry", "Mistral-7B | 7 mld"]);
+    let written = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    // The cells are paragraphs 4 to 7 of the document the re-read described:
+    // the table's four cells, numbered where the body meets them.
+    assert_eq!(
+        written,
+        docs::InsertedTable {
+            rows: 2,
+            columns: 2,
+            first_paragraph: 4,
+            last_paragraph: 7,
+            index: 31,
+        }
+    );
+
+    let sent = batches(&h).await;
+    assert_eq!(sent.len(), 2, "the empty grid, and then its cells");
+    // The empty grid goes in where a new paragraph would: Docs writes the
+    // newline before it itself.
+    assert_eq!(
+        sent[0],
+        json!({
+            "requests": [{"insertTable": {
+                "rows": 2, "columns": 2, "location": {"index": 30}
+            }}],
+            "writeControl": {"requiredRevisionId": REVISION}
+        })
+    );
+    // The cells are filled from the last to the first, so that no insert
+    // moves an index that is still to be used, and every index here is one
+    // the fixture says Google gave for a cell's own paragraph.
+    assert_eq!(
+        sent[1],
+        json!({
+            "requests": [
+                {"insertText": {"text": "7 mld", "location": {"index": 40}}},
+                {"insertText": {"text": "Mistral-7B", "location": {"index": 38}}},
+                {"insertText": {"text": "Parametry", "location": {"index": 35}}},
+                {"insertText": {"text": "Model", "location": {"index": 33}}}
+            ],
+            // The revision of this server's own re-read, and not the
+            // caller's: the document has moved on by one write, its own.
+            "writeControl": {"requiredRevisionId": TABLE_REVISION}
+        })
+    );
+    assert_ne!(TABLE_REVISION, REVISION);
+}
+
+#[tokio::test]
+async fn a_header_row_is_bolded_where_its_own_text_was_just_written() {
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    mount_batch(&h).await;
+
+    // Polish letters are one UTF-16 unit and two UTF-8 bytes; the emoji is
+    // two units and four bytes. "Zażółć 😀" is 8 characters, 13 bytes and 9
+    // units, and only the units make the bold cover the whole cell.
+    let rows = grid(&[&["Zażółć 😀", "Kolumna"], &["już", ""]]);
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, true, None).unwrap();
+    assert!(plan.header);
+    docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    let sent = batches(&h).await;
+    assert_eq!(
+        sent[1]["requests"],
+        json!([
+            // The empty cell is skipped: Docs refuses an insert of no text,
+            // and an empty cell is what it already is.
+            {"insertText": {"text": "już", "location": {"index": 38}}},
+            {"insertText": {"text": "Kolumna", "location": {"index": 35}}},
+            {"updateTextStyle": {
+                "range": {"startIndex": 35, "endIndex": 42},
+                "textStyle": {"bold": true},
+                "fields": "bold"
+            }},
+            {"insertText": {"text": "Zażółć 😀", "location": {"index": 33}}},
+            {"updateTextStyle": {
+                "range": {"startIndex": 33, "endIndex": 42},
+                "textStyle": {"bold": true},
+                "fields": "bold"
+            }}
+        ]),
+        "each header cell is bolded straight after its own insert, before an \
+         insert at a lower index moves it"
+    );
+    // Only the first row is bold, whatever the rest of the table says.
+    assert_eq!(
+        sent[1]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r.get("updateTextStyle").is_some())
+            .count(),
+        2
+    );
+
+    // Without the header the same grid carries no styling at all.
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    mount_batch(&h).await;
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, false, None).unwrap();
+    docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    let plain = batches(&h).await;
+    assert!(
+        plain[1]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("updateTextStyle").is_none()),
+        "{}",
+        plain[1]
+    );
+}
+
+#[tokio::test]
+async fn a_grid_that_is_not_a_table_is_refused_before_any_call() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    let wide = grid(&[&["x"; 21]]);
+    let tall: Vec<Vec<String>> = (0..101).map(|_| vec!["x".to_string()]).collect();
+    for (rows, wanted) in [
+        (
+            grid(&[&["a", "b"], &["c"], &["d", "e"]]),
+            "row 2 holds 1 cell",
+        ),
+        (grid(&[&["a"], &["b", "c"]]), "row 2 holds 2 cells"),
+        (wide, "21 columns"),
+        (tall, "101 rows"),
+        (Vec::new(), "no rows"),
+        (vec![Vec::new()], "no cells"),
+        (grid(&[&["a\nb"]]), "line break"),
+    ] {
+        let refused = docs::plan_table(&outline, REVISION, 2, &rows, false, None).unwrap_err();
+        assert!(matches!(refused, Error::Unsupported(_)), "{refused:?}");
+        assert!(refused.to_string().contains(wanted), "{refused}");
+        assert!(
+            refused.to_string().contains("Nothing was written")
+                || refused.to_string().contains("nothing to insert"),
+            "{refused}"
+        );
+    }
+    // The two locks are checked here as well, and none of these reached
+    // Google: a refused grid costs no call at all.
+    let rows = grid(&[&["a"]]);
+    for refused in [
+        docs::plan_table(&outline, "ALm37BW0Older", 2, &rows, false, None),
+        docs::plan_table(&outline, REVISION, 2, &rows, false, Some("Koniec")),
+        docs::plan_table(&outline, REVISION, 9, &rows, false, None),
+    ] {
+        assert!(matches!(refused, Err(Error::Unsupported(_))), "{refused:?}");
+    }
+    assert!(batches(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_second_batch_google_refuses_says_the_table_is_there_and_empty() {
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    // The first batch goes through and the second is refused, which is the
+    // one moment this tool can leave a document changed and unfinished.
+    Mock::given(method("POST"))
+        .and(path(ARTICLE_BATCH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_batch_update.json")))
+        .up_to_n_times(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ARTICLE_BATCH))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": "Revision ALm37BW0Article2 is not the latest"}
+        })))
+        .mount(&h.server)
+        .await;
+
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, true, None).unwrap();
+    let refused = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::Unsupported(_)), "{refused:?}");
+    let said = refused.to_string();
+    // What is true of the document now, where it is, and what to do about it.
+    assert!(
+        said.contains("2 by 2 table was created and is empty"),
+        "{said}"
+    );
+    assert!(said.contains("paragraphs 4 to 7"), "{said}");
+    assert!(said.contains("docs_insert_text"), "{said}");
+    assert!(said.contains("docs_edit_paragraph"), "{said}");
+    assert!(said.contains("docs_list_paragraphs"), "{said}");
+    assert!(said.contains("Revision ALm37BW0Article2"), "{said}");
+    assert_eq!(batches(&h).await.len(), 2, "the second batch was attempted");
+}
+
+#[tokio::test]
+async fn a_table_that_cannot_be_found_again_is_not_guessed_at() {
+    let h = harness().await;
+    // The re-read answers the article as it was, which holds no empty
+    // two-by-two table. Rather than write into the one-by-one table that is
+    // there, the write stops and says where to look.
+    h.mount_json("GET", ARTICLE_AT, fixture("docs_article.json"))
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap();
+    mount_batch(&h).await;
+
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, false, None).unwrap();
+    let refused = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap_err();
+    let said = refused.to_string();
+    assert!(said.contains("created and is empty"), "{said}");
+    assert!(said.contains("could not find it"), "{said}");
+    // One batch, and nothing written into anybody else's table.
+    assert_eq!(batches(&h).await.len(), 1);
+}

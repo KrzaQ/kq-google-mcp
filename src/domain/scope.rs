@@ -356,6 +356,7 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("docs_edit_paragraph", needs(Service::Docs, Level::Write)),
     ("docs_style_paragraph", needs(Service::Docs, Level::Write)),
     ("docs_insert_code", needs(Service::Docs, Level::Write)),
+    ("docs_insert_table", needs(Service::Docs, Level::Write)),
     ("docs_upload_link", needs(Service::Docs, Level::Write)),
     ("docs_insert_image", needs(Service::Docs, Level::Write)),
     ("sheets_list_tabs", needs(Service::Sheets, Level::Read)),
@@ -574,7 +575,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 53);
+        assert_eq!(TOOLS.len(), 54);
     }
 
     #[test]
@@ -617,6 +618,7 @@ mod tests {
                 "docs_edit_paragraph",
                 "docs_style_paragraph",
                 "docs_insert_code",
+                "docs_insert_table",
                 "docs_upload_link",
                 "docs_insert_image",
             ]

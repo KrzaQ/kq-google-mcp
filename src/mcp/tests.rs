@@ -557,6 +557,7 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
         "docs_edit_paragraph",
         "docs_style_paragraph",
         "docs_insert_code",
+        "docs_insert_table",
     ] {
         for argument in ["revision_id", "confirmed"] {
             assert!(
@@ -577,7 +578,7 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
     for tool in ["docs_edit_paragraph", "docs_style_paragraph"] {
         assert!(required(tool).contains(&json!("expect")), "{tool}");
     }
-    for tool in ["docs_insert_text", "docs_insert_code"] {
+    for tool in ["docs_insert_text", "docs_insert_code", "docs_insert_table"] {
         assert!(!required(tool).contains(&json!("expect")), "{tool}");
         assert!(by_name(tool)["inputSchema"]["properties"]["expect"].is_object());
     }
@@ -3999,6 +4000,130 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
     drop(server);
 }
 
+/// The two reads a table write makes: the article as it is, and then the
+/// article with the empty two-by-two table Google has just put in it.
+async fn table_server() -> MockServer {
+    let server = google_server().await;
+    let at = format!("/v1/documents/{ARTICLE}");
+    Mock::given(http_method("GET"))
+        .and(path(at.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_article.json")))
+        .up_to_n_times(1)
+        .named("the document as the caller read it")
+        .mount(&server)
+        .await;
+    mount(&server, "GET", &at, fixture("docs_article_table.json")).await;
+    server
+}
+
+/// The grid the person in the example is putting in their article.
+fn table_args(header: bool) -> Value {
+    json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+           "rows": [["Model", "Parametry"], ["Mistral-7B", "7 mld"]],
+           "header": header, "expect": "Część",
+           "revision_id": ARTICLE_REVISION})
+}
+
+#[tokio::test]
+async fn docs_insert_table_shows_the_grid_and_writes_nothing_until_it_is_confirmed() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let shown = c
+        .ok("docs_insert_table", confirming(&table_args(true), false))
+        .await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["action"].as_str().unwrap().contains("2 by 2 table"),
+        "{shown}"
+    );
+    let lines = details(&shown);
+    assert!(lines.contains("Część pierwsza"), "{lines}");
+    assert!(lines.contains("Model | Parametry"), "{lines}");
+    assert!(lines.contains("Mistral-7B | 7 mld"), "{lines}");
+    assert!(lines.contains("first row is set bold"), "{lines}");
+    // The preview says what is unusual about this tool before it does it.
+    assert!(lines.contains("writes twice"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0);
+
+    // A grid that is not a table is refused in the same words, confirmed or
+    // not, and nothing is read back or written.
+    let mut ragged = table_args(false);
+    ragged["rows"] = json!([["Model", "Parametry"], ["Mistral-7B"]]);
+    let refused = c
+        .refused("docs_insert_table", confirming(&ragged, true))
+        .await;
+    assert!(refused.contains("row 2 holds 1 cell"), "{refused}");
+    assert!(refused.contains("Nothing was written"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 0);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_table_fills_the_cells_from_the_document_it_reads_back() {
+    let db = Db::open_memory().await.unwrap();
+    let server = table_server().await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let out = c
+        .ok("docs_insert_table", confirming(&table_args(true), true))
+        .await;
+    assert_eq!(out["paragraph"], 2);
+    assert_eq!(out["text"], "Model | Parametry\nMistral-7B | 7 mld");
+    let written = out["written"].as_str().unwrap();
+    // The answer says where the cells are, in the numbers the next call uses.
+    assert!(written.contains("paragraphs 4 to 7"), "{written}");
+    assert!(written.contains("two writes"), "{written}");
+    assert!(written.contains("first row is bold"), "{written}");
+
+    let sent = batch_bodies(&server).await;
+    assert_eq!(sent.len(), 2, "the empty grid, and then its cells");
+    assert_eq!(
+        sent[0],
+        json!({
+            "requests": [{"insertTable": {
+                "rows": 2, "columns": 2, "location": {"index": 30}
+            }}],
+            "writeControl": {"requiredRevisionId": ARTICLE_REVISION}
+        })
+    );
+    // Every index here is one the re-read answered with, and they are used
+    // from the last cell to the first so that no insert moves the next one.
+    assert_eq!(
+        sent[1]["requests"],
+        json!([
+            {"insertText": {"text": "7 mld", "location": {"index": 40}}},
+            {"insertText": {"text": "Mistral-7B", "location": {"index": 38}}},
+            {"insertText": {"text": "Parametry", "location": {"index": 35}}},
+            {"updateTextStyle": {
+                "range": {"startIndex": 35, "endIndex": 44},
+                "textStyle": {"bold": true},
+                "fields": "bold"
+            }},
+            {"insertText": {"text": "Model", "location": {"index": 33}}},
+            {"updateTextStyle": {
+                "range": {"startIndex": 33, "endIndex": 38},
+                "textStyle": {"bold": true},
+                "fields": "bold"
+            }}
+        ])
+    );
+    // The second batch is planned against this server's own re-read, not
+    // against the revision the caller was given.
+    assert_eq!(
+        sent[1]["writeControl"]["requiredRevisionId"],
+        "ALm37BW0Article2"
+    );
+    assert_ne!(
+        sent[1]["writeControl"]["requiredRevisionId"],
+        ARTICLE_REVISION
+    );
+    drop(server);
+}
+
 const LISTING: &str = "1LiStInGdOcIdExAmPlE0123456789abcdef";
 
 /// What docs_read is unable to answer: a paragraph nobody styled as one bare
@@ -4516,6 +4641,18 @@ async fn last_batch(server: &MockServer) -> Value {
         .rfind(|r| r.method.as_str() == "POST" && r.url.path().ends_with(":batchUpdate"))
         .expect("a batchUpdate was sent");
     serde_json::from_slice(&request.body).expect("the batchUpdate body is JSON")
+}
+
+/// Every `batchUpdate` body the mock server saw, oldest first.
+async fn batch_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with(":batchUpdate"))
+        .map(|r| serde_json::from_slice(&r.body).expect("a batchUpdate body is JSON"))
+        .collect()
 }
 
 /// How many structural changes the mock server was asked for.

@@ -43,6 +43,12 @@ pub const ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 pub const INSERT_IMAGE_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub const INSERT_IMAGE_MAX_PIXELS: u64 = 25_000_000;
 
+/// The largest table a tool writes. A magazine table is small, and a model
+/// that has miscounted its data is stopped by these two numbers rather than
+/// by Google, before any call is made.
+pub const TABLE_MAX_ROWS: usize = 100;
+pub const TABLE_MAX_COLUMNS: usize = 20;
+
 /// Serialised tool arguments are cut to this before they reach the log.
 pub const AUDIT_ARGS_MAX_BYTES: usize = 4096;
 /// How long a browser session lasts, and how recently a delegate token's

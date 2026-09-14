@@ -4,10 +4,10 @@
 //! There are two kinds of write here, and they are not rivals. docs_create,
 //! docs_append and docs_replace_text are the broad ones: make a document, add
 //! to the end, change every match. docs_insert_text, docs_edit_paragraph,
-//! docs_style_paragraph and docs_insert_code are the careful ones, and each
-//! takes a paragraph number and the revision id that docs_list_paragraphs
-//! answered with — the two locks that keep a write off the paragraph it was
-//! not meant for.
+//! docs_style_paragraph, docs_insert_code and docs_insert_table are the
+//! careful ones, and each takes a paragraph number and the revision id that
+//! docs_list_paragraphs answered with — the two locks that keep a write off
+//! the paragraph it was not meant for.
 //!
 //! Every write takes `confirmed`. With `confirmed=false` nothing is written
 //! and the answer says what would change, the affected paragraph as it is and
@@ -219,6 +219,28 @@ pub struct DocsCodeParam {
     pub revision_id: String,
     /// Must be true to write. Call with false first and show the person the
     /// code.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsTableParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Put the table after this paragraph, as docs_list_paragraphs numbers
+    /// them
+    pub after_paragraph: u32,
+    /// The grid, row by row and cell by cell:
+    /// [["Model", "Parametry"], ["Mistral-7B", "7 mld"]]. Every row holds the
+    /// same number of cells, and a cell is one line of plain text.
+    pub rows: Vec<Vec<String>>,
+    /// Set the first row bold. That is the only formatting this tool writes.
+    pub header: Option<bool>,
+    /// What the paragraph you named starts with. Optional, and worth passing.
+    pub expect: Option<String>,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person the
+    /// grid.
     pub confirmed: bool,
 }
 
@@ -1074,6 +1096,95 @@ impl Gmcp {
                 spans.len()
             ),
             text,
+            next: REREAD.to_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Insert a table of plain text after the paragraph you name. `rows` is the \
+                       grid, row by row: [[\"Model\", \"Parametry\"], [\"Mistral-7B\", \"7 \
+                       mld\"]]. Every row must hold the same number of cells, a cell is one line \
+                       of plain text, and a table written here is at most 100 rows by 20 columns \
+                       — a ragged grid or a bigger one is refused before any call is made. \
+                       header=true sets the first row bold and is the only formatting on offer: \
+                       no markdown in a cell, no colours, no column widths, no borders and no \
+                       merged cells. This is the one tool here that writes twice, because the \
+                       indexes inside a table do not exist until the table does: it inserts the \
+                       empty grid, reads the document again to see where Google put each cell, \
+                       and fills them in a second write. If that second write is refused the \
+                       answer says so plainly — the table is there and empty, and it names the \
+                       paragraph numbers its cells now have. Pass the revision_id from \
+                       docs_list_paragraphs and confirmed=true after the person has seen the \
+                       grid. One write moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_insert_table(
+        &self,
+        Parameters(p): Parameters<DocsTableParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let header = p.header.unwrap_or(false);
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_table(
+            &outline,
+            &p.revision_id,
+            p.after_paragraph as usize,
+            &p.rows,
+            header,
+            p.expect.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let shape = format!("{} by {}", plan.rows, plan.columns);
+        let grid = plan.lines().join("\n");
+        if !p.confirmed {
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "insert a {shape} table after paragraph {} of the Google Doc {doc_id} in `{}`",
+                    plan.paragraph, connection.label
+                ),
+                vec![
+                    format!(
+                        "paragraph {} reads now: {}",
+                        plan.paragraph,
+                        first_lines(&plan.before)
+                    ),
+                    first_lines(&grid),
+                    match header {
+                        true => "the first row is set bold; nothing else is formatted".to_string(),
+                        false => "nothing is formatted; pass header=true for a bold first row"
+                            .to_string(),
+                    },
+                    "this writes twice: the empty table, and then its cells at the indexes \
+                     Google answers with"
+                        .to_string(),
+                ],
+            ))));
+        }
+        let paragraph = plan.paragraph;
+        let written = docs::apply_table(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "a {shape} table was inserted after paragraph {paragraph}, in two writes: the \
+                 empty grid and then its cells. The cells are paragraphs {} to {} of the \
+                 document now{}",
+                written.first_paragraph,
+                written.last_paragraph,
+                match header {
+                    true => ", and the first row is bold",
+                    false => "",
+                }
+            ),
+            text: grid,
             next: REREAD.to_string(),
         })))
     }

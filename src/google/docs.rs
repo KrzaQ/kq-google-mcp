@@ -9,16 +9,18 @@
 //! caller's own last write, so every write carries the revision it was planned
 //! against and is refused rather than applied once the document has moved on.
 //!
-//! Structural edits are still out: nothing here moves a paragraph, removes
-//! one, or writes to a table. A model that can insert, replace inside one
-//! paragraph and set a named style cannot rearrange someone's article by
-//! accident.
+//! Structural edits are still out: nothing here moves a paragraph or removes
+//! one. A model that can insert, replace inside one paragraph and set a named
+//! style cannot rearrange someone's article by accident. The one structure it
+//! may add is a table, and [`apply_table`] is the single write in this module
+//! that sends two batches; the comment on it says why.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Download, Error, Result, urlencode};
+use crate::domain::limits::{TABLE_MAX_COLUMNS, TABLE_MAX_ROWS};
 
 /// Docs is served from its own host, never from `www.googleapis.com`.
 const DOCS: &str = "docs";
@@ -599,6 +601,43 @@ pub struct Outline {
     /// Where the body ends; the last index is Docs' own final newline.
     pub end_index: i64,
     pub paragraphs: Vec<Paragraph>,
+    /// The tables the body holds, in the order it meets them. This is how a
+    /// table that has just been made is found again: what Google answered
+    /// says where each of its cells is, so nothing has to compute that.
+    tables: Vec<Grid>,
+}
+
+/// One table of the document, as Google described it.
+#[derive(Debug, Clone, PartialEq)]
+struct Grid {
+    /// Where the table itself starts, in Docs' own index.
+    index: i64,
+    rows: Vec<Vec<Cell>>,
+}
+
+/// One cell, named by its first paragraph. A cell always holds at least one
+/// paragraph, and that paragraph is where text written into the cell goes.
+#[derive(Debug, Clone, PartialEq)]
+struct Cell {
+    /// Where that paragraph starts, as Docs counts.
+    index: i64,
+    /// The number `docs_list_paragraphs` gives it.
+    ordinal: usize,
+    /// True when the cell holds no text at all.
+    empty: bool,
+}
+
+impl Grid {
+    fn cells(&self) -> impl Iterator<Item = &Cell> {
+        self.rows.iter().flatten()
+    }
+
+    /// The paragraph number of the first cell and of the last.
+    fn paragraphs(&self) -> (usize, usize) {
+        let first = self.cells().next().map_or(0, |c| c.ordinal);
+        let last = self.cells().last().map_or(0, |c| c.ordinal);
+        (first, last)
+    }
 }
 
 impl Outline {
@@ -689,6 +728,24 @@ impl Outline {
             end_index: end,
         }
     }
+
+    /// The table a write has just made: the first one at or after the index
+    /// it was inserted at that has the shape that was asked for and holds
+    /// nothing at all.
+    ///
+    /// The position alone would be enough in a document nobody else is
+    /// editing. The shape and the emptiness are checked as well because this
+    /// lookup decides where text is about to be written, and a table that is
+    /// not the new one is the one failure this whole two-batch write exists
+    /// to avoid.
+    fn new_table(&self, index: i64, rows: usize, columns: usize) -> Option<&Grid> {
+        self.tables.iter().find(|grid| {
+            grid.index >= index
+                && grid.rows.len() == rows
+                && grid.rows.iter().all(|row| row.len() == columns)
+                && grid.cells().all(|cell| cell.empty && cell.ordinal > 0)
+        })
+    }
 }
 
 /// The document as numbered paragraphs. One `documents.get`, which is the
@@ -696,7 +753,8 @@ impl Outline {
 pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> Result<Outline> {
     let wire = fetch(client, connection_id, document_id).await?;
     let mut paragraphs = Vec::new();
-    collect_paragraphs(&wire.body.content, false, &mut paragraphs);
+    let mut tables = Vec::new();
+    collect_paragraphs(&wire.body.content, false, &mut paragraphs, &mut tables);
     Ok(Outline {
         document_id: wire.document_id,
         title: wire.title,
@@ -709,6 +767,7 @@ pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> 
             .max()
             .unwrap_or(1),
         paragraphs,
+        tables,
     })
 }
 
@@ -716,7 +775,12 @@ pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> 
 /// table carries content of its own, so the walk goes through its cells and
 /// the paragraphs in them are numbered where they are met — the same walk the
 /// pictures take, for the same reason.
-fn collect_paragraphs(content: &[WireElement], in_table: bool, out: &mut Vec<Paragraph>) {
+fn collect_paragraphs(
+    content: &[WireElement],
+    in_table: bool,
+    out: &mut Vec<Paragraph>,
+    tables: &mut Vec<Grid>,
+) {
     for element in content {
         if let Some(wire) = &element.paragraph {
             let start_index = element.start_index.unwrap_or_default();
@@ -748,10 +812,29 @@ fn collect_paragraphs(content: &[WireElement], in_table: bool, out: &mut Vec<Par
                 runs,
             });
         }
-        for row in element.table.iter().flat_map(|t| &t.table_rows) {
-            for cell in &row.table_cells {
-                collect_paragraphs(&cell.content, true, out);
+        // A table is walked cell by cell, and each cell is noted as the
+        // paragraph its text would go into. The numbering is the walk's own,
+        // so a cell's paragraph number here is the number the listing gives
+        // it and the two can never drift apart.
+        if let Some(table) = &element.table {
+            let mut rows = Vec::with_capacity(table.table_rows.len());
+            for row in &table.table_rows {
+                let mut cells = Vec::with_capacity(row.table_cells.len());
+                for cell in &row.table_cells {
+                    let at = out.len();
+                    collect_paragraphs(&cell.content, true, out, tables);
+                    cells.push(Cell {
+                        index: out.get(at).map_or(0, |p| p.start_index),
+                        ordinal: out.get(at).map_or(0, |p| p.ordinal),
+                        empty: out[at..].iter().all(|p| p.text.is_empty()),
+                    });
+                }
+                rows.push(cells);
             }
+            tables.push(Grid {
+                index: element.start_index.unwrap_or_default(),
+                rows,
+            });
         }
     }
 }
@@ -1259,6 +1342,26 @@ pub async fn apply(
     document_id: &str,
     plan: Plan,
 ) -> Result<()> {
+    batch(
+        client,
+        connection_id,
+        document_id,
+        plan.requests,
+        plan.revision_id,
+    )
+    .await
+    .map_err(stale)?;
+    Ok(())
+}
+
+/// One `documents.batchUpdate`, against the revision it was planned for.
+async fn batch(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    requests: Vec<DocRequest>,
+    revision_id: String,
+) -> Result<()> {
     let request = client
         .service(DOCS)
         .post(&format!(
@@ -1266,12 +1369,12 @@ pub async fn apply(
             urlencode(document_id)
         ))?
         .json(&BatchUpdate {
-            requests: plan.requests,
+            requests,
             write_control: Some(WriteControl {
-                required_revision_id: plan.revision_id,
+                required_revision_id: revision_id,
             }),
         });
-    let _: WireBatchReply = client.json(connection_id, request).await.map_err(stale)?;
+    let _: WireBatchReply = client.json(connection_id, request).await?;
     Ok(())
 }
 
@@ -1289,6 +1392,294 @@ fn stale(e: Error) -> Error {
         }
         _ => e,
     }
+}
+
+// ----- a table ---------------------------------------------------------------
+
+/// A table on its way into a document: the empty grid, planned against the
+/// caller's revision, and the text that goes in its cells afterwards.
+///
+/// The cells are not in the plan's requests, because where they go is not
+/// known yet: the indexes inside a table are Google's answer to the write
+/// that makes it. [`apply_table`] is where that happens.
+#[derive(Debug)]
+pub struct TablePlan {
+    /// The paragraph the table goes after.
+    pub paragraph: usize,
+    /// How that paragraph reads now.
+    pub before: String,
+    pub rows: usize,
+    pub columns: usize,
+    /// Whether the first row is set bold, which is the only formatting here.
+    pub header: bool,
+    /// Where the table goes, in Docs' own index.
+    pub index: i64,
+    grid: Vec<Vec<String>>,
+    revision_id: String,
+    requests: Vec<DocRequest>,
+}
+
+impl TablePlan {
+    /// The grid as lines, one row to a line, for a person to read before it
+    /// is written.
+    pub fn lines(&self) -> Vec<String> {
+        self.grid.iter().map(|row| row.join(" | ")).collect()
+    }
+}
+
+/// Where a table landed, once both batches have gone through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertedTable {
+    pub rows: usize,
+    pub columns: usize,
+    /// The paragraph numbers of the first and the last cell, as
+    /// `docs_list_paragraphs` numbers them. Filling a cell adds no paragraph,
+    /// so these are the numbers of the finished table too.
+    pub first_paragraph: usize,
+    pub last_paragraph: usize,
+    /// Where the table starts, in Docs' own index.
+    pub index: i64,
+}
+
+/// A grid of plain text after the paragraph a caller numbered. The cells are
+/// text and nothing else: no markdown, no colours, no widths, no borders and
+/// no merged cells, because a magazine table needs none of those and every
+/// one of them is a thing that can go wrong in somebody's document.
+pub fn plan_table(
+    outline: &Outline,
+    revision_id: &str,
+    after_paragraph: usize,
+    rows: &[Vec<String>],
+    header: bool,
+    expect: Option<&str>,
+) -> Result<TablePlan> {
+    outline.check_revision(revision_id)?;
+    // The whole grid is checked before anything is sent, so a table Google
+    // would have made and this server could not have filled is refused while
+    // the document is still untouched.
+    let (height, width) = grid_size(rows)?;
+    let neighbour = outline.paragraph(after_paragraph)?;
+    if let Some(expect) = expect {
+        neighbour.check_expect(expect)?;
+    }
+    // Where a new paragraph would go is where the table goes. Docs writes a
+    // newline of its own before a table, so this insert carries none.
+    let (index, _, _) = outline.insertion(At::After(after_paragraph), neighbour, "");
+    Ok(TablePlan {
+        paragraph: neighbour.ordinal,
+        before: neighbour.text.clone(),
+        rows: height,
+        columns: width,
+        header,
+        index,
+        grid: rows.to_vec(),
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![DocRequest {
+            insert_table: Some(InsertTable {
+                rows: height as i64,
+                columns: width as i64,
+                location: Location { index },
+            }),
+            ..DocRequest::default()
+        }],
+    })
+}
+
+/// How many rows and columns the grid has, or the first reason it is not a
+/// table: no rows at all, a row that holds a different number of cells than
+/// the first one, a cell that is more than one line, or more rows or columns
+/// than a tool here writes.
+fn grid_size(rows: &[Vec<String>]) -> Result<(usize, usize)> {
+    let Some(first) = rows.first() else {
+        return Err(Error::Unsupported(
+            "there is nothing to insert: the table has no rows".into(),
+        ));
+    };
+    let columns = first.len();
+    if columns == 0 {
+        return Err(Error::Unsupported(
+            "there is nothing to insert: row 1 holds no cells, so the table has no columns".into(),
+        ));
+    }
+    for (at, row) in rows.iter().enumerate() {
+        if row.len() != columns {
+            return Err(Error::Unsupported(format!(
+                "row {} holds {} cell{} and row 1 holds {columns}; every row of a table holds \
+                 the same number of cells. Nothing was written",
+                at + 1,
+                row.len(),
+                if row.len() == 1 { "" } else { "s" }
+            )));
+        }
+        for (cell, text) in row.iter().enumerate() {
+            if text.contains('\n') || text.contains('\r') {
+                return Err(Error::Unsupported(format!(
+                    "the cell in row {}, column {} holds a line break; a cell here is one line \
+                     of plain text. Nothing was written",
+                    at + 1,
+                    cell + 1
+                )));
+            }
+        }
+    }
+    if rows.len() > TABLE_MAX_ROWS {
+        return Err(Error::Unsupported(format!(
+            "this table has {} rows and a table written here holds at most {TABLE_MAX_ROWS}; \
+             count the data again, and put a longer table in a spreadsheet. Nothing was written",
+            rows.len()
+        )));
+    }
+    if columns > TABLE_MAX_COLUMNS {
+        return Err(Error::Unsupported(format!(
+            "this table has {columns} columns and a table written here holds at most \
+             {TABLE_MAX_COLUMNS}; count the data again. Nothing was written"
+        )));
+    }
+    Ok((rows.len(), columns))
+}
+
+/// The one write in this module that sends two batches, deliberately.
+///
+/// `insertTable` makes an empty grid, and filling it means writing at indexes
+/// inside cells that do not exist until the table does. Those indexes could
+/// be worked out from a formula for the new layout and everything sent in one
+/// batch. They are not. A formula would be proved only against a fixture this
+/// repository wrote itself, so a wrong formula and a wrong fixture would agree
+/// with each other while the text landed in the wrong cells of a real
+/// document.
+///
+/// So: the empty grid, then `documents.get` again, then the cells filled at
+/// the indexes Google itself answered with — in reverse document order, so
+/// that each insert leaves the indexes of the ones still to come exactly
+/// where they were. A header's bold follows its own cell's insert straight
+/// away, while that text is still where it was just put. Both batches carry a
+/// revision: the caller's, and then the one from this server's own re-read,
+/// so anything that changed in between refuses the second batch.
+///
+/// When the second batch does fail, the table is there and empty. That is
+/// what the error says, with the paragraph numbers it occupies. An empty
+/// table a person can see and fix is an acceptable failure; text in the wrong
+/// cells is not.
+pub async fn apply_table(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    plan: TablePlan,
+) -> Result<InsertedTable> {
+    let TablePlan {
+        rows,
+        columns,
+        header,
+        index,
+        grid,
+        revision_id,
+        requests,
+        ..
+    } = plan;
+    batch(client, connection_id, document_id, requests, revision_id)
+        .await
+        .map_err(stale)?;
+    // From here a table exists in somebody's document, so every refusal below
+    // says that, rather than reading as though nothing had happened.
+    let after = outline(client, connection_id, document_id)
+        .await
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "{}, and reading the document back to find its cells failed: {e}. Call \
+                 docs_list_paragraphs to see where it is",
+                made(rows, columns)
+            ))
+        })?;
+    let Some(table) = after.new_table(index, rows, columns) else {
+        return Err(Error::Unsupported(format!(
+            "{}, and this server could not find it in the document it read back, so nothing \
+             was written into its cells. Call docs_list_paragraphs to see where it is",
+            made(rows, columns)
+        )));
+    };
+    let (first_paragraph, last_paragraph) = table.paragraphs();
+    let requests = fill_requests(table, &grid, header);
+    if !requests.is_empty() {
+        batch(
+            client,
+            connection_id,
+            document_id,
+            requests,
+            after.revision_id.clone(),
+        )
+        .await
+        .map_err(|e| empty_table(rows, columns, first_paragraph, last_paragraph, e))?;
+    }
+    Ok(InsertedTable {
+        rows,
+        columns,
+        first_paragraph,
+        last_paragraph,
+        index: table.index,
+    })
+}
+
+/// What the first batch did, in the words every refusal after it starts with.
+fn made(rows: usize, columns: usize) -> String {
+    format!("the {rows} by {columns} table was created and is empty")
+}
+
+/// The second batch failed, so the table stands there with nothing in it.
+/// The answer says exactly that, says where it is in numbers the next call
+/// can use, and says what to do about it.
+fn empty_table(
+    rows: usize,
+    columns: usize,
+    first_paragraph: usize,
+    last_paragraph: usize,
+    e: Error,
+) -> Error {
+    Error::Unsupported(format!(
+        "{}: its cells are paragraphs {first_paragraph} to {last_paragraph} of the document as \
+         it stands now, and none of the text was written into them. Fill a cell with \
+         docs_insert_text before_paragraph=<that number>, change one that already holds text \
+         with docs_edit_paragraph, or delete the table in Docs and start again. Read the \
+         document with docs_list_paragraphs first, because the numbers here are from this \
+         server's own read and the write that failed may have been refused because somebody \
+         else was editing. Google refused the second write: {e}",
+        made(rows, columns)
+    ))
+}
+
+/// The requests that fill the cells, in reverse document order.
+///
+/// An insert moves everything after it, so the last cell is written first and
+/// every index still to be used is the one Google gave for a document that
+/// has not moved yet. A header cell is set bold immediately after its own
+/// insert, where the text covers exactly the units it was just written at.
+/// An empty cell is skipped: Docs refuses an insert of no text.
+fn fill_requests(table: &Grid, grid: &[Vec<String>], header: bool) -> Vec<DocRequest> {
+    let mut requests = Vec::new();
+    for (at, (row, texts)) in table.rows.iter().zip(grid).enumerate().rev() {
+        for (cell, text) in row.iter().zip(texts).rev() {
+            if text.is_empty() {
+                continue;
+            }
+            requests.push(insert_request(cell.index, text));
+            if header && at == 0 {
+                requests.push(DocRequest {
+                    update_text_style: Some(UpdateTextStyle {
+                        range: Range {
+                            start_index: cell.index,
+                            end_index: cell.index + index::len(text),
+                        },
+                        text_style: TextStyle {
+                            bold: Some(true),
+                            ..TextStyle::default()
+                        },
+                        fields: "bold".to_string(),
+                    }),
+                    ..DocRequest::default()
+                });
+            }
+        }
+    }
+    requests
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1562,6 +1953,18 @@ struct DocRequest {
     replace_all_text: Option<ReplaceAllText>,
     #[serde(skip_serializing_if = "Option::is_none")]
     insert_inline_image: Option<InsertInlineImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert_table: Option<InsertTable>,
+}
+
+/// Docs writes a newline of its own before the table it inserts, so the
+/// paragraph the caller named keeps its own ending and the table follows it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertTable {
+    rows: i64,
+    columns: i64,
+    location: Location,
 }
 
 /// Docs fetches `uri` itself while the batch runs, so the picture has to be
