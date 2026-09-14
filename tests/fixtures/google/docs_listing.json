@@ -1,0 +1,129 @@
+{
+  "documentId": "1LiStInGdOcIdExAmPlE0123456789abcdef",
+  "title": "Listing",
+  "revisionId": "ALm37BW0Listing1",
+  "body": {
+    "content": [
+      {
+        "startIndex": 0,
+        "endIndex": 1,
+        "sectionBreak": {
+          "sectionStyle": {}
+        }
+      },
+      {
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 1,
+              "endIndex": 10,
+              "textRun": {
+                "content": "Przykład\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 10,
+        "endIndex": 24,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 10,
+              "endIndex": 14,
+              "textRun": {
+                "content": "let ",
+                "textStyle": {
+                  "bold": true,
+                  "weightedFontFamily": {
+                    "fontFamily": "Courier New",
+                    "weight": 400
+                  },
+                  "fontSize": {
+                    "magnitude": 10,
+                    "unit": "PT"
+                  },
+                  "foregroundColor": {
+                    "color": {
+                      "rgbColor": {
+                        "red": 1
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "startIndex": 14,
+              "endIndex": 18,
+              "textRun": {
+                "content": "ż = ",
+                "textStyle": {
+                  "weightedFontFamily": {
+                    "fontFamily": "Courier New",
+                    "weight": 400
+                  },
+                  "fontSize": {
+                    "magnitude": 10,
+                    "unit": "PT"
+                  }
+                }
+              }
+            },
+            {
+              "startIndex": 18,
+              "endIndex": 22,
+              "textRun": {
+                "content": "\"😀\"",
+                "textStyle": {
+                  "italic": true,
+                  "weightedFontFamily": {
+                    "fontFamily": "Courier New",
+                    "weight": 400
+                  },
+                  "fontSize": {
+                    "magnitude": 10,
+                    "unit": "PT"
+                  },
+                  "foregroundColor": {
+                    "color": {
+                      "rgbColor": {
+                        "green": 1
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "startIndex": 22,
+              "endIndex": 24,
+              "textRun": {
+                "content": ";\n",
+                "textStyle": {
+                  "weightedFontFamily": {
+                    "fontFamily": "Courier New",
+                    "weight": 400
+                  },
+                  "fontSize": {
+                    "magnitude": 10,
+                    "unit": "PT"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -561,6 +561,79 @@ pub struct DocParagraphOut {
     pub truncated: bool,
 }
 
+/// A document as the runs it is made of: what `docs_read` cannot say,
+/// because the markdown export throws every colour, font and weight away.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocFormattingOut {
+    pub account: String,
+    pub doc_id: String,
+    pub title: String,
+    pub url: String,
+    /// The same revision id docs_list_paragraphs answers with, so a write can
+    /// be planned straight off this read.
+    pub revision_id: String,
+    /// How many paragraphs the document has, whatever this answer shows.
+    pub count: usize,
+    /// The range shown, 1-based and inclusive.
+    pub from: usize,
+    pub to: usize,
+    pub paragraphs: Vec<DocRunsOut>,
+    pub note: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocRunsOut {
+    /// What to pass as `paragraph` to a write.
+    pub paragraph: usize,
+    /// Docs' own name for the style: NORMAL_TEXT, HEADING_2, TITLE.
+    pub style: String,
+    /// How many characters the paragraph holds.
+    pub chars: usize,
+    pub in_table: bool,
+    /// The runs, in order and covering the paragraph end to end.
+    pub runs: Vec<DocRunOut>,
+}
+
+/// One run of a paragraph. Only what the document sets is here: a run with no
+/// colour, no weight and no font of its own answers `start`, `end` and `text`
+/// and nothing else, so a plain paragraph is one bare run.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DocRunOut {
+    /// The first character of the run, counting from 0 at the start of the
+    /// paragraph. These are the units docs_insert_code takes for its spans.
+    pub start: usize,
+    /// One past the last character of the run.
+    pub end: usize,
+    pub text: String,
+    /// The foreground colour, as #rrggbb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    /// The size in points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+}
+
+impl From<docs::StyledRun> for DocRunOut {
+    fn from(run: docs::StyledRun) -> Self {
+        Self {
+            start: run.start,
+            end: run.end,
+            text: run.text,
+            colour: run.style.colour,
+            bold: run.style.bold,
+            italic: run.style.italic,
+            font: run.style.font,
+            size: run.style.size,
+        }
+    }
+}
+
 /// What one paragraph write did, and what it invalidated by doing it.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DocEditOut {

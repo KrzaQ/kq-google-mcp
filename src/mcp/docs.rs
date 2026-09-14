@@ -112,6 +112,23 @@ pub struct DocsParagraphsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocsFormattingParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// The document id, the long string in its Docs URL
+    pub doc_id: String,
+    /// One paragraph, as docs_list_paragraphs numbers them. Give this, or
+    /// from and to, not both.
+    pub paragraph: Option<u32>,
+    /// The first paragraph to read, counting from 1; the start of the
+    /// document by default
+    pub from: Option<u32>,
+    /// The last paragraph to read, counting from 1 and included; the end of
+    /// the document by default
+    pub to: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocsInsertParam {
     pub account: String,
     pub doc_id: String,
@@ -616,6 +633,97 @@ impl Gmcp {
                 .to_string(),
         };
         Ok(Json(dto::DocParagraphsOut {
+            account: connection.label,
+            url: outline.url(),
+            doc_id: outline.document_id,
+            title: outline.title,
+            revision_id: outline.revision_id,
+            count,
+            from,
+            to: paragraphs.last().map(|p| p.paragraph).unwrap_or(to),
+            paragraphs,
+            note,
+        }))
+    }
+
+    #[tool(
+        description = "The colours, fonts and weights a Google Doc actually holds, paragraph by \
+                       paragraph. docs_read goes through Drive's markdown export, which throws \
+                       every colour, font and size away, so this is the only way to read back a \
+                       listing docs_insert_code coloured. For each paragraph it answers the named \
+                       style and the text runs; a run is {start, end, text} plus only the \
+                       properties the document sets on it — colour as #rrggbb, bold, italic, font \
+                       and size in points — so a paragraph nobody styled comes back as one bare \
+                       run rather than a wall of defaults. start and end count characters from \
+                       the beginning of the paragraph, the same units docs_insert_code takes for \
+                       its spans, so what comes out here can be fed back in. Two things to expect \
+                       before you conclude the document is wrong: Docs merges neighbouring \
+                       characters that share a style into one run, so a listing written as twenty \
+                       spans reads back as fewer runs than that, and the comparison to make is \
+                       what colour sits at a given offset rather than how many runs there are. \
+                       Ask for one paragraph with `paragraph`, or a range with from and to; the \
+                       answer is capped and says which paragraph to ask from next."
+    )]
+    async fn docs_read_formatting(
+        &self,
+        Parameters(p): Parameters<DocsFormattingParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::DocFormattingOut>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        if p.paragraph.is_some() && (p.from.is_some() || p.to.is_some()) {
+            return Err(bad(
+                "say which paragraphs once: `paragraph` for one, or from and to for a range",
+            ));
+        }
+        let outline = docs::outline(&self.google()?.client, connection.id, p.doc_id.trim())
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let count = outline.paragraphs.len();
+        let from = (p.paragraph.or(p.from).unwrap_or(1) as usize).max(1);
+        let to = p
+            .paragraph
+            .or(p.to)
+            .map(|t| t as usize)
+            .unwrap_or(count)
+            .min(count);
+        let mut budget = LISTING_MAX_CHARS;
+        let mut stopped = None;
+        let mut paragraphs = Vec::new();
+        for paragraph in outline.paragraphs.iter().skip(from.saturating_sub(1)) {
+            if paragraph.ordinal > to {
+                break;
+            }
+            if budget == 0 {
+                stopped = Some(paragraph.ordinal);
+                break;
+            }
+            // A paragraph is answered whole or not at all: a run cut in half
+            // would report an offset that covers fewer characters than it
+            // says, and the offsets are the point of this tool.
+            let runs: Vec<dto::DocRunOut> =
+                paragraph.formatting().into_iter().map(Into::into).collect();
+            budget -= paragraph.chars().min(budget);
+            paragraphs.push(dto::DocRunsOut {
+                paragraph: paragraph.ordinal,
+                style: paragraph.style.clone(),
+                chars: paragraph.chars(),
+                in_table: paragraph.in_table,
+                runs,
+            });
+        }
+        let note = match stopped {
+            Some(at) => format!(
+                "stopped at paragraph {at} to keep this answer small; ask again with from={at}"
+            ),
+            None if paragraphs.is_empty() => format!(
+                "this document has {count} paragraphs, so there is nothing to read from {from}"
+            ),
+            None => "Docs merges neighbouring characters that share a style into one run, so a \
+                     listing comes back as fewer runs than the spans that wrote it. Compare the \
+                     colour at an offset, not the number of runs."
+                .to_string(),
+        };
+        Ok(Json(dto::DocFormattingOut {
             account: connection.label,
             url: outline.url(),
             doc_id: outline.document_id,

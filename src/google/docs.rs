@@ -386,11 +386,11 @@ pub mod index {
     /// other way round. `None` when the offset is past the end of the text or
     /// halfway through a surrogate pair, which is no character at all.
     ///
-    /// Nothing in the server converts this way — Google is told indexes and
-    /// never asked for them — but the tests walk both directions over the
-    /// same Polish and emoji text, because an index that is wrong one way is
-    /// wrong the other.
-    #[allow(dead_code)]
+    /// A write is told indexes and never asked for them, so this is the read
+    /// direction: `docs_read_formatting` reports each run in the characters
+    /// its caller counts. The tests walk both directions over the same Polish
+    /// and emoji text, because an index that is wrong one way is wrong the
+    /// other.
     pub fn to_chars(text: &str, units: i64) -> Option<usize> {
         let mut left = units;
         for (seen, c) in text.chars().enumerate() {
@@ -459,12 +459,83 @@ pub struct Paragraph {
 struct Run {
     start_index: i64,
     text: String,
+    style: RunStyle,
+}
+
+/// What one run of text is set to, and only that. Docs answers with the
+/// properties somebody chose on the run and leaves out the ones it inherits
+/// from the paragraph's named style, so an absent value here means the
+/// document says nothing about it and not that it is off.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunStyle {
+    /// The foreground colour as `#rrggbb`.
+    pub colour: Option<String>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub font: Option<String>,
+    /// The size in points, as Docs measures it.
+    pub size: Option<f64>,
+}
+
+/// One run of a paragraph, with the characters it covers.
+///
+/// `start` and `end` count characters from the start of the paragraph, which
+/// is what [`Span`] takes: a listing read back this way can be written back
+/// with the same numbers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledRun {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub style: RunStyle,
 }
 
 impl Paragraph {
     /// How many characters the paragraph holds, as a person counts them.
     pub fn chars(&self) -> usize {
         self.text.chars().count()
+    }
+
+    /// The runs this paragraph is made of, each with the characters it covers
+    /// and only the properties the document sets on it.
+    ///
+    /// Docs merges neighbouring characters that share a style into one run,
+    /// so a listing written as twenty coloured spans reads back as fewer runs
+    /// than that. The colour at a given offset is the thing to compare; the
+    /// number of runs is Docs' own business.
+    ///
+    /// The offsets are characters and Docs' indexes are UTF-16 code units, so
+    /// the walk counts units and converts through [`index`], the one place
+    /// this module does that.
+    pub fn formatting(&self) -> Vec<StyledRun> {
+        let mut out = Vec::with_capacity(self.runs.len());
+        let mut units = 0;
+        for (at, run) in self.runs.iter().enumerate() {
+            // Only the last run of a paragraph can carry the newline that
+            // ends it, and `text` does not hold that newline.
+            let text = match at + 1 == self.runs.len() {
+                true => run.text.strip_suffix('\n').unwrap_or(&run.text),
+                false => run.text.as_str(),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let start = index::to_chars(&self.text, units);
+            units += index::len(text);
+            let (Some(start), Some(end)) = (start, index::to_chars(&self.text, units)) else {
+                // The runs and the text they were joined from disagree, which
+                // they cannot; reporting nothing is better than reporting an
+                // offset a write would act on.
+                return Vec::new();
+            };
+            out.push(StyledRun {
+                start,
+                end,
+                text: text.to_string(),
+                style: run.style.clone(),
+            });
+        }
+        out
     }
 
     /// The document index of a byte offset into [`Paragraph::text`], or
@@ -657,6 +728,7 @@ fn collect_paragraphs(content: &[WireElement], in_table: bool, out: &mut Vec<Par
                     runs.push(Run {
                         start_index: at,
                         text: run.content.clone(),
+                        style: RunStyle::from(&run.text_style),
                     });
                     cursor = at + index::len(&run.content);
                 } else {
@@ -1192,6 +1264,81 @@ struct WireParagraphElement {
 #[serde(rename_all = "camelCase", default)]
 struct WireTextRun {
     content: String,
+    text_style: WireTextStyle,
+}
+
+/// What Docs says about one run. Every field is optional because Docs sends
+/// only what the document sets: a run nobody styled comes back with no text
+/// style at all.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireTextStyle {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    foreground_color: Option<WireOptionalColor>,
+    weighted_font_family: Option<WireWeightedFontFamily>,
+    font_size: Option<WireDimension>,
+}
+
+/// Docs' `OptionalColor`: an object with no `color` at all means the run is
+/// deliberately set to no colour, which is not the same as inheriting one.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireOptionalColor {
+    color: Option<WireColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireColor {
+    rgb_color: WireRgbColor,
+}
+
+/// Each channel is a fraction of one, and a channel that is zero is left out
+/// of the JSON altogether, so an absent channel is none of that colour.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireRgbColor {
+    red: f32,
+    green: f32,
+    blue: f32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireWeightedFontFamily {
+    font_family: String,
+}
+
+impl From<&WireTextStyle> for RunStyle {
+    fn from(wire: &WireTextStyle) -> Self {
+        Self {
+            colour: wire
+                .foreground_color
+                .as_ref()
+                .and_then(|c| c.color.as_ref())
+                .map(|c| hex(&c.rgb_color)),
+            bold: wire.bold,
+            italic: wire.italic,
+            font: wire
+                .weighted_font_family
+                .as_ref()
+                .and_then(|f| some(&f.font_family)),
+            size: wire.font_size.as_ref().and_then(|d| d.magnitude),
+        }
+    }
+}
+
+/// A Docs colour written the way a caller passes one in: [`rgb`] the other
+/// way round, so a colour that went in as `#1a7f37` comes back as `#1a7f37`.
+fn hex(colour: &WireRgbColor) -> String {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(colour.red),
+        channel(colour.green),
+        channel(colour.blue)
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]

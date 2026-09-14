@@ -345,6 +345,7 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("drive_view_image", needs(Service::Drive, Level::Read)),
     ("docs_read", needs(Service::Docs, Level::Read)),
     ("docs_list_paragraphs", needs(Service::Docs, Level::Read)),
+    ("docs_read_formatting", needs(Service::Docs, Level::Read)),
     ("docs_list_images", needs(Service::Docs, Level::Read)),
     ("docs_view_image", needs(Service::Docs, Level::Read)),
     ("docs_image_link", needs(Service::Docs, Level::Read)),
@@ -571,7 +572,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 50);
+        assert_eq!(TOOLS.len(), 51);
     }
 
     #[test]
@@ -598,6 +599,7 @@ mod tests {
             [
                 "docs_read",
                 "docs_list_paragraphs",
+                "docs_read_formatting",
                 "docs_list_images",
                 "docs_view_image",
                 "docs_image_link"

@@ -3978,6 +3978,87 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
     drop(server);
 }
 
+const LISTING: &str = "1LiStInGdOcIdExAmPlE0123456789abcdef";
+
+/// What docs_read is unable to answer: a paragraph nobody styled as one bare
+/// run, and a coloured listing in the character offsets that wrote it.
+#[tokio::test]
+async fn docs_read_formatting_answers_runs_a_span_can_be_written_from() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{LISTING}"),
+        fixture("docs_listing.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let plain = c
+        .ok(
+            "docs_read_formatting",
+            json!({"account": "work", "doc_id": LISTING, "paragraph": 1}),
+        )
+        .await;
+    assert_eq!(plain["revision_id"], "ALm37BW0Listing1");
+    assert_eq!(plain["count"], 2);
+    assert_eq!(plain["from"], 1);
+    assert_eq!(plain["to"], 1);
+    let runs = plain["paragraphs"][0]["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    // A wall of defaults is what this tool exists not to send: a run the
+    // document says nothing about carries three keys and no more.
+    assert_eq!(runs[0], json!({"start": 0, "end": 8, "text": "Przykład"}));
+
+    let listing = c
+        .ok(
+            "docs_read_formatting",
+            json!({"account": "work", "doc_id": LISTING, "paragraph": 2}),
+        )
+        .await;
+    let runs = listing["paragraphs"][0]["runs"].as_array().unwrap();
+    // Four runs, where docs_insert_code would have written two spans and one
+    // font over the whole block: Docs merged what shares a style, which is
+    // why the note says to compare the colour at an offset.
+    assert_eq!(runs.len(), 4);
+    assert_eq!(runs[0]["colour"], "#ff0000");
+    assert_eq!(runs[0]["bold"], true);
+    assert!(runs[0]["italic"].is_null(), "{}", runs[0]);
+    // The quoted emoji: three characters, four UTF-16 units. The offsets are
+    // the ones docs_insert_code takes.
+    assert_eq!(
+        (runs[2]["start"].as_u64(), runs[2]["end"].as_u64()),
+        (Some(8), Some(11))
+    );
+    assert_eq!(runs[2]["text"], "\"😀\"");
+    assert_eq!(runs[2]["colour"], "#00ff00");
+    assert_eq!(runs[3]["font"], "Courier New");
+    assert_eq!(runs[3]["size"], 10.0);
+    assert!(
+        listing["note"].as_str().unwrap().contains("merges"),
+        "{}",
+        listing["note"]
+    );
+
+    // The whole document, and then a range that says nothing at all.
+    let all = c
+        .ok(
+            "docs_read_formatting",
+            json!({"account": "work", "doc_id": LISTING}),
+        )
+        .await;
+    assert_eq!(all["paragraphs"].as_array().unwrap().len(), 2);
+    let refused = c
+        .refused(
+            "docs_read_formatting",
+            json!({"account": "work", "doc_id": LISTING, "paragraph": 1, "to": 2}),
+        )
+        .await;
+    assert!(refused.contains("once"), "{refused}");
+    drop(server);
+}
+
 // ----- sheets -----------------------------------------------------------------
 
 #[tokio::test]

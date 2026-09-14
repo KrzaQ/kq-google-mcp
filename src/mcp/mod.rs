@@ -81,7 +81,9 @@ fn instructions(portal: &str) -> String {
          A Google Doc is changed paragraph by paragraph: call docs_list_paragraphs first, pass \
          the numbers and the revision_id it answers with to docs_insert_text, \
          docs_edit_paragraph, docs_style_paragraph or docs_insert_code, and call it again after \
-         every write, because one write moves both.\n\
+         every write, because one write moves both. docs_read answers the words and no \
+         formatting at all, so read a colour, a font or a weight back with \
+         docs_read_formatting.\n\
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \

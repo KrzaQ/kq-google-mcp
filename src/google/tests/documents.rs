@@ -865,3 +865,89 @@ async fn a_listing_that_cannot_be_coloured_completely_is_refused() {
         docs::plan_code(&outline, REVISION, 2, CODE, Some("Roboto Mono"), &[], None).unwrap();
     assert_eq!(plain.requests(), 2);
 }
+
+// ----- reading the formatting back -------------------------------------------
+
+const LISTING: &str = "1LiStInGdOcIdExAmPlE0123456789abcdef";
+const LISTING_AT: &str = "/v1/documents/1LiStInGdOcIdExAmPlE0123456789abcdef";
+
+/// Character offsets out, UTF-16 indexes back in. This is the whole contract
+/// of the read: what comes out of a run can be written back as a span, and
+/// the text it is measured over is Polish with an emoji in it, where the
+/// three counts all disagree.
+#[tokio::test]
+async fn runs_are_reported_in_the_characters_a_span_is_written_in() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    let paragraph = outline.paragraph(3).unwrap();
+    let runs = paragraph.formatting();
+
+    assert_eq!(
+        runs.iter()
+            .map(|r| (r.start, r.end, r.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, 20, "Zażółć gęślą jaźń 😀 "), (20, 29, "już i już")]
+    );
+    // Only what the document sets. The first run says nothing at all, and the
+    // second says bold and nothing else — not that it is black, not that it
+    // is upright.
+    assert_eq!(runs[0].style, docs::RunStyle::default());
+    assert_eq!(runs[1].style.bold, Some(true));
+    assert_eq!(runs[1].style.colour, None);
+    assert_eq!(runs[1].style.font, None);
+    // The offsets convert back to the indexes Docs itself gave the runs,
+    // which is what makes them usable as a span.
+    for (run, index) in runs.iter().zip([30, 51]) {
+        assert_eq!(
+            paragraph.start_index + docs::index::from_chars(&paragraph.text, run.start).unwrap(),
+            index,
+            "{:?}",
+            run.text
+        );
+    }
+    // The newline that ends the paragraph is not a character of it.
+    assert_eq!(runs.last().unwrap().end, paragraph.chars());
+}
+
+/// A paragraph nobody styled is one bare run, and a listing comes back with
+/// the colours it was written with — in fewer runs than the spans that wrote
+/// it, because Docs merges neighbours that share a style.
+#[tokio::test]
+async fn a_listing_reads_back_with_its_colours_and_its_font() {
+    let h = harness().await;
+    h.mount_json("GET", LISTING_AT, fixture("docs_listing.json"))
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, LISTING).await.unwrap();
+
+    let plain = outline.paragraph(1).unwrap().formatting();
+    assert_eq!(plain.len(), 1);
+    assert_eq!((plain[0].start, plain[0].end), (0, 8));
+    assert_eq!(plain[0].text, "Przykład");
+    assert_eq!(plain[0].style, docs::RunStyle::default());
+
+    let listing = outline.paragraph(2).unwrap().formatting();
+    assert_eq!(
+        listing
+            .iter()
+            .map(|r| (r.start, r.end, r.text.as_str(), r.style.colour.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (0, 4, "let ", Some("#ff0000")),
+            (4, 8, "ż = ", None),
+            // The quoted emoji is three characters and four code units, so a
+            // colour read at character 8 is a colour written at character 8.
+            (8, 11, "\"😀\"", Some("#00ff00")),
+            (11, 12, ";", None),
+        ]
+    );
+    // Docs leaves a zero channel out of the JSON, so #ff0000 arrives as red
+    // alone and must not come back as #ff0000 minus its black.
+    assert_eq!(listing[0].style.bold, Some(true));
+    assert_eq!(listing[2].style.italic, Some(true));
+    assert_eq!(listing[0].style.italic, None);
+    // The font covered the whole listing, so every run carries it.
+    for run in &listing {
+        assert_eq!(run.style.font.as_deref(), Some(docs::CODE_FONT));
+        assert_eq!(run.style.size, Some(10.0));
+    }
+}
