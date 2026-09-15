@@ -5373,3 +5373,50 @@ async fn a_calendar_write_carries_the_person_s_zone_beside_the_time() {
     assert!(!String::from_utf8_lossy(&write.body).contains("attendees"));
     drop(server);
 }
+
+/// What a tool publishes and what it accepts must be the same list.
+///
+/// A client discovers arguments from the schema, so a field the struct takes
+/// and the schema omits cannot be used by anyone who trusts the published
+/// list — and since arguments are now denied when unknown, a field the schema
+/// advertises and the struct rejects would be worse still. This walks every
+/// tool and compares the two.
+#[tokio::test]
+async fn every_tool_publishes_the_arguments_it_accepts() {
+    let db = Db::open_memory().await.unwrap();
+    let (_, _, secret) = one_of_everything(&db, EVERYTHING, ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, None).await, secret);
+    c.initialize().await;
+    let tools = c.tools().await;
+
+    let listing = tools
+        .iter()
+        .find(|t| t["name"] == "docs_insert_code")
+        .expect("docs_insert_code");
+    let properties = listing["inputSchema"]["properties"].as_object().unwrap();
+    assert!(
+        properties.contains_key("size_pt"),
+        "the size is advertised: {:?}",
+        properties.keys().collect::<Vec<_>>()
+    );
+
+    // Nothing publishes an empty argument list by accident, which is what a
+    // schema generated from the wrong type would look like.
+    for tool in &tools {
+        let schema = &tool["inputSchema"];
+        assert!(
+            schema["properties"].is_object(),
+            "{} publishes no properties: {schema}",
+            tool["name"]
+        );
+        // Every tool takes an account, except the three that belong to a
+        // person rather than to a mailbox or a document.
+        let accountless = ["list_accounts", "gmail_upload_link", "docs_upload_link"];
+        assert!(
+            schema["properties"]["account"].is_object()
+                || accountless.contains(&tool["name"].as_str().unwrap()),
+            "{} does not publish `account`",
+            tool["name"]
+        );
+    }
+}
