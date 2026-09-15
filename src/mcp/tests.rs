@@ -4081,7 +4081,7 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
 
     let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
     "code": "let ż = \"😀\";", "expect": "Część",
-    "revision_id": ARTICLE_REVISION,
+    "revision_id": ARTICLE_REVISION, "size_pt": 8,
     "spans": [
         {"start": 0, "end": 3, "colour": "#ff0000", "bold": true},
         {"start": 8, "end": 11, "color": "#00ff00", "italic": true}
@@ -4093,7 +4093,10 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
         lines.contains("2 spans"),
         "the preview counts the spans: {lines}"
     );
-    assert!(lines.contains("Courier New"), "{lines}");
+    // The size is named, not merely accepted. A person approving a listing has
+    // to see it, and a model has to see that the size it asked for was
+    // understood rather than dropped by a build that never knew the argument.
+    assert!(lines.contains("Courier New 8 pt"), "{lines}");
     assert!(
         lines.contains("let ż = \"😀\";"),
         "the preview shows the code: {lines}"

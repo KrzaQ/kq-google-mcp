@@ -1054,6 +1054,13 @@ impl Gmcp {
         let outline = docs::outline(client, connection.id, &doc_id)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
+        // A person approving a listing has to see the size, and a model has to
+        // see that the size it asked for was understood: a build that did not
+        // know size_pt would otherwise write 11 pt and say nothing about it.
+        let set_in = match p.size_pt {
+            Some(size) => format!("{font} {}", dto::points(size)),
+            None => font.clone(),
+        };
         let plan = docs::plan_code(
             &outline,
             &p.revision_id,
@@ -1080,7 +1087,7 @@ impl Gmcp {
                         first_lines(&plan.before)
                     ),
                     format!(
-                        "{} characters of code, in {font}, with {} spans coloured",
+                        "{} characters of code, in {set_in}, with {} spans coloured",
                         plan.after.chars().count(),
                         spans.len()
                     ),
@@ -1099,7 +1106,7 @@ impl Gmcp {
             paragraph,
             written: format!(
                 "{} characters of code inserted after paragraph {paragraph} in one batch of \
-                 {requests} requests: the text, the {font} font and {} spans",
+                 {requests} requests: the text, {set_in} and {} spans",
                 text.chars().count(),
                 spans.len()
             ),

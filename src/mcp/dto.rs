@@ -25,6 +25,16 @@ use serde::Serialize;
 use crate::db::Connection;
 use crate::google::{calendar, docs, drive, gmail, sheets};
 
+/// A point size as a person writes it: "8 pt", not "8.0 pt", because a
+/// listing is set in whole points far more often than not.
+pub fn points(size: f64) -> String {
+    if size.fract() == 0.0 {
+        format!("{} pt", size as i64)
+    } else {
+        format!("{size} pt")
+    }
+}
+
 /// One instant, on `tz`'s clock and with `tz`'s offset for that day.
 pub fn instant(at: Option<DateTime<Utc>>, tz: Tz) -> Option<String> {
     at.map(|at| at_zone(at, tz))
