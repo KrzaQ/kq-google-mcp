@@ -4065,7 +4065,7 @@ async fn docs_insert_text_puts_a_styled_paragraph_where_it_was_told() {
     assert_eq!(
         last_batch(&server).await["requests"],
         json!([
-            {"insertText": {"text": "Nowy akapit\n", "location": {"index": 30}}},
+            {"insertText": {"text": "\nNowy akapit", "location": {"index": 29}}},
             {"updateParagraphStyle": {
                 "range": {"startIndex": 30, "endIndex": 41},
                 "paragraphStyle": {"namedStyleType": "HEADING_3"},
@@ -4182,7 +4182,7 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
     assert_eq!(requests.len(), 4, "the text, the font and one per span");
     assert_eq!(
         requests[0]["insertText"],
-        json!({"text": "let ż = \"😀\";\n", "location": {"index": 30}})
+        json!({"text": "\nlet ż = \"😀\";", "location": {"index": 29}})
     );
     assert_eq!(
         requests[1]["updateTextStyle"]["textStyle"]["weightedFontFamily"]["fontFamily"],
@@ -4766,7 +4766,7 @@ async fn docs_insert_image_puts_a_staged_picture_where_google_can_fetch_it() {
     assert_eq!(requests.len(), 2, "{body}");
     assert_eq!(
         requests[0]["insertText"],
-        json!({"text": "\n", "location": {"index": 30}})
+        json!({"text": "\n", "location": {"index": 29}})
     );
     assert_eq!(
         requests[1]["insertInlineImage"]["location"],

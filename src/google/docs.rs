@@ -845,6 +845,17 @@ impl Outline {
     ///
     /// The third value is where the caller's own text begins, which is what a
     /// style or a colour is measured from.
+    /// Where a whole element goes when it follows a paragraph: the boundary
+    /// after that paragraph's break.
+    ///
+    /// Text may not be written there — [`Self::insertion`] says why — but a
+    /// table is not text. It is an element of the body in its own right, and
+    /// writing it inside a paragraph would split that paragraph in two rather
+    /// than put a table after it.
+    fn boundary(&self, paragraph: &Paragraph) -> i64 {
+        paragraph.end_index.max(1)
+    }
+
     fn insertion(&self, at: At, paragraph: &Paragraph, body: &str) -> (i64, String, i64) {
         match at {
             At::Before(_) => (
@@ -852,15 +863,16 @@ impl Outline {
                 format!("{body}\n"),
                 paragraph.start_index,
             ),
-            At::After(_) if paragraph.end_index >= self.end_index => {
-                let index = (self.end_index - 1).max(1);
+            // Always inside the paragraph named, never at the index after
+            // its break. That index belongs to no paragraph when the next
+            // thing is a table or a section break, and Docs refuses to write
+            // there — a caption above a table is the ordinary way to meet it.
+            // Writing the break first and the text after it puts the same
+            // characters in the same order, at an index that always exists.
+            At::After(_) => {
+                let index = (paragraph.end_index - 1).max(1);
                 (index, format!("\n{body}"), index + 1)
             }
-            At::After(_) => (
-                paragraph.end_index,
-                format!("{body}\n"),
-                paragraph.end_index,
-            ),
         }
     }
 
@@ -1670,8 +1682,10 @@ pub fn plan_table(
         neighbour.check_expect(expect)?;
     }
     // Where a new paragraph would go is where the table goes. Docs writes a
-    // newline of its own before a table, so this insert carries none.
-    let (index, _, _) = outline.insertion(At::After(after_paragraph), neighbour, "");
+    // newline of its own before a table, so this insert carries none — and
+    // the table goes at the paragraph boundary rather than inside the
+    // paragraph, which is the one place these two writes differ.
+    let index = outline.boundary(neighbour);
     Ok(TablePlan {
         paragraph: neighbour.ordinal,
         before: neighbour.text.clone(),

@@ -680,7 +680,7 @@ async fn an_insert_carries_its_own_paragraph_break() {
         .unwrap();
     assert_eq!(
         h.last_body("POST", ARTICLE_BATCH).await["requests"],
-        json!([{"insertText": {"text": "Akapit\n", "location": {"index": 30}}}])
+        json!([{"insertText": {"text": "\nAkapit", "location": {"index": 29}}}])
     );
 
     // After the last paragraph the break comes first, because nothing may be
@@ -768,7 +768,7 @@ async fn a_code_listing_is_written_and_coloured_in_one_batch() {
         h.last_body("POST", ARTICLE_BATCH).await,
         json!({
             "requests": [
-                {"insertText": {"text": "let ż = \"😀\";\n", "location": {"index": 30}}},
+                {"insertText": {"text": "\nlet ż = \"😀\";", "location": {"index": 29}}},
                 {"updateTextStyle": {
                     "range": {"startIndex": 30, "endIndex": 43},
                     "textStyle": {
@@ -1040,7 +1040,7 @@ async fn a_picture_is_inserted_into_a_paragraph_of_its_own() {
     assert_eq!(
         h.last_body("POST", ARTICLE_BATCH).await["requests"],
         json!([
-            {"insertText": {"text": "\n", "location": {"index": 30}}},
+            {"insertText": {"text": "\n", "location": {"index": 29}}},
             {"insertInlineImage": {
                 "uri": PICTURE_URL,
                 "location": {"index": 30},
@@ -1628,4 +1628,55 @@ async fn a_table_is_deleted_by_its_own_span_from_any_cell_in_it() {
         json!([{"deleteContentRange": {"range": {"startIndex": 31, "endIndex": 42}}}])
     );
     assert_eq!(body["writeControl"]["requiredRevisionId"], TABLE_REVISION);
+}
+
+/// A caption above a table is the ordinary way to meet this, and it used to
+/// fail after the person had already approved the write.
+///
+/// "After paragraph N" once meant the index following N's paragraph break.
+/// When the next thing is a table, that index is inside no paragraph, and
+/// Docs refuses to write text there — but only when the write is sent, so
+/// the preview passed and the refusal arrived after approval. The insert now
+/// goes inside the paragraph, before its own break, which is a position that
+/// always exists.
+#[tokio::test]
+async fn text_goes_in_after_the_paragraph_that_sits_in_front_of_a_table() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_table.json").await;
+    mount_batch(&h).await;
+
+    // Paragraph 3 is the empty line at 30..31, and the table starts at 31.
+    let plan = docs::plan_insert(
+        &outline,
+        TABLE_REVISION,
+        docs::At::After(3),
+        "Tabela 1. Mistral kontra Qwen",
+        None,
+        None,
+    )
+    .unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    let sent = h.last_body("POST", ARTICLE_BATCH).await;
+    let insert = &sent["requests"][0]["insertText"];
+    assert_eq!(
+        insert["location"]["index"], 30,
+        "inside the paragraph, not at the table's own start: {sent}"
+    );
+    assert_eq!(insert["text"], "\nTabela 1. Mistral kontra Qwen");
+
+    // A table, though, is an element and not text: it goes at the boundary,
+    // because writing it inside the paragraph would split the paragraph.
+    let table = docs::plan_table(
+        &outline,
+        TABLE_REVISION,
+        3,
+        &[vec!["Model".to_string(), "Parametry".to_string()]],
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(table.index, 31);
 }
