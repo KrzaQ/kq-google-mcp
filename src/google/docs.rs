@@ -947,6 +947,19 @@ impl Outline {
             .collect()
     }
 
+    /// Whether the break that ends this paragraph may still be deleted, now
+    /// that the table is in. The plan asked the same question of the document
+    /// the caller read; this asks it again of the document this server read
+    /// back, and adds what only the second read can say: that the paragraph
+    /// still ends where the plan measured, and that the newline Docs wrote of
+    /// its own stands between that break and the table. Anything else and the
+    /// break stays where it is.
+    fn tidy_before(&self, ordinal: usize, index: i64, table: i64) -> bool {
+        table == index + 1
+            && self.paragraph(ordinal).is_ok_and(|p| p.end_index == index)
+            && self.check_deletable(ordinal, ordinal, index).is_ok()
+    }
+
     fn new_table(&self, index: i64, rows: usize, columns: usize) -> Option<&Grid> {
         self.tables.iter().find(|grid| {
             grid.index >= index
@@ -1677,6 +1690,15 @@ pub struct TablePlan {
     pub columns: usize,
     /// Whether the first row is set bold, which is the only formatting here.
     pub header: bool,
+    /// Whether the table ends up directly under the paragraph it follows.
+    ///
+    /// Docs writes a newline of its own in front of a table, so an insert on
+    /// its own leaves an empty paragraph between the text and the grid. That
+    /// newline is the one Docs refuses to delete, so the second batch deletes
+    /// the break that ends the named paragraph instead. Where even that break
+    /// may not go, this is false: the table is still written and the empty
+    /// paragraph stays.
+    pub tidy: bool,
     /// Where the table goes, in Docs' own index.
     pub index: i64,
     grid: Vec<Vec<String>>,
@@ -1704,6 +1726,10 @@ pub struct InsertedTable {
     pub last_paragraph: usize,
     /// Where the table starts, in Docs' own index.
     pub index: i64,
+    /// Whether the empty paragraph Docs writes in front of a table was closed
+    /// up, so the table sits directly under the paragraph it follows. When
+    /// this is false an empty paragraph is left there, and the answer says so.
+    pub tidy: bool,
 }
 
 /// A grid of plain text after the paragraph a caller numbered. The cells are
@@ -1732,12 +1758,28 @@ pub fn plan_table(
     // the table goes at the paragraph boundary rather than inside the
     // paragraph, which is the one place these two writes differ.
     let index = outline.boundary(neighbour);
+    // That newline of Docs' own would stand between the text and the grid as
+    // an empty paragraph, and it is the one newline Docs will not let anything
+    // delete. The break that ends the named paragraph is a different
+    // character, one index lower, and deleting it merges the two paragraphs:
+    // the text ends up directly on top of the table and the newline in front
+    // of the table is never touched. Whether that break may go is
+    // `check_deletable`'s question and is asked of the document as the caller
+    // read it. A paragraph that Docs already refuses to shorten there — the
+    // last of a table cell, one in front of another table — keeps its break
+    // and its empty paragraph: the shape a table takes next to one of those is
+    // not a shape this server has measured, and it guesses at none of them.
+    let tidy = index > 1
+        && outline
+            .check_deletable(neighbour.ordinal, neighbour.ordinal, index)
+            .is_ok();
     Ok(TablePlan {
         paragraph: neighbour.ordinal,
         before: neighbour.text.clone(),
         rows: height,
         columns: width,
         header,
+        tidy,
         index,
         grid: rows.to_vec(),
         revision_id: revision_id.trim().to_string(),
@@ -1832,6 +1874,15 @@ fn check_one_line(text: &str, cell: &str) -> Result<()> {
 /// revision: the caller's, and then the one from this server's own re-read,
 /// so anything that changed in between refuses the second batch.
 ///
+/// The second batch ends with one delete: the break that ends the paragraph
+/// the table follows. Docs writes a newline of its own in front of a table,
+/// and that newline is the one it refuses to delete, so the empty paragraph it
+/// makes is closed up from the other side — the two paragraphs merge and the
+/// text ends up directly on top of the grid. It goes last because it is the
+/// one request at a lower index than the cells. Where that break may not go
+/// either, [`TablePlan::tidy`] is false, the delete is left out and the table
+/// is written all the same.
+///
 /// When the second batch does fail, the table is there and empty. That is
 /// what the error says, with the paragraph numbers it occupies. An empty
 /// table a person can see and fix is an acceptable failure; text in the wrong
@@ -1843,9 +1894,11 @@ pub async fn apply_table(
     plan: TablePlan,
 ) -> Result<InsertedTable> {
     let TablePlan {
+        paragraph,
         rows,
         columns,
         header,
+        tidy,
         index,
         grid,
         revision_id,
@@ -1874,7 +1927,16 @@ pub async fn apply_table(
         )));
     };
     let (first_paragraph, last_paragraph) = table.paragraphs();
-    let requests = fill_requests(table, &grid, header);
+    let tidy = tidy && after.tidy_before(paragraph, index, table.index);
+    let mut requests = fill_requests(table, &grid, header);
+    if tidy {
+        // Last of all, because it is the only request here at a lower index
+        // than the cells: doing it last leaves every index the cells were
+        // computed from exactly where Google put it. One character goes, the
+        // break that ends the paragraph the table follows, and the paragraph
+        // Docs wrote in front of the table closes the text off instead.
+        requests.push(delete_request(index - 1, index));
+    }
     if !requests.is_empty() {
         batch(
             client,
@@ -1886,12 +1948,17 @@ pub async fn apply_table(
         .await
         .map_err(|e| empty_table(rows, columns, first_paragraph, last_paragraph, e))?;
     }
+    // That delete merges two paragraphs into one, so everything after it is
+    // numbered one lower than the read this server made, and the table itself
+    // starts one character earlier.
+    let closed = usize::from(tidy);
     Ok(InsertedTable {
         rows,
         columns,
-        first_paragraph,
-        last_paragraph,
-        index: table.index,
+        first_paragraph: first_paragraph.saturating_sub(closed),
+        last_paragraph: last_paragraph.saturating_sub(closed),
+        index: table.index - i64::from(tidy),
+        tidy,
     })
 }
 

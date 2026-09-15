@@ -1172,16 +1172,19 @@ async fn a_table_is_filled_at_the_indexes_the_re_read_answered_with() {
         .await
         .unwrap();
 
-    // The cells are paragraphs 4 to 7 of the document the re-read described:
-    // the table's four cells, numbered where the body meets them.
+    // The cells are paragraphs 4 to 7 of the document the re-read described,
+    // and 3 to 6 of the document the second batch leaves: closing up the
+    // empty paragraph Docs wrote in front of the table takes one paragraph
+    // out, and one character with it.
     assert_eq!(
         written,
         docs::InsertedTable {
             rows: 2,
             columns: 2,
-            first_paragraph: 4,
-            last_paragraph: 7,
-            index: 31,
+            first_paragraph: 3,
+            last_paragraph: 6,
+            index: 30,
+            tidy: true,
         }
     );
 
@@ -1208,7 +1211,13 @@ async fn a_table_is_filled_at_the_indexes_the_re_read_answered_with() {
                 {"insertText": {"text": "7 mld", "location": {"index": 40}}},
                 {"insertText": {"text": "Mistral-7B", "location": {"index": 38}}},
                 {"insertText": {"text": "Parametry", "location": {"index": 35}}},
-                {"insertText": {"text": "Model", "location": {"index": 33}}}
+                {"insertText": {"text": "Model", "location": {"index": 33}}},
+                // Last, and at a lower index than every insert above it: the
+                // break that ends paragraph 2. Docs wrote the newline at 30
+                // itself and refuses to delete it, so the paragraph is closed
+                // up from the other side and the table ends up directly under
+                // the text.
+                {"deleteContentRange": {"range": {"startIndex": 29, "endIndex": 30}}}
             ],
             // The revision of this server's own re-read, and not the
             // caller's: the document has moved on by one write, its own.
@@ -1252,7 +1261,8 @@ async fn a_header_row_is_bolded_where_its_own_text_was_just_written() {
                 "range": {"startIndex": 33, "endIndex": 42},
                 "textStyle": {"bold": true},
                 "fields": "bold"
-            }}
+            }},
+            {"deleteContentRange": {"range": {"startIndex": 29, "endIndex": 30}}}
         ]),
         "each header cell is bolded straight after its own insert, before an \
          insert at a lower index moves it"
@@ -1368,7 +1378,15 @@ async fn a_second_batch_google_refuses_says_the_table_is_there_and_empty() {
     assert!(said.contains("docs_edit_paragraph"), "{said}");
     assert!(said.contains("docs_list_paragraphs"), "{said}");
     assert!(said.contains("Revision ALm37BW0Article2"), "{said}");
-    assert_eq!(batches(&h).await.len(), 2, "the second batch was attempted");
+    let sent = batches(&h).await;
+    assert_eq!(sent.len(), 2, "the second batch was attempted");
+    // The batch that was refused carried the delete as well, so the numbers
+    // above are the ones the re-read gave and not the ones the delete would
+    // have left: a batch Docs refuses writes nothing at all.
+    assert_eq!(
+        sent[1]["requests"].as_array().unwrap().last().unwrap(),
+        &json!({"deleteContentRange": {"range": {"startIndex": 29, "endIndex": 30}}})
+    );
 }
 
 #[tokio::test]
@@ -1392,6 +1410,181 @@ async fn a_table_that_cannot_be_found_again_is_not_guessed_at() {
     assert!(said.contains("could not find it"), "{said}");
     // One batch, and nothing written into anybody else's table.
     assert_eq!(batches(&h).await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_break_that_goes_is_the_paragraphs_own_and_never_the_one_before_the_table() {
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    mount_batch(&h).await;
+
+    // Measured against a real document twice: Docs writes a newline of its
+    // own in front of the table, so the empty paragraph is at 30 and the
+    // table starts at 31. Paragraph 2 ends at 30, which puts its own break
+    // at 29, and that is the one character this write takes.
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, REVISION, 2, &rows, false, None).unwrap();
+    assert!(
+        plan.tidy,
+        "paragraph 2 is plain body text and may lose its break"
+    );
+    let written = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    assert!(written.tidy);
+
+    let sent = batches(&h).await;
+    let requests = sent[1]["requests"].as_array().unwrap();
+    let deletes: Vec<&Value> = sent
+        .iter()
+        .flat_map(|batch| batch["requests"].as_array().unwrap())
+        .filter(|request| request.get("deleteContentRange").is_some())
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "one break goes and nothing else: {sent:?}"
+    );
+    assert_eq!(
+        deletes[0],
+        requests.last().unwrap(),
+        "the delete is the last request of the second batch, because it is \
+         the one request at a lower index than the cells"
+    );
+    let range = &deletes[0]["deleteContentRange"]["range"];
+    let (start, end) = (
+        range["startIndex"].as_i64().unwrap(),
+        range["endIndex"].as_i64().unwrap(),
+    );
+    assert_eq!((start, end), (29, 30));
+    // The newline at 30 is the one in front of the table and Docs refuses to
+    // delete it; the table itself starts at 31. Neither index is in the
+    // range, and the range stops exactly where the newline begins.
+    for index in [30, 31] {
+        assert!(
+            !(start..end).contains(&index),
+            "{index} is in {start}..{end}"
+        );
+    }
+    assert_eq!(end, written.index, "the table starts where the delete ends");
+}
+
+#[tokio::test]
+async fn a_paragraph_that_may_not_lose_its_break_keeps_its_empty_line() {
+    let h = harness().await;
+    let rows = grid(&[&["a"]]);
+
+    // Paragraph 4 of the article is the one paragraph of a table cell, and a
+    // cell must keep its last break. Paragraph 3 is the paragraph in front of
+    // a table, whose break Docs will not delete either.
+    let outline = article(&h).await;
+    for after in [3, 4] {
+        let plan = docs::plan_table(&outline, REVISION, after, &rows, false, None).unwrap();
+        assert!(!plan.tidy, "paragraph {after} keeps its break");
+    }
+    assert!(
+        docs::plan_table(&outline, REVISION, 2, &rows, false, None)
+            .unwrap()
+            .tidy
+    );
+
+    // Paragraph 5 of the same article with a section break in it is the
+    // paragraph in front of that break, and paragraph 6 is the last of the
+    // body, whose break is the one every document keeps.
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_section.json").await;
+    for after in [5, 6] {
+        let plan = docs::plan_table(&outline, REVISION, after, &rows, false, None).unwrap();
+        assert!(!plan.tidy, "paragraph {after} keeps its break");
+    }
+    // The same rules, from the same place: what plan_delete refuses to take
+    // is what a table insert leaves alone.
+    for after in [5, 6] {
+        assert!(
+            docs::plan_delete(&outline, REVISION, after, None, "", None).is_err(),
+            "paragraph {after}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_document_that_reads_back_a_different_shape_keeps_its_break() {
+    let h = harness().await;
+    let outline = article_then_table(&h).await;
+    mount_batch(&h).await;
+
+    // The table was asked for after paragraph 1, which ends at 15, so the
+    // break to delete would be at 14 and the table should come back at 16.
+    // The document this server reads back has it at 31 instead — somebody
+    // else was editing — and a character at 14 no longer means what the plan
+    // measured. The cells are filled where Google says they are and nothing
+    // is deleted.
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, REVISION, 1, &rows, false, Some("Wywiad")).unwrap();
+    assert!(
+        plan.tidy,
+        "paragraph 1 may lose its break in the document as read"
+    );
+    let written = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    assert!(!written.tidy);
+    assert_eq!(written.first_paragraph, 4);
+    assert_eq!(written.index, 31);
+    let sent = batches(&h).await;
+    assert!(
+        sent[1]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request.get("deleteContentRange").is_none()),
+        "{}",
+        sent[1]
+    );
+}
+
+#[tokio::test]
+async fn a_table_after_a_paragraph_that_keeps_its_break_is_still_written() {
+    let h = harness().await;
+    // The article whose paragraph 2 is followed straight away by a table, and
+    // then the document Google answers with once the new empty two-by-two
+    // table has gone in front of that one.
+    Mock::given(method("GET"))
+        .and(path(ARTICLE_AT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_article_grid.json")))
+        .up_to_n_times(1)
+        .mount(&h.server)
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap();
+    h.mount_json("GET", ARTICLE_AT, fixture("docs_article_table.json"))
+        .await;
+    mount_batch(&h).await;
+
+    let rows = grid(&[&["Model", "Parametry"], &["Mistral-7B", "7 mld"]]);
+    let plan = docs::plan_table(&outline, "ALm37BW0Grid1", 2, &rows, false, None).unwrap();
+    assert!(!plan.tidy);
+    let written = docs::apply_table(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+
+    // The table is in and its cells are filled; only the empty paragraph in
+    // front of it stays, so nothing is numbered one lower.
+    assert!(!written.tidy);
+    assert_eq!(written.first_paragraph, 4);
+    assert_eq!(written.last_paragraph, 7);
+    assert_eq!(written.index, 31);
+    let sent = batches(&h).await;
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent.iter().all(|batch| batch["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request.get("deleteContentRange").is_none())),
+        "nothing is deleted when the break may not go: {sent:?}"
+    );
+    assert_eq!(sent[1]["requests"].as_array().unwrap().len(), 4);
 }
 
 // ----- a row or a column of a table ------------------------------------------

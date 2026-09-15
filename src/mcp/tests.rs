@@ -4313,10 +4313,16 @@ async fn docs_insert_table_fills_the_cells_from_the_document_it_reads_back() {
     assert_eq!(out["paragraph"], 2);
     assert_eq!(out["text"], "Model | Parametry\nMistral-7B | 7 mld");
     let written = out["written"].as_str().unwrap();
-    // The answer says where the cells are, in the numbers the next call uses.
-    assert!(written.contains("paragraphs 4 to 7"), "{written}");
+    // The answer says where the cells are, in the numbers the next call uses:
+    // 3 to 7 in the document this server read back, and 3 to 6 once the empty
+    // paragraph in front of the table has been closed up.
+    assert!(written.contains("paragraphs 3 to 6"), "{written}");
     assert!(written.contains("two writes"), "{written}");
     assert!(written.contains("first row is bold"), "{written}");
+    assert!(
+        !written.contains("empty paragraph is left"),
+        "the table is directly under paragraph 2: {written}"
+    );
 
     let sent = batch_bodies(&server).await;
     assert_eq!(sent.len(), 2, "the empty grid, and then its cells");
@@ -4347,7 +4353,10 @@ async fn docs_insert_table_fills_the_cells_from_the_document_it_reads_back() {
                 "range": {"startIndex": 33, "endIndex": 38},
                 "textStyle": {"bold": true},
                 "fields": "bold"
-            }}
+            }},
+            // The break that ends paragraph 2, deleted last because it is the
+            // one request here at a lower index than the cells.
+            {"deleteContentRange": {"range": {"startIndex": 29, "endIndex": 30}}}
         ])
     );
     // The second batch is planned against this server's own re-read, not
@@ -4359,6 +4368,74 @@ async fn docs_insert_table_fills_the_cells_from_the_document_it_reads_back() {
     assert_ne!(
         sent[1]["writeControl"]["requiredRevisionId"],
         ARTICLE_REVISION
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_table_says_which_of_the_two_outcomes_to_expect() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    // Paragraph 2 is plain body text, so the empty paragraph Docs writes in
+    // front of a table is closed up and the grid sits under the text.
+    let shown = c
+        .ok("docs_insert_table", confirming(&table_args(false), false))
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("directly under paragraph 2"), "{lines}");
+    assert!(!lines.contains("empty paragraph is left"), "{lines}");
+
+    // Paragraph 4 is the one paragraph of a table cell, and a cell keeps the
+    // break that ends it, so that empty paragraph stays. The preview says so
+    // before anybody agrees to the write, because the tidy answer and the
+    // untidy one are different documents.
+    let mut cell = table_args(false);
+    cell["after_paragraph"] = json!(4);
+    cell["expect"] = json!("Komórka");
+    let lines = details(&c.ok("docs_insert_table", confirming(&cell, false)).await);
+    assert!(
+        lines.contains("an empty paragraph is left between paragraph 4"),
+        "{lines}"
+    );
+    assert!(!lines.contains("directly under"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_table_says_when_an_empty_paragraph_is_left_in_front() {
+    let db = Db::open_memory().await.unwrap();
+    // The article whose paragraph 2 is followed straight away by a table:
+    // that paragraph's break is one Docs will not delete, so the write goes
+    // ahead without it.
+    let server = grid_server("docs_article_table.json").await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let mut args = table_args(false);
+    args["revision_id"] = json!(GRID_REVISION);
+    let out = c.ok("docs_insert_table", confirming(&args, true)).await;
+    let written = out["written"].as_str().unwrap();
+    // The table is in, its cells are filled, and the answer says what the
+    // person will see above it and what can be done about it.
+    assert!(written.contains("paragraphs 4 to 7"), "{written}");
+    assert!(
+        written.contains("An empty paragraph is left between paragraph 2 and the table"),
+        "{written}"
+    );
+    assert!(written.contains("docs_delete_table"), "{written}");
+
+    let sent = batch_bodies(&server).await;
+    assert!(
+        sent.iter().all(|batch| batch["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request.get("deleteContentRange").is_none())),
+        "{sent:?}"
     );
     drop(server);
 }

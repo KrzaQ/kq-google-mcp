@@ -1287,9 +1287,12 @@ impl Gmcp {
                        merged cells. This is the one tool here that writes twice, because the \
                        indexes inside a table do not exist until the table does: it inserts the \
                        empty grid, reads the document again to see where Google put each cell, \
-                       and fills them in a second write. If that second write is refused the \
-                       answer says so plainly — the table is there and empty, and it names the \
-                       paragraph numbers its cells now have. Pass the revision_id from \
+                       and fills them in a second write. That second write also closes up the \
+                       empty line Docs puts in front of every table, so the table sits directly \
+                       under the paragraph you named; where Docs will not allow that, the answer \
+                       says an empty paragraph was left there. If that second write is refused \
+                       the answer says so plainly — the table is there and empty, and it names \
+                       the paragraph numbers its cells now have. Pass the revision_id from \
                        docs_list_paragraphs and confirmed=true after the person has seen the \
                        grid. One write moves every paragraph number and changes the revision id."
     )]
@@ -1337,6 +1340,19 @@ impl Gmcp {
                     "this writes twice: the empty table, and then its cells at the indexes \
                      Google answers with"
                         .to_string(),
+                    match plan.tidy {
+                        true => format!(
+                            "the table sits directly under paragraph {}, with no empty line \
+                             between them",
+                            plan.paragraph
+                        ),
+                        false => format!(
+                            "an empty paragraph is left between paragraph {} and the table: \
+                             Docs writes one in front of every table, and here it refuses the \
+                             one delete that would close it up",
+                            plan.paragraph
+                        ),
+                    },
                 ],
             ))));
         }
@@ -1352,12 +1368,24 @@ impl Gmcp {
             written: format!(
                 "a {shape} table was inserted after paragraph {paragraph}, in two writes: the \
                  empty grid and then its cells. The cells are paragraphs {} to {} of the \
-                 document now{}",
+                 document now{}{}",
                 written.first_paragraph,
                 written.last_paragraph,
                 match header {
                     true => ", and the first row is bold",
                     false => "",
+                },
+                match written.tidy {
+                    true => String::new(),
+                    false => format!(
+                        ". An empty paragraph is left between paragraph {paragraph} and the \
+                         table: Docs writes one in front of every table, and the break that \
+                         would close it up is one Docs refuses to delete here. No tool here can \
+                         take that line out either, because the break in front of a table goes \
+                         only when the table goes with it. The person removes it in Docs itself, \
+                         or docs_delete_table takes the table away and it goes in after another \
+                         paragraph"
+                    ),
                 }
             ),
             text: grid,
