@@ -864,6 +864,30 @@ impl Outline {
     ///
     /// The third value is where the caller's own text begins, which is what a
     /// style or a colour is measured from.
+    /// Whether a table may follow this paragraph at all.
+    ///
+    /// A table goes at the boundary after a paragraph, and for the last
+    /// paragraph of a table cell that boundary is the cell's own end, which
+    /// lies inside no paragraph: Docs refuses to insert there, because a cell
+    /// must end with a paragraph rather than with a table. Measured in a real
+    /// document, where the write failed after the person had approved it.
+    ///
+    /// A table inside a cell is fine otherwise — the same document holds one —
+    /// so this refuses the position and not the nesting, and names the way
+    /// round it.
+    fn check_table_fits(&self, paragraph: &Paragraph) -> Result<()> {
+        match self.cell_of(paragraph.ordinal) {
+            Some(cell) if cell.last == paragraph.ordinal => Err(Error::Unsupported(format!(
+                "a table cannot go after paragraph {}, because it is the last paragraph of a \
+                 table cell and a cell must end with a paragraph rather than with a table. \
+                 Put a paragraph after it first with docs_insert_text, then insert the table \
+                 after paragraph {}",
+                paragraph.ordinal, paragraph.ordinal
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Where a whole element goes when it follows a paragraph: the boundary
     /// after that paragraph's break.
     ///
@@ -1753,6 +1777,7 @@ pub fn plan_table(
     if let Some(expect) = expect {
         neighbour.check_expect(expect)?;
     }
+    outline.check_table_fits(neighbour)?;
     // Where a new paragraph would go is where the table goes. Docs writes a
     // newline of its own before a table, so this insert carries none — and
     // the table goes at the paragraph boundary rather than inside the

@@ -4388,19 +4388,35 @@ async fn docs_insert_table_says_which_of_the_two_outcomes_to_expect() {
     assert!(lines.contains("directly under paragraph 2"), "{lines}");
     assert!(!lines.contains("empty paragraph is left"), "{lines}");
 
-    // Paragraph 4 is the one paragraph of a table cell, and a cell keeps the
-    // break that ends it, so that empty paragraph stays. The preview says so
-    // before anybody agrees to the write, because the tidy answer and the
-    // untidy one are different documents.
-    let mut cell = table_args(false);
-    cell["after_paragraph"] = json!(4);
-    cell["expect"] = json!("Komórka");
-    let lines = details(&c.ok("docs_insert_table", confirming(&cell, false)).await);
+    // Paragraph 3 is the one in front of a table, and Docs will not delete the
+    // break in front of a table, so that empty paragraph stays. The preview
+    // says so before anybody agrees to the write, because the tidy answer and
+    // the untidy one are different documents.
+    let mut front = table_args(false);
+    front["after_paragraph"] = json!(3);
+    front["expect"] = json!("Zażółć");
+    let lines = details(&c.ok("docs_insert_table", confirming(&front, false)).await);
     assert!(
-        lines.contains("an empty paragraph is left between paragraph 4"),
+        lines.contains("an empty paragraph is left between paragraph 3"),
         "{lines}"
     );
     assert!(!lines.contains("directly under"), "{lines}");
+
+    // Paragraph 4 is the one paragraph of a table cell, where no table may go
+    // at all: a cell must end with a paragraph. That is refused at the
+    // preview, not after the person has approved it — the write used to be
+    // built, shown, agreed to, and only then refused by Google.
+    let mut cell = table_args(false);
+    cell["after_paragraph"] = json!(4);
+    cell["expect"] = json!("Komórka");
+    let refused = c
+        .refused("docs_insert_table", confirming(&cell, false))
+        .await;
+    assert!(
+        refused.contains("last paragraph of a table cell"),
+        "{refused}"
+    );
+    assert!(refused.contains("docs_insert_text"), "{refused}");
     assert_eq!(batch_calls(&server).await, 0);
     drop(server);
 }

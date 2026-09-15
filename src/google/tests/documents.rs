@@ -1474,14 +1474,22 @@ async fn a_paragraph_that_may_not_lose_its_break_keeps_its_empty_line() {
     let h = harness().await;
     let rows = grid(&[&["a"]]);
 
-    // Paragraph 4 of the article is the one paragraph of a table cell, and a
-    // cell must keep its last break. Paragraph 3 is the paragraph in front of
-    // a table, whose break Docs will not delete either.
+    // Paragraph 3 is the paragraph in front of a table, whose break Docs will
+    // not delete, so a table may follow it but the empty line stays.
     let outline = article(&h).await;
-    for after in [3, 4] {
-        let plan = docs::plan_table(&outline, REVISION, after, &rows, false, None).unwrap();
-        assert!(!plan.tidy, "paragraph {after} keeps its break");
-    }
+    let plan = docs::plan_table(&outline, REVISION, 3, &rows, false, None).unwrap();
+    assert!(!plan.tidy, "paragraph 3 keeps its break");
+
+    // Paragraph 4 is the one paragraph of a table cell. A cell must end with
+    // a paragraph rather than a table, so no table may follow it at all: the
+    // question of its break never arises.
+    let refused = docs::plan_table(&outline, REVISION, 4, &rows, false, None).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("last paragraph of a table cell"),
+        "{refused}"
+    );
     assert!(
         docs::plan_table(&outline, REVISION, 2, &rows, false, None)
             .unwrap()
