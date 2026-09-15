@@ -9,7 +9,15 @@ use serde_json::Value;
 use super::limits::AUDIT_ARGS_MAX_BYTES;
 
 /// Fields whose value is content rather than a parameter, at any depth.
-const CONTENT_FIELDS: [&str; 5] = ["body", "text", "html", "rows", "markdown"];
+///
+/// A field belongs here when it carries what the person wrote rather than
+/// how the tool should behave. `code` is a listing, `cells` are the words in
+/// a table row, and `replace` is the new wording of a sentence; all three
+/// were being written to the log in full, which the first paragraph of this
+/// file says they should not be.
+const CONTENT_FIELDS: [&str; 8] = [
+    "body", "text", "html", "rows", "markdown", "code", "cells", "replace",
+];
 /// What a cut log line ends with.
 const CUT: char = '…';
 
@@ -86,6 +94,25 @@ mod tests {
         assert_eq!(stripped["draft"]["note"]["text"], json!("<6 chars>"));
         assert_eq!(stripped["updates"][0]["markdown"], json!("<9 chars>"));
         assert_eq!(stripped["updates"][1]["rows"], json!("<3 rows>"));
+
+        // A listing, a table row and a replacement are content too: they are
+        // what the person wrote, not how the tool should behave. All three
+        // used to reach the log in full.
+        let docs = strip_args(json!({
+            "doc_id": "1AbC",
+            "after_paragraph": 12,
+            "code": "fn main() {\n    println!(\"hi\");\n}",
+            "cells": ["Mistral-7B", "7 mld"],
+            "replace": "a whole rewritten sentence",
+            "font": "Courier New",
+        }));
+        let docs: Value = serde_json::from_str(&docs).unwrap();
+        assert_eq!(docs["doc_id"], json!("1AbC"));
+        assert_eq!(docs["after_paragraph"], json!(12));
+        assert_eq!(docs["font"], json!("Courier New"), "a font is a parameter");
+        assert_eq!(docs["code"], json!("<33 chars>"));
+        assert_eq!(docs["cells"], json!("<2 rows>"));
+        assert_eq!(docs["replace"], json!("<26 chars>"));
     }
 
     #[test]
