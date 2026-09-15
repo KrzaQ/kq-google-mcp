@@ -558,6 +558,8 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
         "docs_style_paragraph",
         "docs_insert_code",
         "docs_insert_table",
+        "docs_delete_paragraphs",
+        "docs_delete_table",
     ] {
         for argument in ["revision_id", "confirmed"] {
             assert!(
@@ -575,7 +577,12 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
     }
     // `expect` is required where a write overwrites and optional where it
     // inserts, because inserting beside the wrong paragraph is recoverable.
-    for tool in ["docs_edit_paragraph", "docs_style_paragraph"] {
+    for tool in [
+        "docs_edit_paragraph",
+        "docs_style_paragraph",
+        "docs_delete_paragraphs",
+        "docs_delete_table",
+    ] {
         assert!(required(tool).contains(&json!("expect")), "{tool}");
     }
     for tool in ["docs_insert_text", "docs_insert_code", "docs_insert_table"] {
@@ -3790,12 +3797,17 @@ const ARTICLE_REVISION: &str = "ALm37BW0Article1";
 
 /// The Polish article every test below reads before it writes.
 async fn article_server() -> MockServer {
+    document_server(fixture("docs_article.json")).await
+}
+
+/// The same, for a document a test shapes itself.
+async fn document_server(document: Value) -> MockServer {
     let server = google_server().await;
     mount(
         &server,
         "GET",
         &format!("/v1/documents/{ARTICLE}"),
-        fixture("docs_article.json"),
+        document,
     )
     .await;
     server
@@ -4344,6 +4356,264 @@ const LISTING: &str = "1LiStInGdOcIdExAmPlE0123456789abcdef";
 
 /// What docs_read is unable to answer: a paragraph nobody styled as one bare
 /// run, and a coloured listing in the character offsets that wrote it.
+/// A document of `count` numbered paragraphs, long enough that a preview of a
+/// range over it has to cut the list of what would go.
+fn long_document(count: usize) -> Value {
+    let mut content = vec![json!({
+        "startIndex": 0, "endIndex": 1, "sectionBreak": {"sectionStyle": {}}
+    })];
+    let mut at = 1;
+    for n in 1..=count {
+        let text = format!("Akapit {n}.\n");
+        let end = at + text.chars().map(|c| c.len_utf16()).sum::<usize>();
+        content.push(json!({
+            "startIndex": at, "endIndex": end,
+            "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"startIndex": at, "endIndex": end,
+                              "textRun": {"content": text}}]
+            }
+        }));
+        at = end;
+    }
+    let mut document = fixture("docs_article.json");
+    document["body"]["content"] = Value::Array(content);
+    document
+}
+
+#[tokio::test]
+async fn docs_delete_paragraphs_takes_one_paragraph_with_its_break() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "from": 2,
+                      "expect": "Część", "revision_id": ARTICLE_REVISION});
+
+    let shown = c
+        .ok("docs_delete_paragraphs", confirming(&args, false))
+        .await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("paragraph 2: Część pierwsza"), "{lines}");
+    assert!(lines.contains("1 paragraph would go"), "{lines}");
+    assert!(lines.contains("cannot be undone"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0, "a preview deleted something");
+
+    let out = c
+        .ok("docs_delete_paragraphs", confirming(&args, true))
+        .await;
+    assert_eq!(out["paragraph"], 2);
+    // The range starts where paragraph 1 ends and stops where paragraph 3
+    // starts, so the newline that ends paragraph 2 goes with it and the text
+    // around it closes up rather than leaving an empty line.
+    let body = last_batch(&server).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 15, "endIndex": 30}}}])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], ARTICLE_REVISION);
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_delete_paragraphs_takes_a_range_in_one_request() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(long_document(12)).await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "from": 1, "to": 10,
+                      "expect": "Akapit 1.", "expect_last": "Akapit 10.",
+                      "revision_id": ARTICLE_REVISION});
+
+    let shown = c
+        .ok("docs_delete_paragraphs", confirming(&args, false))
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("10 paragraphs would go"), "{lines}");
+    // A long range is cut: both ends are listed and the middle is counted, so
+    // the person can see the range starts and stops where they meant.
+    assert!(lines.contains("paragraph 1: Akapit 1."), "{lines}");
+    assert!(lines.contains("paragraph 4: Akapit 4."), "{lines}");
+    assert!(
+        lines.contains("and 4 more paragraphs in between"),
+        "{lines}"
+    );
+    assert!(lines.contains("paragraph 9: Akapit 9."), "{lines}");
+    assert!(lines.contains("paragraph 10: Akapit 10."), "{lines}");
+    assert!(!lines.contains("paragraph 6:"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0, "a preview deleted something");
+
+    let out = c
+        .ok("docs_delete_paragraphs", confirming(&args, true))
+        .await;
+    assert!(
+        out["written"]
+            .as_str()
+            .unwrap()
+            .contains("paragraphs 1 to 10"),
+        "{out}"
+    );
+    // One `deleteContentRange` over the whole span and not one per paragraph:
+    // from the start of paragraph 1 to the start of paragraph 11.
+    let body = last_batch(&server).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 1, "endIndex": 102}}}])
+    );
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn the_break_in_front_of_a_table_goes_only_when_the_table_goes() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article_tail.json")).await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let alone = c
+        .refused(
+            "docs_delete_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 3, "expect": "Zażółć",
+                   "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(alone.contains("in front of a table"), "{alone}");
+    assert!(alone.contains("paragraph 4"), "{alone}");
+    assert_eq!(batch_calls(&server).await, 0);
+
+    // Widened past the table, the same delete goes through and takes the
+    // table with it.
+    let args = json!({"account": "work", "doc_id": ARTICLE, "from": 3, "to": 5,
+                      "expect": "Zażółć", "expect_last": "Koniec",
+                      "revision_id": ARTICLE_REVISION});
+    let shown = c
+        .ok("docs_delete_paragraphs", confirming(&args, false))
+        .await;
+    let lines = details(&shown);
+    assert!(
+        lines.contains("the 1 by 1 table in that range goes whole"),
+        "{lines}"
+    );
+    assert!(lines.contains("paragraph 4: Komórka tabeli"), "{lines}");
+
+    let out = c
+        .ok("docs_delete_paragraphs", confirming(&args, true))
+        .await;
+    assert!(
+        out["written"]
+            .as_str()
+            .unwrap()
+            .contains("the table in that range went with them"),
+        "{out}"
+    );
+    let body = last_batch(&server).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 30, "endIndex": 87}}}])
+    );
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_delete_table_takes_the_whole_table_from_any_cell_in_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article_table.json")).await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+    let revision = "ALm37BW0Article2";
+
+    // The 2 by 2 table's cells are paragraphs 4 to 7 and every one of them is
+    // empty, so there are no words to expect and `expect` says exactly that.
+    let first = c
+        .ok(
+            "docs_delete_table",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 4, "expect": "",
+                   "revision_id": revision, "confirmed": false}),
+        )
+        .await;
+    let last = c
+        .ok(
+            "docs_delete_table",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 7, "expect": "",
+                   "revision_id": revision, "confirmed": false}),
+        )
+        .await;
+    for shown in [first, last] {
+        let lines = details(&shown);
+        assert!(lines.contains("2 rows, 2 columns and 4 cells"), "{lines}");
+        assert!(lines.contains("paragraphs 4 to 7"), "{lines}");
+        assert!(
+            lines.contains("the paragraph in front of the table stays"),
+            "{lines}"
+        );
+    }
+    assert_eq!(batch_calls(&server).await, 0, "a preview deleted a table");
+
+    let out = c
+        .ok(
+            "docs_delete_table",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 7, "expect": "",
+                   "revision_id": revision, "confirmed": true}),
+        )
+        .await;
+    assert!(out["written"].as_str().unwrap().contains("2 by 2"), "{out}");
+    // The table's own span and not one index more: the empty paragraph in
+    // front of it, 30 to 31, is left where it is.
+    let body = last_batch(&server).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 31, "endIndex": 42}}}])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], revision);
+    assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_stale_revision_or_an_expect_that_does_not_match_deletes_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let paragraphs = c
+        .refused(
+            "docs_delete_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 2, "expect": "Część",
+                   "revision_id": "ALm37BW0Older", "confirmed": true}),
+        )
+        .await;
+    assert!(paragraphs.contains("docs_list_paragraphs"), "{paragraphs}");
+    assert!(paragraphs.contains("ALm37BW0Older"), "{paragraphs}");
+
+    let table = c
+        .refused(
+            "docs_delete_table",
+            json!({"account": "work", "doc_id": ARTICLE, "paragraph": 4, "expect": "Komórka",
+                   "revision_id": "ALm37BW0Older", "confirmed": true}),
+        )
+        .await;
+    assert!(table.contains("ALm37BW0Older"), "{table}");
+
+    let counted = c
+        .refused(
+            "docs_delete_paragraphs",
+            json!({"account": "work", "doc_id": ARTICLE, "from": 2, "expect": "Koniec",
+                   "revision_id": ARTICLE_REVISION, "confirmed": true}),
+        )
+        .await;
+    assert!(counted.contains("does not start with"), "{counted}");
+    assert!(counted.contains("Część pierwsza"), "{counted}");
+    assert_eq!(batch_calls(&server).await, 0);
+    drop(server);
+}
+
 #[tokio::test]
 async fn docs_read_formatting_answers_runs_a_span_can_be_written_from() {
     let db = Db::open_memory().await.unwrap();

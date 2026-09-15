@@ -726,7 +726,9 @@ pub struct DocEditOut {
     /// What was written, in one line the model can repeat to the person.
     pub written: String,
     /// The text this write leaves behind: the changed paragraph, the
-    /// inserted one, or the name of the picture that was put in.
+    /// inserted one, or the name of the picture that was put in. A delete
+    /// leaves nothing behind, so it reports what it took instead, cut to the
+    /// first few paragraphs and the last few.
     pub text: String,
     /// Always the same sentence: read the document again before writing to it
     /// again.

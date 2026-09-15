@@ -4,10 +4,16 @@
 //! There are two kinds of write here, and they are not rivals. docs_create,
 //! docs_append and docs_replace_text are the broad ones: make a document, add
 //! to the end, change every match. docs_insert_text, docs_edit_paragraph,
-//! docs_style_paragraph, docs_insert_code and docs_insert_table are the
-//! careful ones, and each takes a paragraph number and the revision id that
-//! docs_list_paragraphs answered with — the two locks that keep a write off
-//! the paragraph it was not meant for.
+//! docs_style_paragraph, docs_insert_code, docs_insert_table,
+//! docs_delete_paragraphs and docs_delete_table are the careful ones, and each
+//! takes a paragraph number and the revision id that docs_list_paragraphs
+//! answered with — the two locks that keep a write off the paragraph it was
+//! not meant for.
+//!
+//! The two delete tools are the only ones here that destroy anything, so they
+//! are locked harder than the rest: `expect` is required on both, a range
+//! needs `expect_last` for its far end as well, and every deletion Docs itself
+//! would refuse is refused here first, in this server's own words.
 //!
 //! Every write takes `confirmed`. With `confirmed=false` nothing is written
 //! and the answer says what would change, the affected paragraph as it is and
@@ -257,6 +263,50 @@ pub struct DocsTableParam {
     pub revision_id: String,
     /// Must be true to write. Call with false first and show the person the
     /// grid.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsDeleteParam {
+    pub account: String,
+    pub doc_id: String,
+    /// The first paragraph to delete, as docs_list_paragraphs numbers them
+    pub from: u32,
+    /// The last paragraph to delete, included. Left out, only `from` goes.
+    pub to: Option<u32>,
+    /// What paragraph `from` starts with, as docs_list_paragraphs reports it.
+    /// Nothing is deleted when it says something else. Pass an empty string
+    /// for a paragraph that holds no text, which is how a blank line is
+    /// deleted.
+    pub expect: String,
+    /// What paragraph `to` starts with, in the same words. Required whenever
+    /// `to` is a different paragraph from `from`: both ends of a range are
+    /// confirmed here.
+    pub expect_last: Option<String>,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to delete. Call with false first and show the person every
+    /// paragraph that would go.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsDeleteTableParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Any paragraph inside the table: a cell of it, as docs_list_paragraphs
+    /// numbers them. Those paragraphs come back with in_table true.
+    pub paragraph: u32,
+    /// What that paragraph starts with, as docs_list_paragraphs reports it.
+    /// An empty string for a cell that holds no text, which every cell of a
+    /// table that has just been made does.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to delete. Call with false first and show the person how
+    /// many rows and columns go.
     pub confirmed: bool,
 }
 
@@ -1405,6 +1455,174 @@ impl Gmcp {
             next: REREAD.to_string(),
         })))
     }
+
+    #[tool(
+        description = "Delete whole paragraphs from a Google Doc, `from` to `to` and both \
+                       included, with the paragraph break that ends each one, so nothing is left \
+                       behind as an empty line. Leave `to` out to delete the single paragraph \
+                       `from`. This takes text out of a document and nothing on this side puts \
+                       it back: what it deletes is gone from the version you are editing and \
+                       lives on only in the document's own history in Docs. `expect` is \
+                       required and is what paragraph `from` starts with, as \
+                       docs_list_paragraphs reports it — an empty string for a paragraph that \
+                       is blank, which is how a stray empty line goes. `expect_last` is \
+                       required as well whenever `to` is a different paragraph, and is what \
+                       paragraph `to` starts with: both ends of a range are confirmed here, \
+                       because a range is where a miscount takes a whole section with it. Five \
+                       ranges are refused before anything is sent, each naming the paragraph \
+                       numbers to use instead: one that would cut a table in half, one that \
+                       would take the document's last paragraph break, one that would take the \
+                       last paragraph of a table cell, and one that would take the break in \
+                       front of a table or a section break without taking the element itself. A \
+                       range that covers a table whole takes that table too, and the preview \
+                       says so. Pass the revision_id from docs_list_paragraphs and \
+                       confirmed=true after the person has seen every paragraph that would go. \
+                       One write moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_delete_paragraphs(
+        &self,
+        Parameters(p): Parameters<DocsDeleteParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_delete(
+            &outline,
+            &p.revision_id,
+            p.from as usize,
+            p.to.map(|to| to as usize),
+            &p.expect,
+            p.expect_last.as_deref(),
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let named = match plan.from == plan.to {
+            true => format!("paragraph {}", plan.from),
+            false => format!("paragraphs {} to {}", plan.from, plan.to),
+        };
+        let listing = going_lines(&plan.going);
+        let count = plan.going.len();
+        if !p.confirmed {
+            let mut details = vec![format!(
+                "{count} paragraph{} would go, with the break that ends each one, so nothing \
+                 is left behind as an empty line",
+                if count == 1 { "" } else { "s" }
+            )];
+            details.extend(listing.clone());
+            details.extend(plan.tables.iter().map(|(rows, columns)| {
+                format!(
+                    "the {rows} by {columns} table in that range goes whole, with everything in \
+                     its cells"
+                )
+            }));
+            details.push(NO_UNDO.to_string());
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "delete {named} of the Google Doc {doc_id} in `{}`",
+                    connection.label
+                ),
+                details,
+            ))));
+        }
+        let (paragraph, tables) = (plan.from, plan.tables.len());
+        let (start, end) = (plan.start, plan.end);
+        docs::apply_delete(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "{named} deleted over indexes {start} to {end}, in one request. The break \
+                 that ends each paragraph went with it{}",
+                match tables {
+                    0 => String::new(),
+                    1 => ", and the table in that range went with them".to_string(),
+                    many => format!(", and the {many} tables in that range went with them"),
+                }
+            ),
+            text: listing.join("\n"),
+            next: REREAD.to_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Delete a whole table from a Google Doc: every row, every column and \
+                       everything in the cells. Name any paragraph inside it — \
+                       docs_list_paragraphs marks those with in_table true — and `expect` is \
+                       what that paragraph starts with, or an empty string for a cell that holds \
+                       no text, which is every cell of a table that has just been made. A \
+                       paragraph that is not inside a table is refused, saying so; to delete \
+                       ordinary paragraphs use docs_delete_paragraphs. The Docs API has no \
+                       request that removes a table, \
+                       so this deletes the table's own span, and the paragraph in front of it is \
+                       left where it is. Nothing on this side can put a deleted table back. Pass \
+                       the revision_id from docs_list_paragraphs and confirmed=true after the \
+                       person has seen how many rows and columns go. One write moves every \
+                       paragraph number and changes the revision id."
+    )]
+    async fn docs_delete_table(
+        &self,
+        Parameters(p): Parameters<DocsDeleteTableParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = p.doc_id.trim().to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan =
+            docs::plan_delete_table(&outline, &p.revision_id, p.paragraph as usize, &p.expect)
+                .map_err(|e| self.google_err_for(&connection, e))?;
+        let (rows, columns) = plan.tables.first().copied().unwrap_or_default();
+        let shape = format!("{rows} by {columns}");
+        let listing = going_lines(&plan.going);
+        if !p.confirmed {
+            let mut details = vec![
+                format!(
+                    "the whole table goes: {rows} rows, {columns} columns and {} cells",
+                    rows * columns
+                ),
+                format!(
+                    "its cells are paragraphs {} to {} of the document as it stands",
+                    plan.from, plan.to
+                ),
+            ];
+            details.extend(listing.clone());
+            details.push("the paragraph in front of the table stays where it is".to_string());
+            details.push(NO_UNDO.to_string());
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "delete the {shape} table at paragraph {} of the Google Doc {doc_id} in `{}`",
+                    p.paragraph, connection.label
+                ),
+                details,
+            ))));
+        }
+        let (paragraph, from, to) = (plan.from, plan.from, plan.to);
+        let (start, end) = (plan.start, plan.end);
+        docs::apply_delete(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "the {shape} table was deleted whole over indexes {start} to {end}, in one \
+                 request; its cells were paragraphs {from} to {to}"
+            ),
+            text: listing.join("\n"),
+            next: REREAD.to_string(),
+        })))
+    }
 }
 
 /// Why a staged file cannot go into a document, in the words that say what to
@@ -1456,6 +1674,48 @@ fn cut(text: &str, max: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (text.chars().take(max).collect(), true)
+}
+
+/// What every delete says before it is agreed to. A document's own version
+/// history in Docs is the only way back, and the person has to know that
+/// before they say yes.
+const NO_UNDO: &str = "this cannot be undone from here; the document's own version history in \
+                       Docs is what gets it back";
+
+/// What a delete would take, as lines a person reads before agreeing: one
+/// paragraph to a line, with the number to name it by.
+///
+/// A long range is cut the way a long paragraph is. A preview of a whole
+/// chapter that reprinted the chapter would be a second copy of it in the
+/// conversation, and nobody checks a hundred lines before saying yes, so the
+/// first few and the last few are shown with a count of what sits between
+/// them: enough to see both ends of the range are the ones that were meant.
+fn going_lines(going: &[(usize, String)]) -> Vec<String> {
+    const HEAD: usize = 4;
+    const TAIL: usize = 2;
+    if going.len() <= HEAD + TAIL + 1 {
+        return going.iter().map(going_line).collect();
+    }
+    let mut lines: Vec<String> = going[..HEAD].iter().map(going_line).collect();
+    lines.push(format!(
+        "… and {} more paragraphs in between …",
+        going.len() - HEAD - TAIL
+    ));
+    lines.extend(going[going.len() - TAIL..].iter().map(going_line));
+    lines
+}
+
+/// One paragraph of that list: its number, and enough of it to recognise.
+fn going_line((ordinal, text): &(usize, String)) -> String {
+    const KEEP: usize = 120;
+    let (head, cut) = cut(text, KEEP);
+    if head.is_empty() {
+        return format!("paragraph {ordinal}: (empty)");
+    }
+    match cut {
+        true => format!("paragraph {ordinal}: {head}…"),
+        false => format!("paragraph {ordinal}: {head}"),
+    }
 }
 
 /// The beginning of what would be written, for the person to recognise. A

@@ -80,8 +80,10 @@ fn instructions(portal: &str) -> String {
          confirmation, because the draft is itself the thing being confirmed.\n\
          A Google Doc is changed paragraph by paragraph: call docs_list_paragraphs first, pass \
          the numbers and the revision_id it answers with to docs_insert_text, \
-         docs_edit_paragraph, docs_style_paragraph, docs_insert_code or docs_insert_table, and \
-         call it again after every write, because one write moves both. docs_read answers the \
+         docs_edit_paragraph, docs_style_paragraph, docs_insert_code, docs_insert_table, \
+         docs_delete_paragraphs or docs_delete_table, and call it again after every write, \
+         because one write moves both. The two delete tools are the only ones here that destroy \
+         anything, and nothing on this side undoes them. docs_read answers the \
          words and no formatting at all, so read a colour, a font or a weight back with \
          docs_read_formatting. A picture goes into a document the same way a file goes into a \
          draft: mint a URL with docs_upload_link, POST the picture to it yourself, and pass the \
