@@ -876,6 +876,20 @@ impl Outline {
     /// so this refuses the position and not the nesting, and names the way
     /// round it.
     fn check_table_fits(&self, paragraph: &Paragraph) -> Result<()> {
+        // The body ends where that paragraph ends, and Docs will not insert
+        // at its own end index: a document must finish with a paragraph, the
+        // same rule a cell keeps, and Google adds no paragraph of its own.
+        // Measured: "Index 157 must be less than the end index of the
+        // referenced segment, 157."
+        if paragraph.end_index >= self.end_index {
+            return Err(Error::Unsupported(format!(
+                "a table cannot go after paragraph {}, because it is the last paragraph of the \
+                 document and a document must end with a paragraph rather than with a table. \
+                 Add a paragraph at the end with docs_append first, then insert the table after \
+                 paragraph {}",
+                paragraph.ordinal, paragraph.ordinal
+            )));
+        }
         match self.cell_of(paragraph.ordinal) {
             Some(cell) if cell.last == paragraph.ordinal => Err(Error::Unsupported(format!(
                 "a table cannot go after paragraph {}, because it is the last paragraph of a \

@@ -1497,14 +1497,25 @@ async fn a_paragraph_that_may_not_lose_its_break_keeps_its_empty_line() {
     );
 
     // Paragraph 5 of the same article with a section break in it is the
-    // paragraph in front of that break, and paragraph 6 is the last of the
-    // body, whose break is the one every document keeps.
+    // paragraph in front of that break: a table may follow it, and the empty
+    // line stays.
     let h = harness().await;
     let outline = outline_of(&h, "docs_article_section.json").await;
-    for after in [5, 6] {
-        let plan = docs::plan_table(&outline, REVISION, after, &rows, false, None).unwrap();
-        assert!(!plan.tidy, "paragraph {after} keeps its break");
-    }
+    let plan = docs::plan_table(&outline, REVISION, 5, &rows, false, None).unwrap();
+    assert!(!plan.tidy, "paragraph 5 keeps its break");
+
+    // Paragraph 6 is the last of the body. No table may follow it either: a
+    // document must end with a paragraph, and Google adds none of its own —
+    // measured in a real document, where the write failed after approval with
+    // "Index 157 must be less than the end index of the referenced segment".
+    let refused = docs::plan_table(&outline, REVISION, 6, &rows, false, None).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("last paragraph of the document"),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("docs_append"), "{refused}");
     // The same rules, from the same place: what plan_delete refuses to take
     // is what a table insert leaves alone.
     for after in [5, 6] {
