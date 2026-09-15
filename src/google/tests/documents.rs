@@ -1394,6 +1394,491 @@ async fn a_table_that_cannot_be_found_again_is_not_guessed_at() {
     assert_eq!(batches(&h).await.len(), 1);
 }
 
+// ----- a row or a column of a table ------------------------------------------
+
+/// What `docs_article_grid.json` says the document is at: the article with a
+/// two-by-two table somebody has already filled in and set column widths on.
+/// Its cells are paragraphs 3 to 7, and the last of them holds two paragraphs,
+/// because a cell may.
+const GRID_REVISION: &str = "ALm37BW0Grid1";
+
+/// The two reads a structural table write makes, in the order it makes them:
+/// the table as it stands, and then the table with the empty row or column
+/// Google has just put in it. The second fixture is what the Docs API really
+/// answers, so the indexes the cells are filled at are Google's and not this
+/// test's arithmetic.
+async fn grid_then(h: &Harness, name: &str) -> docs::Outline {
+    Mock::given(method("GET"))
+        .and(path(ARTICLE_AT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_article_grid.json")))
+        .up_to_n_times(1)
+        .mount(&h.server)
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap();
+    h.mount_json("GET", ARTICLE_AT, fixture(name)).await;
+    outline
+}
+
+fn cells(texts: &[&str]) -> Vec<String> {
+    texts.iter().map(|t| t.to_string()).collect()
+}
+
+#[tokio::test]
+async fn a_new_row_is_filled_at_the_indexes_the_re_read_answered_with() {
+    let h = harness().await;
+    let outline = grid_then(&h, "docs_article_grid_row.json").await;
+    mount_batch(&h).await;
+
+    // Paragraph 3 is the cell that reads "Model", which names the table; the
+    // new row goes under row 1 and becomes row 2.
+    let plan = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        3,
+        1,
+        &cells(&["Llama-3", "8 mld"]),
+        "Model",
+    )
+    .unwrap();
+    assert_eq!(plan.number, 2);
+    assert_eq!((plan.rows, plan.columns), (2, 2));
+    assert_eq!((plan.new_rows, plan.new_columns), (3, 2));
+    assert_eq!(plan.line(), "Llama-3 | 8 mld");
+
+    let written = docs::apply_insert_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    // The new cells are paragraphs 5 and 6 of the document the re-read
+    // described, between the row above and the row below.
+    assert_eq!(
+        written,
+        docs::InsertedCells {
+            rows: 3,
+            columns: 2,
+            paragraphs: vec![5, 6],
+        }
+    );
+
+    let sent = batches(&h).await;
+    assert_eq!(sent.len(), 2, "the empty row, and then its cells");
+    // The table starts at 30 and the person counted row 1, which is row 0 to
+    // Docs. The column makes no difference to an insertTableRow, so it is the
+    // first one.
+    assert_eq!(
+        sent[0],
+        json!({
+            "requests": [{"insertTableRow": {
+                "tableCellLocation": {
+                    "tableStartLocation": {"index": 30},
+                    "rowIndex": 0,
+                    "columnIndex": 0
+                },
+                "insertBelow": true
+            }}],
+            "writeControl": {"requiredRevisionId": GRID_REVISION}
+        })
+    );
+    // The cells are filled from the last to the first, so that no insert
+    // moves an index still to be used, and both indexes are the fixture's.
+    assert_eq!(
+        sent[1],
+        json!({
+            "requests": [
+                {"insertText": {"text": "8 mld", "location": {"index": 53}}},
+                {"insertText": {"text": "Llama-3", "location": {"index": 51}}}
+            ],
+            // This server's own re-read, not the revision the caller was
+            // given: the document has moved on by one write, its own.
+            "writeControl": {"requiredRevisionId": "ALm37BW0Grid2"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_new_column_is_filled_at_the_indexes_the_re_read_answered_with() {
+    let h = harness().await;
+    let outline = grid_then(&h, "docs_article_grid_column.json").await;
+    mount_batch(&h).await;
+
+    let plan = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Column,
+        3,
+        1,
+        &cells(&["Rok", "2023"]),
+        "Model",
+    )
+    .unwrap();
+    assert_eq!(plan.number, 2);
+    assert_eq!((plan.new_rows, plan.new_columns), (2, 3));
+
+    let written = docs::apply_insert_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    // A column's cells are not next to each other in the document: one sits
+    // in each row, and the cell above the second one holds two paragraphs.
+    assert_eq!(
+        written,
+        docs::InsertedCells {
+            rows: 2,
+            columns: 3,
+            paragraphs: vec![4, 7],
+        }
+    );
+
+    let sent = batches(&h).await;
+    assert_eq!(
+        sent[0]["requests"],
+        json!([{"insertTableColumn": {
+            "tableCellLocation": {
+                "tableStartLocation": {"index": 30},
+                "rowIndex": 0,
+                "columnIndex": 0
+            },
+            "insertRight": true
+        }}])
+    );
+    assert_eq!(
+        sent[1]["requests"],
+        json!([
+            {"insertText": {"text": "2023", "location": {"index": 65}}},
+            {"insertText": {"text": "Rok", "location": {"index": 39}}}
+        ])
+    );
+    assert_eq!(
+        sent[1]["writeControl"]["requiredRevisionId"],
+        "ALm37BW0Grid3"
+    );
+}
+
+#[tokio::test]
+async fn a_row_or_a_column_takes_one_cell_for_each_of_the_others() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_grid.json").await;
+
+    // A row of a two-column table takes two cells, and a column of a two-row
+    // table takes two; the refusal names both numbers.
+    let wide = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        3,
+        1,
+        &cells(&["a", "b", "c"]),
+        "Model",
+    )
+    .unwrap_err();
+    assert!(wide.to_string().contains("holds 3 cells"), "{wide}");
+    assert!(wide.to_string().contains("has 2 columns"), "{wide}");
+    assert!(wide.to_string().contains("Nothing was written"), "{wide}");
+
+    let short = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Column,
+        3,
+        1,
+        &cells(&["a"]),
+        "Model",
+    )
+    .unwrap_err();
+    assert!(short.to_string().contains("holds 1 cell,"), "{short}");
+    assert!(short.to_string().contains("has 2 rows"), "{short}");
+
+    // A cell that is two lines would be two paragraphs, which moves every
+    // number the answer reports.
+    let broken = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        3,
+        1,
+        &cells(&["a\nb", "c"]),
+        "Model",
+    )
+    .unwrap_err();
+    assert!(broken.to_string().contains("line break"), "{broken}");
+    assert!(
+        broken.to_string().contains("cell 1 of the new row"),
+        "{broken}"
+    );
+
+    // No cells at all is a row that goes in empty, which is allowed.
+    assert!(
+        docs::plan_insert_row_or_column(
+            &outline,
+            GRID_REVISION,
+            docs::Axis::Row,
+            3,
+            1,
+            &[],
+            "Model"
+        )
+        .is_ok()
+    );
+    assert!(batches(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_last_row_and_the_last_column_are_docs_delete_tables_work() {
+    let h = harness().await;
+    // The one-by-one table of the article: taking its only row away would
+    // take the table with it, which is not what this tool was asked for.
+    let outline = article(&h).await;
+
+    for axis in [docs::Axis::Row, docs::Axis::Column] {
+        let refused =
+            docs::plan_delete_row_or_column(&outline, REVISION, axis, 4, 1, "Komórka").unwrap_err();
+        assert!(matches!(refused, Error::Unsupported(_)), "{refused:?}");
+        let said = refused.to_string();
+        assert!(said.contains("docs_delete_table"), "{said}");
+        assert!(said.contains("Nothing was written"), "{said}");
+        assert!(
+            said.contains(&format!("has one {} left", axis.one())),
+            "{said}"
+        );
+    }
+    assert!(batches(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_row_is_deleted_by_the_number_the_person_counted() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_grid.json").await;
+    mount_batch(&h).await;
+
+    // Row 2 holds "Mistral-7B" and a cell of two paragraphs, so four
+    // paragraphs go and not two.
+    let plan =
+        docs::plan_delete_row_or_column(&outline, GRID_REVISION, docs::Axis::Row, 3, 2, "Model")
+            .unwrap();
+    assert_eq!(plan.number, 2);
+    assert_eq!((plan.new_rows, plan.new_columns), (1, 2));
+    assert_eq!(plan.cells(), 2);
+    assert_eq!(
+        plan.going,
+        [
+            (5, "Mistral-7B".to_string()),
+            (6, "7 mld".to_string()),
+            (7, "około".to_string())
+        ]
+    );
+
+    docs::apply_delete_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    let body = h.last_body("POST", ARTICLE_BATCH).await;
+    // Row 2 to a person is row 1 to Docs.
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteTableRow": {"tableCellLocation": {
+            "tableStartLocation": {"index": 30},
+            "rowIndex": 1,
+            "columnIndex": 0
+        }}}])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], GRID_REVISION);
+}
+
+#[tokio::test]
+async fn a_column_is_deleted_by_the_number_the_person_counted() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_grid.json").await;
+    mount_batch(&h).await;
+
+    let plan =
+        docs::plan_delete_row_or_column(&outline, GRID_REVISION, docs::Axis::Column, 3, 2, "Model")
+            .unwrap();
+    assert_eq!((plan.new_rows, plan.new_columns), (2, 1));
+    // Column 2 is "Parametry" and the cell of two paragraphs under it.
+    assert_eq!(
+        plan.going,
+        [
+            (4, "Parametry".to_string()),
+            (6, "7 mld".to_string()),
+            (7, "około".to_string())
+        ]
+    );
+
+    docs::apply_delete_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    let body = h.last_body("POST", ARTICLE_BATCH).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteTableColumn": {"tableCellLocation": {
+            "tableStartLocation": {"index": 30},
+            "rowIndex": 0,
+            "columnIndex": 1
+        }}}])
+    );
+}
+
+/// Every refusal these four share, none of which reaches Google: a paragraph
+/// that is not in a table, a row number the table does not have, a stale
+/// revision and an `expect` the cell does not match.
+#[tokio::test]
+async fn a_structural_table_edit_is_refused_before_anything_is_sent() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_grid.json").await;
+
+    let body_text = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        2,
+        1,
+        &[],
+        "Część",
+    )
+    .unwrap_err();
+    assert!(
+        body_text.to_string().contains("not inside a table"),
+        "{body_text}"
+    );
+    assert!(body_text.to_string().contains("in_table"), "{body_text}");
+
+    for (refused, wanted) in [
+        (
+            docs::plan_insert_row_or_column(
+                &outline,
+                GRID_REVISION,
+                docs::Axis::Row,
+                3,
+                3,
+                &[],
+                "Model",
+            )
+            .unwrap_err(),
+            "this table has 2 rows, so there is no row 3",
+        ),
+        (
+            docs::plan_delete_row_or_column(
+                &outline,
+                GRID_REVISION,
+                docs::Axis::Column,
+                3,
+                0,
+                "Model",
+            )
+            .unwrap_err(),
+            "numbered from 1, so there is no column 0",
+        ),
+        (
+            docs::plan_insert_row_or_column(
+                &outline,
+                "ALm37BW0Older",
+                docs::Axis::Row,
+                3,
+                1,
+                &[],
+                "Model",
+            )
+            .unwrap_err(),
+            "ALm37BW0Older",
+        ),
+        (
+            docs::plan_delete_row_or_column(
+                &outline,
+                GRID_REVISION,
+                docs::Axis::Row,
+                3,
+                2,
+                "Koniec",
+            )
+            .unwrap_err(),
+            "paragraph 3 does not start with",
+        ),
+    ] {
+        assert!(matches!(refused, Error::Unsupported(_)), "{refused:?}");
+        assert!(refused.to_string().contains(wanted), "{refused}");
+    }
+
+    let posts = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .count();
+    assert_eq!(posts, 0);
+}
+
+#[tokio::test]
+async fn a_second_batch_google_refuses_says_the_row_is_there_and_empty() {
+    let h = harness().await;
+    let outline = grid_then(&h, "docs_article_grid_row.json").await;
+    // The row goes in and the fill is refused, which is the one moment this
+    // tool can leave a document changed and unfinished.
+    Mock::given(method("POST"))
+        .and(path(ARTICLE_BATCH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_batch_update.json")))
+        .up_to_n_times(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ARTICLE_BATCH))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": "Revision ALm37BW0Grid2 is not the latest"}
+        })))
+        .mount(&h.server)
+        .await;
+
+    let plan = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        3,
+        1,
+        &cells(&["Llama-3", "8 mld"]),
+        "Model",
+    )
+    .unwrap();
+    let refused = docs::apply_insert_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap_err();
+
+    let said = refused.to_string();
+    assert!(said.contains("the new row is row 2"), "{said}");
+    assert!(said.contains("is empty"), "{said}");
+    assert!(said.contains("paragraphs 5, 6"), "{said}");
+    assert!(said.contains("docs_delete_table_row"), "{said}");
+    assert!(said.contains("docs_list_paragraphs"), "{said}");
+    assert_eq!(batches(&h).await.len(), 2, "the second batch was attempted");
+}
+
+#[tokio::test]
+async fn a_row_that_cannot_be_found_again_is_not_guessed_at() {
+    let h = harness().await;
+    // The re-read answers the table as it was, which has no third row. Rather
+    // than write into the cells that are there, the write stops and says so.
+    let outline = outline_of(&h, "docs_article_grid.json").await;
+    mount_batch(&h).await;
+
+    let plan = docs::plan_insert_row_or_column(
+        &outline,
+        GRID_REVISION,
+        docs::Axis::Row,
+        3,
+        1,
+        &cells(&["Llama-3", "8 mld"]),
+        "Model",
+    )
+    .unwrap();
+    let refused = docs::apply_insert_row_or_column(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap_err();
+    let said = refused.to_string();
+    assert!(said.contains("is empty"), "{said}");
+    assert!(said.contains("could not find its empty cells"), "{said}");
+    assert_eq!(
+        batches(&h).await.len(),
+        1,
+        "nothing was written into a cell"
+    );
+}
+
 // ----- taking content away ---------------------------------------------------
 
 /// The article read from a document this suite names rather than the usual

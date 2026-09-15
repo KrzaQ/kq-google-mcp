@@ -1,0 +1,320 @@
+{
+  "documentId": "1ArTiClEdOcIdExAmPlE0123456789abcdef",
+  "title": "Wywiad z Anną",
+  "revisionId": "ALm37BW0Grid2",
+  "body": {
+    "content": [
+      {
+        "startIndex": 0,
+        "endIndex": 1,
+        "sectionBreak": {
+          "sectionStyle": {}
+        }
+      },
+      {
+        "startIndex": 1,
+        "endIndex": 15,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "TITLE"
+          },
+          "elements": [
+            {
+              "startIndex": 1,
+              "endIndex": 15,
+              "textRun": {
+                "content": "Wywiad z Anną\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 15,
+        "endIndex": 30,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "elements": [
+            {
+              "startIndex": 15,
+              "endIndex": 30,
+              "textRun": {
+                "content": "Część pierwsza\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 30,
+        "endIndex": 81,
+        "table": {
+          "rows": 3,
+          "columns": 2,
+          "tableRows": [
+            {
+              "startIndex": 31,
+              "endIndex": 50,
+              "tableCells": [
+                {
+                  "startIndex": 32,
+                  "endIndex": 38,
+                  "content": [
+                    {
+                      "startIndex": 32,
+                      "endIndex": 38,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 32,
+                            "endIndex": 38,
+                            "textRun": {
+                              "content": "Model\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                },
+                {
+                  "startIndex": 39,
+                  "endIndex": 49,
+                  "content": [
+                    {
+                      "startIndex": 39,
+                      "endIndex": 49,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 39,
+                            "endIndex": 49,
+                            "textRun": {
+                              "content": "Parametry\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                }
+              ],
+              "tableRowStyle": {
+                "minRowHeight": {
+                  "magnitude": 0,
+                  "unit": "PT"
+                }
+              }
+            },
+            {
+              "startIndex": 50,
+              "endIndex": 55,
+              "tableCells": [
+                {
+                  "startIndex": 51,
+                  "endIndex": 52,
+                  "content": [
+                    {
+                      "startIndex": 51,
+                      "endIndex": 52,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 51,
+                            "endIndex": 52,
+                            "textRun": {
+                              "content": "\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                },
+                {
+                  "startIndex": 53,
+                  "endIndex": 54,
+                  "content": [
+                    {
+                      "startIndex": 53,
+                      "endIndex": 54,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 53,
+                            "endIndex": 54,
+                            "textRun": {
+                              "content": "\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                }
+              ],
+              "tableRowStyle": {
+                "minRowHeight": {
+                  "magnitude": 0,
+                  "unit": "PT"
+                }
+              }
+            },
+            {
+              "startIndex": 55,
+              "endIndex": 81,
+              "tableCells": [
+                {
+                  "startIndex": 56,
+                  "endIndex": 67,
+                  "content": [
+                    {
+                      "startIndex": 56,
+                      "endIndex": 67,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 56,
+                            "endIndex": 67,
+                            "textRun": {
+                              "content": "Mistral-7B\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                },
+                {
+                  "startIndex": 68,
+                  "endIndex": 80,
+                  "content": [
+                    {
+                      "startIndex": 68,
+                      "endIndex": 74,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 68,
+                            "endIndex": 74,
+                            "textRun": {
+                              "content": "7 mld\n"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "startIndex": 74,
+                      "endIndex": 80,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 74,
+                            "endIndex": 80,
+                            "textRun": {
+                              "content": "około\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "tableCellStyle": {
+                    "rowSpan": 1,
+                    "columnSpan": 1
+                  }
+                }
+              ],
+              "tableRowStyle": {
+                "minRowHeight": {
+                  "magnitude": 0,
+                  "unit": "PT"
+                }
+              }
+            }
+          ],
+          "tableStyle": {
+            "tableColumnProperties": [
+              {
+                "widthType": "FIXED_WIDTH",
+                "width": {
+                  "magnitude": 120,
+                  "unit": "PT"
+                }
+              },
+              {
+                "widthType": "FIXED_WIDTH",
+                "width": {
+                  "magnitude": 150,
+                  "unit": "PT"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "startIndex": 81,
+        "endIndex": 89,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 81,
+              "endIndex": 89,
+              "textRun": {
+                "content": "Koniec.\n"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

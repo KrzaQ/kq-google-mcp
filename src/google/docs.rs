@@ -12,15 +12,18 @@
 //! Structural edits are narrow. Nothing here moves a paragraph, so a model
 //! that can insert, replace inside one paragraph and set a named style cannot
 //! rearrange someone's article by accident. The one structure it may add is a
-//! table, and [`apply_table`] is the single write in this module that sends
-//! two batches; the comment on it says why.
+//! table, whole with [`apply_table`] or a row at a time with
+//! [`apply_insert_row_or_column`]. Those two are the writes in this module
+//! that send two batches, for the reason the comment on [`apply_table`] gives
+//! at length.
 //!
-//! Two writes take content away, and they are the only ones here that destroy
-//! anything: [`plan_delete`] removes whole paragraphs and
-//! [`plan_delete_table`] removes a table. Docs refuses several deletions
+//! Three writes take content away, and they are the only ones here that
+//! destroy anything: [`plan_delete`] removes whole paragraphs,
+//! [`plan_delete_table`] removes a table and [`plan_delete_row_or_column`]
+//! removes one row or one column of one. Docs refuses several deletions
 //! outright — a segment's last newline, half a table, the break in front of
-//! one — and [`Outline::check_deletable`] answers each of those in this
-//! server's own words before a request is built.
+//! one, the last row of a table — and this module answers each of those in
+//! its own words before a request is built.
 
 use std::collections::HashMap;
 
@@ -696,6 +699,22 @@ impl Grid {
         (first, last)
     }
 
+    /// The cells of one row or one column, in document order. The number is
+    /// the one a person counts with, from 1.
+    fn line(&self, axis: Axis, number: usize) -> Vec<&Cell> {
+        let Some(at) = number.checked_sub(1) else {
+            return Vec::new();
+        };
+        match axis {
+            Axis::Row => self
+                .rows
+                .get(at)
+                .map(|row| row.iter().collect())
+                .unwrap_or_default(),
+            Axis::Column => self.rows.iter().filter_map(|row| row.get(at)).collect(),
+        }
+    }
+
     /// Whether this table is where that paragraph sits.
     fn holds(&self, ordinal: usize) -> bool {
         let (first, last) = self.paragraphs();
@@ -901,6 +920,33 @@ impl Outline {
     /// lookup decides where text is about to be written, and a table that is
     /// not the new one is the one failure this whole two-batch write exists
     /// to avoid.
+    /// The table a row or a column has just gone into: the one that still
+    /// starts where it did, now with the shape the edit asked for.
+    ///
+    /// A structural edit leaves the table's own start index alone, so that
+    /// index names it again in the document read back, and the shape says the
+    /// edit is the one that landed.
+    fn changed_table(&self, index: i64, rows: usize, columns: usize) -> Option<&Grid> {
+        self.tables.iter().find(|grid| {
+            grid.index == index
+                && grid.rows.len() == rows
+                && grid.rows.iter().all(|row| row.len() == columns)
+        })
+    }
+
+    /// The paragraphs these cells hold, numbered as the listing numbers them.
+    /// A cell may hold more than one paragraph, so this walks each cell's own
+    /// range rather than taking one paragraph per cell.
+    fn cell_paragraphs(&self, cells: &[&Cell]) -> Vec<(usize, String)> {
+        cells
+            .iter()
+            .filter(|cell| cell.ordinal > 0)
+            .flat_map(|cell| cell.ordinal..=cell.last)
+            .filter_map(|ordinal| self.paragraphs.get(ordinal - 1))
+            .map(|p| (p.ordinal, p.text.clone()))
+            .collect()
+    }
+
     fn new_table(&self, index: i64, rows: usize, columns: usize) -> Option<&Grid> {
         self.tables.iter().find(|grid| {
             grid.index >= index
@@ -1733,14 +1779,10 @@ fn grid_size(rows: &[Vec<String>]) -> Result<(usize, usize)> {
             )));
         }
         for (cell, text) in row.iter().enumerate() {
-            if text.contains('\n') || text.contains('\r') {
-                return Err(Error::Unsupported(format!(
-                    "the cell in row {}, column {} holds a line break; a cell here is one line \
-                     of plain text. Nothing was written",
-                    at + 1,
-                    cell + 1
-                )));
-            }
+            check_one_line(
+                text,
+                &format!("the cell in row {}, column {}", at + 1, cell + 1),
+            )?;
         }
     }
     if rows.len() > TABLE_MAX_ROWS {
@@ -1757,6 +1799,19 @@ fn grid_size(rows: &[Vec<String>]) -> Result<(usize, usize)> {
         )));
     }
     Ok((rows.len(), columns))
+}
+
+/// A cell is one line of plain text. A break in one would make a second
+/// paragraph inside the cell and move every paragraph number the answer
+/// reports, so it is refused before anything is sent.
+fn check_one_line(text: &str, cell: &str) -> Result<()> {
+    if text.contains('\n') || text.contains('\r') {
+        return Err(Error::Unsupported(format!(
+            "{cell} holds a line break; a cell here is one line of plain text. Nothing was \
+             written"
+        )));
+    }
+    Ok(())
 }
 
 /// The one write in this module that sends two batches, deliberately.
@@ -1901,6 +1956,472 @@ fn fill_requests(table: &Grid, grid: &[Vec<String>], header: bool) -> Vec<DocReq
         }
     }
     requests
+}
+
+// ----- a row or a column of a table ------------------------------------------
+
+/// Which way round a table is edited. A row runs across the table and holds
+/// one cell for each column; a column runs down it and holds one for each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Row,
+    Column,
+}
+
+impl Axis {
+    /// The word for one of them, for a person to read.
+    pub fn one(self) -> &'static str {
+        match self {
+            Axis::Row => "row",
+            Axis::Column => "column",
+        }
+    }
+
+    /// The word for several of them.
+    pub fn many(self) -> &'static str {
+        match self {
+            Axis::Row => "rows",
+            Axis::Column => "columns",
+        }
+    }
+
+    /// "1 row", "2 rows".
+    fn counted(self, n: usize) -> String {
+        format!("{n} {}", if n == 1 { self.one() } else { self.many() })
+    }
+
+    /// The other way round. A row is as long as the table has columns, which
+    /// is the one place this matters.
+    fn across(self) -> Self {
+        match self {
+            Axis::Row => Axis::Column,
+            Axis::Column => Axis::Row,
+        }
+    }
+
+    /// How many of these a table of this shape has.
+    fn count(self, rows: usize, columns: usize) -> usize {
+        match self {
+            Axis::Row => rows,
+            Axis::Column => columns,
+        }
+    }
+
+    /// The shape the table has once one more of these has gone in.
+    fn grown(self, rows: usize, columns: usize) -> (usize, usize) {
+        match self {
+            Axis::Row => (rows + 1, columns),
+            Axis::Column => (rows, columns + 1),
+        }
+    }
+
+    /// The shape it has once one of them has come out.
+    fn shrunk(self, rows: usize, columns: usize) -> (usize, usize) {
+        match self {
+            Axis::Row => (rows.saturating_sub(1), columns),
+            Axis::Column => (rows, columns.saturating_sub(1)),
+        }
+    }
+}
+
+/// A row or a column on its way into a table that is already there, and the
+/// text that goes in its cells afterwards.
+///
+/// The cells are not in the plan's requests, for the reason [`apply_table`]
+/// gives: an insert makes cells that do not exist yet, and where they are is
+/// Google's answer to the write that makes them.
+#[derive(Debug)]
+pub struct TableInsertPlan {
+    /// The cell the caller named the table by.
+    pub paragraph: usize,
+    pub axis: Axis,
+    /// Which row or column of the table the new one becomes, counting from 1.
+    pub number: usize,
+    /// The table's shape as it stands.
+    pub rows: usize,
+    pub columns: usize,
+    /// Its shape once this has gone in.
+    pub new_rows: usize,
+    pub new_columns: usize,
+    /// The text for the new cells, one to a cell, and empty for a row or a
+    /// column that goes in blank.
+    pub cells: Vec<String>,
+    /// Where the table starts, in Docs' own index. A structural edit leaves
+    /// that index where it is, so it is what finds the table again in the
+    /// document this server reads back.
+    index: i64,
+    revision_id: String,
+    requests: Vec<DocRequest>,
+}
+
+impl TableInsertPlan {
+    /// The new cells as one line, for a person to read before it is written.
+    pub fn line(&self) -> String {
+        self.cells.join(" | ")
+    }
+}
+
+/// A row or a column on its way out of a table, with everything in its cells.
+#[derive(Debug)]
+pub struct TableDeletePlan {
+    /// The cell the caller named the table by.
+    pub paragraph: usize,
+    pub axis: Axis,
+    /// Which row or column goes, counting from 1.
+    pub number: usize,
+    /// The table's shape as it stands.
+    pub rows: usize,
+    pub columns: usize,
+    /// Its shape once this has come out.
+    pub new_rows: usize,
+    pub new_columns: usize,
+    /// Every paragraph that goes: its number, and how it reads now. A cell
+    /// may hold more than one paragraph, so this is not one line per cell.
+    pub going: Vec<(usize, String)>,
+    revision_id: String,
+    requests: Vec<DocRequest>,
+}
+
+impl TableDeletePlan {
+    /// How many cells go with it: a row holds one for each column.
+    pub fn cells(&self) -> usize {
+        self.axis.across().count(self.rows, self.columns)
+    }
+}
+
+/// Where a new row or column landed, once both batches have gone through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertedCells {
+    /// The table's shape now.
+    pub rows: usize,
+    pub columns: usize,
+    /// The first paragraph of each new cell, as `docs_list_paragraphs`
+    /// numbers them, which is where text goes into that cell.
+    pub paragraphs: Vec<usize>,
+}
+
+/// A row under the row a caller counted, or a column to the right of the
+/// column they counted, in a table that is already there.
+///
+/// This is why the tool exists: a table edited this way keeps its column
+/// widths, its borders and everything else somebody set by hand in Docs,
+/// which deleting the table and writing it again throws away.
+pub fn plan_insert_row_or_column(
+    outline: &Outline,
+    revision_id: &str,
+    axis: Axis,
+    paragraph: usize,
+    after: usize,
+    cells: &[String],
+    expect: &str,
+) -> Result<TableInsertPlan> {
+    outline.check_revision(revision_id)?;
+    outline.paragraph(paragraph)?.check_expect_blank(expect)?;
+    let grid = table_at(outline, paragraph, axis)?;
+    let (rows, columns) = (grid.rows.len(), grid.columns());
+    check_number(axis, after, axis.count(rows, columns))?;
+    check_cells(axis, cells, axis.across().count(rows, columns))?;
+    let (new_rows, new_columns) = axis.grown(rows, columns);
+    // Docs locates a structural edit by a cell of the table, and the new row
+    // goes below that cell's row. Which cell of the row it is makes no
+    // difference, so it is the first one.
+    let request = match axis {
+        Axis::Row => DocRequest {
+            insert_table_row: Some(InsertTableRow {
+                table_cell_location: TableCellLocation::at(grid.index, after, 1),
+                insert_below: true,
+            }),
+            ..DocRequest::default()
+        },
+        Axis::Column => DocRequest {
+            insert_table_column: Some(InsertTableColumn {
+                table_cell_location: TableCellLocation::at(grid.index, 1, after),
+                insert_right: true,
+            }),
+            ..DocRequest::default()
+        },
+    };
+    Ok(TableInsertPlan {
+        paragraph,
+        axis,
+        number: after + 1,
+        rows,
+        columns,
+        new_rows,
+        new_columns,
+        cells: cells.to_vec(),
+        index: grid.index,
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![request],
+    })
+}
+
+/// One row or one column out of a table, named by any cell of that table.
+///
+/// Docs deletes the whole table when its last row or its last column goes,
+/// which is not what this was asked for, so that is refused here and
+/// docs_delete_table is named instead.
+pub fn plan_delete_row_or_column(
+    outline: &Outline,
+    revision_id: &str,
+    axis: Axis,
+    paragraph: usize,
+    number: usize,
+    expect: &str,
+) -> Result<TableDeletePlan> {
+    outline.check_revision(revision_id)?;
+    outline.paragraph(paragraph)?.check_expect_blank(expect)?;
+    let grid = table_at(outline, paragraph, axis)?;
+    let (rows, columns) = (grid.rows.len(), grid.columns());
+    let have = axis.count(rows, columns);
+    if have <= 1 {
+        return Err(Error::Unsupported(format!(
+            "this table has one {} left, and Docs takes the whole table away when the last one \
+             goes. Delete the table itself with docs_delete_table, which says how many rows and \
+             columns go before it does it. Nothing was written",
+            axis.one()
+        )));
+    }
+    check_number(axis, number, have)?;
+    let (new_rows, new_columns) = axis.shrunk(rows, columns);
+    let location = match axis {
+        Axis::Row => TableCellLocation::at(grid.index, number, 1),
+        Axis::Column => TableCellLocation::at(grid.index, 1, number),
+    };
+    let request = match axis {
+        Axis::Row => DocRequest {
+            delete_table_row: Some(DeleteTableRow {
+                table_cell_location: location,
+            }),
+            ..DocRequest::default()
+        },
+        Axis::Column => DocRequest {
+            delete_table_column: Some(DeleteTableColumn {
+                table_cell_location: location,
+            }),
+            ..DocRequest::default()
+        },
+    };
+    Ok(TableDeletePlan {
+        paragraph,
+        axis,
+        number,
+        rows,
+        columns,
+        new_rows,
+        new_columns,
+        going: outline.cell_paragraphs(&grid.line(axis, number)),
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![request],
+    })
+}
+
+/// The table a caller named by one of its cells, or the refusal that says a
+/// paragraph of the body is not one.
+fn table_at(outline: &Outline, paragraph: usize, axis: Axis) -> Result<&Grid> {
+    outline.table_of(paragraph).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "paragraph {paragraph} is not inside a table, so it has no {} to change: it is body \
+             text. docs_list_paragraphs marks the paragraphs that are in one with in_table, and \
+             this tool takes any cell of the table you mean. Nothing was written",
+            axis.many()
+        ))
+    })
+}
+
+/// The row or the column a caller counted, against what the table holds. Both
+/// are counted from 1 here, the way a person counts them and the way every
+/// other ordinal in these tools works.
+fn check_number(axis: Axis, number: usize, have: usize) -> Result<()> {
+    if number == 0 {
+        return Err(Error::Unsupported(format!(
+            "the {} of a table are numbered from 1, so there is no {} 0. Nothing was written",
+            axis.many(),
+            axis.one()
+        )));
+    }
+    if number > have {
+        return Err(Error::Unsupported(format!(
+            "this table has {}, so there is no {} {number}. Nothing was written",
+            axis.counted(have),
+            axis.one()
+        )));
+    }
+    Ok(())
+}
+
+/// The text for a new row or column against the shape of the table. A row
+/// holds one cell for each column, so a row's text has to have as many
+/// entries as the table has columns; anything else is a miscount, and the
+/// refusal names both numbers. No text at all is a row that goes in empty.
+fn check_cells(axis: Axis, cells: &[String], wanted: usize) -> Result<()> {
+    if cells.is_empty() {
+        return Ok(());
+    }
+    if cells.len() != wanted {
+        return Err(Error::Unsupported(format!(
+            "the new {} holds {} cell{}, and this table has {}: a {} takes one cell for each {}. \
+             Leave `cells` out for an empty {}. Nothing was written",
+            axis.one(),
+            cells.len(),
+            if cells.len() == 1 { "" } else { "s" },
+            axis.across().counted(wanted),
+            axis.one(),
+            axis.across().one(),
+            axis.one()
+        )));
+    }
+    for (at, text) in cells.iter().enumerate() {
+        check_one_line(text, &format!("cell {} of the new {}", at + 1, axis.one()))?;
+    }
+    Ok(())
+}
+
+/// The second write in this module that sends two batches, for the reason
+/// [`apply_table`] gives at length: an insert makes empty cells, and where
+/// they are is Google's answer to the write that made them rather than
+/// anything a formula here should guess.
+///
+/// So the row goes in, the document is read again, and the cells are filled
+/// at the indexes that read answered with — from the last to the first, so
+/// that no insert moves an index still to be used — in a batch carrying the
+/// revision of that read.
+///
+/// When the second batch fails, the row is there and empty. The answer says
+/// exactly that and names the paragraph numbers its cells now have.
+pub async fn apply_insert_row_or_column(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    plan: TableInsertPlan,
+) -> Result<InsertedCells> {
+    let TableInsertPlan {
+        axis,
+        number,
+        new_rows,
+        new_columns,
+        cells,
+        index,
+        revision_id,
+        requests,
+        ..
+    } = plan;
+    batch(client, connection_id, document_id, requests, revision_id)
+        .await
+        .map_err(stale)?;
+    // From here a table in somebody's document has a row it did not have, so
+    // every refusal below says so rather than reading as though nothing had
+    // happened.
+    let after = outline(client, connection_id, document_id)
+        .await
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "{}, and reading the document back to find its cells failed: {e}. Call \
+                 docs_list_paragraphs to see where it is",
+                added(axis, number)
+            ))
+        })?;
+    let new = after
+        .changed_table(index, new_rows, new_columns)
+        .map(|grid| grid.line(axis, number))
+        .filter(|cells| !cells.is_empty() && cells.iter().all(|c| c.empty && c.ordinal > 0))
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}, and this server could not find its empty cells in the document it read \
+                 back, so nothing was written into them. Call docs_list_paragraphs to see where \
+                 it is",
+                added(axis, number)
+            ))
+        })?;
+    let paragraphs: Vec<usize> = new.iter().map(|cell| cell.ordinal).collect();
+    let requests = fill_cells(&new, &cells);
+    if !requests.is_empty() {
+        batch(
+            client,
+            connection_id,
+            document_id,
+            requests,
+            after.revision_id.clone(),
+        )
+        .await
+        .map_err(|e| empty_cells(axis, number, &paragraphs, e))?;
+    }
+    Ok(InsertedCells {
+        rows: new_rows,
+        columns: new_columns,
+        paragraphs,
+    })
+}
+
+/// The one `batchUpdate` a row or a column delete sends, against the revision
+/// it was planned for. Docs has a request for this one, so it is one request
+/// and one batch, where deleting a whole table is a span.
+pub async fn apply_delete_row_or_column(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    plan: TableDeletePlan,
+) -> Result<()> {
+    batch(
+        client,
+        connection_id,
+        document_id,
+        plan.requests,
+        plan.revision_id,
+    )
+    .await
+    .map_err(stale)?;
+    Ok(())
+}
+
+/// The requests that fill the new cells, in reverse document order, so that
+/// each insert leaves the indexes of the ones still to come where they were.
+/// An empty cell is skipped: Docs refuses an insert of no text, and empty is
+/// what the cell already is.
+fn fill_cells(cells: &[&Cell], texts: &[String]) -> Vec<DocRequest> {
+    cells
+        .iter()
+        .zip(texts)
+        .rev()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(cell, text)| insert_request(cell.index, text))
+        .collect()
+}
+
+/// What the first batch did, in the words every refusal after it starts with.
+fn added(axis: Axis, number: usize) -> String {
+    format!(
+        "the new {} is {} {number} of the table and is empty",
+        axis.one(),
+        axis.one()
+    )
+}
+
+/// The second batch failed, so the row stands there with nothing in it. The
+/// answer says that, says where its cells are in numbers the next call can
+/// use, and says what to do about it.
+fn empty_cells(axis: Axis, number: usize, paragraphs: &[usize], e: Error) -> Error {
+    Error::Unsupported(format!(
+        "{}: its cells are paragraphs {} of the document as it stands now, and none of the text \
+         was written into them. Fill a cell with docs_insert_text before_paragraph=<that \
+         number>, or take the {} out again with docs_delete_table_{}. Read the document with \
+         docs_list_paragraphs first, because the numbers here are from this server's own read \
+         and the write that failed may have been refused because somebody else was editing. \
+         Google refused the second write: {e}",
+        added(axis, number),
+        numbered(paragraphs),
+        axis.one(),
+        axis.one()
+    ))
+}
+
+/// A few numbers, for a sentence that names them: "5, 6".
+fn numbered(numbers: &[usize]) -> String {
+    numbers
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ----- taking content away ---------------------------------------------------
@@ -2329,6 +2850,70 @@ struct DocRequest {
     insert_inline_image: Option<InsertInlineImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     insert_table: Option<InsertTable>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert_table_row: Option<InsertTableRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert_table_column: Option<InsertTableColumn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_table_row: Option<DeleteTableRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_table_column: Option<DeleteTableColumn>,
+}
+
+/// Where in a table a structural edit happens: the table itself, and one cell
+/// of it. Docs counts the row and the column from 0 here and every tool of
+/// this server counts them from 1, so [`TableCellLocation::at`] is the one
+/// place the two meet.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TableCellLocation {
+    table_start_location: Location,
+    row_index: i64,
+    column_index: i64,
+}
+
+impl TableCellLocation {
+    /// The cell a person counted, as Docs counts it.
+    fn at(index: i64, row: usize, column: usize) -> Self {
+        Self {
+            table_start_location: Location { index },
+            row_index: row as i64 - 1,
+            column_index: column as i64 - 1,
+        }
+    }
+}
+
+/// The new row goes below the cell's own row, never above it, because the
+/// tool takes the number of the row to put it under.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertTableRow {
+    table_cell_location: TableCellLocation,
+    insert_below: bool,
+}
+
+/// The same the other way round: to the right of the cell's own column.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertTableColumn {
+    table_cell_location: TableCellLocation,
+    insert_right: bool,
+}
+
+/// The row the cell sits in goes, with everything in its cells. Docs deletes
+/// the whole table when this is its last row, which is why that is refused
+/// before the request is built.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteTableRow {
+    table_cell_location: TableCellLocation,
+}
+
+/// The column the cell sits in, likewise.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteTableColumn {
+    table_cell_location: TableCellLocation,
 }
 
 /// Docs writes a newline of its own before the table it inserts, so the
