@@ -242,9 +242,10 @@ pub struct DocsCodeParam {
     /// The point size for the whole listing, 1 to 400. Left out, the listing
     /// takes the document's own size, which is usually 11
     pub size_pt: Option<f64>,
-    /// What to colour, and how. Offsets count characters from the start of
-    /// `code`, spans may not overlap, and you work the tokens out yourself:
-    /// this server highlights nothing.
+    /// What to colour, and how. Offsets count every character from the start
+    /// of `code`, the line breaks included; spans may not overlap, need not
+    /// cover the whole listing, and you work the tokens out yourself: this
+    /// server highlights nothing.
     pub spans: Option<Vec<DocsSpanParam>>,
     /// What the paragraph you named starts with. Optional, and worth passing.
     pub expect: Option<String>,
@@ -1211,10 +1212,17 @@ impl Gmcp {
                        all of it, and one \
                        colour, bold or italic per span. A span is {start, end, colour, bold, \
                        italic}, where start and end count characters from the beginning of \
-                       `code`. You work out where the tokens are: this server highlights nothing \
+                       `code` — every character, the line breaks included, so count the newlines \
+                       too. You work out where the tokens are: this server highlights nothing \
                        and takes no language. Spans may not overlap, may not be empty and may not \
-                       run past the end of the code, and a colour is #rrggbb — a listing that \
-                       cannot be coloured completely is refused rather than half written. size_pt sets the whole listing, 1 to 400 \
+                       run past the end of the code, and a colour is #rrggbb. Every span is \
+                       checked before the first request is built, so a span this refuses leaves \
+                       the document untouched rather than half coloured. The spans need not \
+                       cover the whole listing: what they miss keeps the document's own colour, \
+                       which is what colouring only the keywords means. The preview and the \
+                       answer both say how many characters the spans colour out of how many the \
+                       listing holds, so read that number back before you agree to the write. \
+                       size_pt sets the whole listing, 1 to 400 \
                        points; left out, it takes the document's own size. Pass \
                        the revision_id from docs_list_paragraphs and confirmed=true. One write \
                        moves every paragraph number and changes the revision id."
@@ -1258,6 +1266,18 @@ impl Gmcp {
             p.expect.as_deref(),
         )
         .map_err(|e| self.google_err_for(&connection, e))?;
+        // What the spans colour and what the listing holds, both counted in
+        // the characters the spans are written in. A caller that counted the
+        // code it could see and forgot the newlines reads its mistake here,
+        // in the preview, rather than in a listing whose last characters
+        // print in the document's own colour inside a coloured block.
+        let (coloured, characters) = plan.coverage();
+        let covered = format!(
+            "{} {} {coloured} of {characters} characters; what they miss keeps the document's \
+             own colour",
+            spans.len(),
+            plural(spans.len(), "span colours", "spans colour")
+        );
         if !p.confirmed {
             return Ok(Json(Confirmable::Preview(PreviewOut::new(
                 format!(
@@ -1270,11 +1290,8 @@ impl Gmcp {
                         plan.paragraph,
                         first_lines(&plan.before)
                     ),
-                    format!(
-                        "{} characters of code, in {set_in}, with {} spans coloured",
-                        plan.after.chars().count(),
-                        spans.len()
-                    ),
+                    format!("{characters} characters of code, in {set_in}"),
+                    covered.clone(),
                     first_lines(&plan.after),
                 ],
             ))));
@@ -1290,9 +1307,8 @@ impl Gmcp {
             paragraph,
             written: format!(
                 "{} characters of code inserted after paragraph {paragraph} in one batch of \
-                 {requests} requests: the text, {set_in} and {} spans",
-                text.chars().count(),
-                spans.len()
+                 {requests} requests: the text, {set_in} and the spans. {covered}",
+                text.chars().count()
             ),
             text,
             next: REREAD.to_string(),

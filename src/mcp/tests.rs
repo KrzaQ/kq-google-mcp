@@ -4283,7 +4283,8 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
     );
     assert_eq!(body["writeControl"]["requiredRevisionId"], ARTICLE_REVISION);
 
-    // A listing that cannot be coloured completely is not written at all.
+    // A span this refuses stops the whole listing: the check runs before the
+    // first request is built, so nothing is half coloured.
     let mut overlapping = args.as_object().unwrap().clone();
     overlapping.insert(
         "spans".into(),
@@ -4296,6 +4297,62 @@ async fn docs_insert_code_writes_the_text_the_font_and_every_span_in_one_batch()
         .await;
     assert!(refused.contains("overlap"), "{refused}");
     assert_eq!(batch_calls(&server).await, 1);
+    drop(server);
+}
+
+/// The listing this was found on: five lines holding 289 characters, and the
+/// four newlines between them bring it to 293. A caller that counted what it
+/// could see wrote one span of 0..289, and the last four characters printed
+/// in the document's own colour inside a red block.
+const LISTING_293: &str = "fn coverage(spans: &[Span], code: &str) -> (usize, usize) {\n    // a span may never overlap another one, so adding the lengths counts every character they cover exactly once.\n    let coloured: usize = spans.iter().map(|span| span.end - span.start).sum();\n    (coloured, code.chars().count())\n}";
+
+/// The spans need not cover the listing — colouring the keywords and leaving
+/// the prose is the ordinary case — so the tool reports the coverage instead
+/// of checking it, in the preview and in the answer both.
+#[tokio::test]
+async fn docs_insert_code_says_how_much_of_the_listing_the_spans_colour() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let short = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                       "code": LISTING_293, "revision_id": ARTICLE_REVISION,
+                       "spans": [{"start": 0, "end": 289, "colour": "#ff0000"}]});
+    let shown = c.ok("docs_insert_code", confirming(&short, false)).await;
+    let lines = details(&shown);
+    assert!(
+        lines.contains("1 span colours 289 of 293 characters"),
+        "the preview counts the four newlines the span misses: {lines}"
+    );
+    let out = c.ok("docs_insert_code", confirming(&short, true)).await;
+    assert!(
+        out["written"]
+            .as_str()
+            .unwrap()
+            .contains("1 span colours 289 of 293 characters"),
+        "the answer says it too: {out}"
+    );
+
+    // A listing the spans do cover whole says so in the same words.
+    let whole = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                       "code": LISTING_293, "revision_id": ARTICLE_REVISION,
+                       "spans": [{"start": 0, "end": 200, "colour": "#ff0000"},
+                                 {"start": 200, "end": 293, "colour": "#1a7f37"}]});
+    let shown = c.ok("docs_insert_code", confirming(&whole, false)).await;
+    assert!(
+        details(&shown).contains("2 spans colour 293 of 293 characters"),
+        "{}",
+        details(&shown)
+    );
+    let out = c.ok("docs_insert_code", confirming(&whole, true)).await;
+    assert!(
+        out["written"]
+            .as_str()
+            .unwrap()
+            .contains("2 spans colour 293 of 293 characters"),
+        "{out}"
+    );
     drop(server);
 }
 

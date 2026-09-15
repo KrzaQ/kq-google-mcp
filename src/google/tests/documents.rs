@@ -951,7 +951,7 @@ async fn a_code_listing_is_written_and_coloured_in_one_batch() {
 }
 
 #[tokio::test]
-async fn a_listing_that_cannot_be_coloured_completely_is_refused() {
+async fn a_listing_with_a_span_this_cannot_write_is_refused_whole() {
     let h = harness().await;
     let outline = article(&h).await;
     let plan = |spans: Vec<docs::Span>| {

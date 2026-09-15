@@ -1165,6 +1165,9 @@ pub struct Plan {
     pub after: String,
     /// Where the write lands, in Docs' own index.
     pub index: i64,
+    /// How many characters of a code listing the spans colour. Every other
+    /// write leaves this at zero, because only a listing has spans.
+    coloured: usize,
     revision_id: String,
     requests: Vec<DocRequest>,
 }
@@ -1186,6 +1189,18 @@ impl Plan {
             .enumerate()
             .map(|(at, text)| format!("{}: {text:?}", at + 1))
             .collect()
+    }
+
+    /// How many characters of a code listing the spans colour, and how many
+    /// the listing holds. Two spans may not overlap — `span_ranges` refuses
+    /// that before this is counted — so the lengths of the spans add up to
+    /// the characters they cover, with no character counted twice.
+    ///
+    /// The listing holds its newlines, and they are characters the spans
+    /// count too. That is where a caller who colours what it can see loses
+    /// the end of the listing, so both numbers are reported.
+    pub fn coverage(&self) -> (usize, usize) {
+        (self.coloured, self.after.chars().count())
     }
 }
 
@@ -1270,6 +1285,7 @@ pub fn plan_insert(
         before: neighbour.text.clone(),
         after: body.to_string(),
         index,
+        coloured: 0,
         revision_id: revision_id.trim().to_string(),
         requests,
     })
@@ -1342,6 +1358,7 @@ pub fn plan_edit(
         before: paragraph.text.clone(),
         after,
         index: start,
+        coloured: 0,
         revision_id: revision_id.trim().to_string(),
         requests,
     })
@@ -1364,6 +1381,7 @@ pub fn plan_style(
         before: paragraph.style.clone(),
         after: named_style_type.to_string(),
         index: paragraph.start_index,
+        coloured: 0,
         revision_id: revision_id.trim().to_string(),
         requests: vec![DocRequest {
             update_paragraph_style: Some(UpdateParagraphStyle {
@@ -1436,6 +1454,12 @@ pub fn plan_code(
     // half-coloured because the fourth span was nonsense would have to be
     // repaired by hand.
     let ranges = span_ranges(body, spans)?;
+    // How many characters of the listing the spans colour. `span_ranges` has
+    // just refused every overlap, so adding the lengths counts no character
+    // twice and the sum is the coverage itself. The spans need not cover the
+    // listing — colouring the keywords and leaving the rest is the ordinary
+    // case — so this is reported rather than checked.
+    let coloured: usize = spans.iter().map(|span| span.end - span.start).sum();
     let (index, payload, text_at) = outline.insertion(At::After(after_paragraph), neighbour, body);
     let mut requests = vec![
         insert_request(index, &payload),
@@ -1505,6 +1529,7 @@ pub fn plan_code(
         before: neighbour.text.clone(),
         after: body.to_string(),
         index,
+        coloured,
         revision_id: revision_id.trim().to_string(),
         requests,
     })
@@ -1556,6 +1581,7 @@ pub fn plan_image(
         before: neighbour.text.clone(),
         after: image.label.to_string(),
         index: image_at,
+        coloured: 0,
         revision_id: revision_id.trim().to_string(),
         requests: vec![
             insert_request(index, &payload),
