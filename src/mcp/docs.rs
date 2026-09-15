@@ -10,8 +10,15 @@
 //! answered with — the two locks that keep a write off the paragraph it was
 //! not meant for.
 //!
-//! The two delete tools are the only ones here that destroy anything, so they
-//! are locked harder than the rest: `expect` is required on both, a range
+//! Four more edit a table that is already there, one row or one column at a
+//! time: docs_insert_table_row, docs_insert_table_column,
+//! docs_delete_table_row and docs_delete_table_column. They exist because the
+//! other way to add a row — delete the table, write it again — throws away the
+//! column widths and everything else the person set by hand in Docs. Each one
+//! names its table by any paragraph inside it, as docs_delete_table does.
+//!
+//! The four delete tools are the only ones here that destroy anything, so they
+//! are locked harder than the rest: `expect` is required on all four, a range
 //! needs `expect_last` for its far end as well, and every deletion Docs itself
 //! would refuse is refused here first, in this server's own words.
 //!
@@ -307,6 +314,94 @@ pub struct DocsDeleteTableParam {
     pub revision_id: String,
     /// Must be true to delete. Call with false first and show the person how
     /// many rows and columns go.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsInsertRowParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Any paragraph inside the table: a cell of it, as docs_list_paragraphs
+    /// numbers them. Those paragraphs come back with in_table true.
+    pub paragraph: u32,
+    /// Put the new row under this one, counting the table's own rows from 1.
+    /// below_row=1 puts it under the first row.
+    pub below_row: u32,
+    /// The text for the new row, one entry per column of the table, left to
+    /// right. Leave it out for an empty row.
+    pub cells: Option<Vec<String>>,
+    /// What the paragraph you named starts with, as docs_list_paragraphs
+    /// reports it. An empty string for a cell that holds no text.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person the
+    /// table's shape and the row that would go in.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsInsertColumnParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Any paragraph inside the table: a cell of it, as docs_list_paragraphs
+    /// numbers them. Those paragraphs come back with in_table true.
+    pub paragraph: u32,
+    /// Put the new column to the right of this one, counting the table's own
+    /// columns from 1. right_of_column=1 puts it after the first column.
+    pub right_of_column: u32,
+    /// The text for the new column, one entry per row of the table, top to
+    /// bottom. Leave it out for an empty column.
+    pub cells: Option<Vec<String>>,
+    /// What the paragraph you named starts with, as docs_list_paragraphs
+    /// reports it. An empty string for a cell that holds no text.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to write. Call with false first and show the person the
+    /// table's shape and the column that would go in.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsDeleteRowParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Any paragraph inside the table: a cell of it, as docs_list_paragraphs
+    /// numbers them. Those paragraphs come back with in_table true.
+    pub paragraph: u32,
+    /// Which row goes, counting the table's own rows from 1
+    pub row: u32,
+    /// What the paragraph you named starts with, as docs_list_paragraphs
+    /// reports it. An empty string for a cell that holds no text.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to delete. Call with false first and show the person
+    /// everything in that row.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocsDeleteColumnParam {
+    pub account: String,
+    pub doc_id: String,
+    /// Any paragraph inside the table: a cell of it, as docs_list_paragraphs
+    /// numbers them. Those paragraphs come back with in_table true.
+    pub paragraph: u32,
+    /// Which column goes, counting the table's own columns from 1
+    pub column: u32,
+    /// What the paragraph you named starts with, as docs_list_paragraphs
+    /// reports it. An empty string for a cell that holds no text.
+    pub expect: String,
+    /// The revision_id docs_list_paragraphs answered with
+    pub revision_id: String,
+    /// Must be true to delete. Call with false first and show the person
+    /// everything in that column.
     pub confirmed: bool,
 }
 
@@ -1623,6 +1718,331 @@ impl Gmcp {
             next: REREAD.to_string(),
         })))
     }
+
+    #[tool(
+        description = "Add one row to a table that is already in a Google Doc, under the row you \
+                       name. This is how a table grows: deleting it and writing it again with \
+                       docs_insert_table throws away the column widths, the borders and \
+                       everything else the person set by hand in Docs, and this keeps all of it. \
+                       Name the table by any paragraph inside it — docs_list_paragraphs marks \
+                       those with in_table true — and count the table's own rows from 1, so \
+                       below_row=1 puts the new row under the first row. `cells` is the text for \
+                       it, one entry per column and in order; a different number of entries is \
+                       refused naming both counts, a cell is one line of plain text, and leaving \
+                       `cells` out adds an empty row. This writes twice, as docs_insert_table \
+                       does and for the same reason: the new cells do not exist until the row \
+                       does, so it adds the row, reads the document again to see where Google \
+                       put each cell, and fills them in a second write. If that second write is \
+                       refused the answer says so plainly — the row is there and empty, and it \
+                       names the paragraph numbers its cells have. Pass the revision_id from \
+                       docs_list_paragraphs and confirmed=true after the person has seen the \
+                       row. One write moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_insert_table_row(
+        &self,
+        Parameters(p): Parameters<DocsInsertRowParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        self.insert_row_or_column(
+            &call,
+            docs::Axis::Row,
+            TableEdit {
+                account: &p.account,
+                doc_id: p.doc_id.trim(),
+                paragraph: p.paragraph,
+                number: p.below_row,
+                cells: p.cells.as_deref().unwrap_or_default(),
+                expect: &p.expect,
+                revision_id: &p.revision_id,
+                confirmed: p.confirmed,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Add one column to a table that is already in a Google Doc, to the right \
+                       of the column you name. The twin of docs_insert_table_row, and it is here \
+                       for the same reason: a table edited this way keeps the column widths, the \
+                       borders and everything else the person set by hand, which deleting the \
+                       table and writing it again throws away. Name the table by any paragraph \
+                       inside it — docs_list_paragraphs marks those with in_table true — and \
+                       count the table's own columns from 1, so right_of_column=1 puts the new \
+                       column after the first one. `cells` is the text for it, one entry per row \
+                       and top to bottom; a different number of entries is refused naming both \
+                       counts, a cell is one line of plain text, and leaving `cells` out adds an \
+                       empty column. This writes twice, like docs_insert_table_row: the empty \
+                       column, then its cells at the indexes Google answers with. Pass the \
+                       revision_id from docs_list_paragraphs and confirmed=true after the person \
+                       has seen the column. One write moves every paragraph number and changes \
+                       the revision id."
+    )]
+    async fn docs_insert_table_column(
+        &self,
+        Parameters(p): Parameters<DocsInsertColumnParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        self.insert_row_or_column(
+            &call,
+            docs::Axis::Column,
+            TableEdit {
+                account: &p.account,
+                doc_id: p.doc_id.trim(),
+                paragraph: p.paragraph,
+                number: p.right_of_column,
+                cells: p.cells.as_deref().unwrap_or_default(),
+                expect: &p.expect,
+                revision_id: &p.revision_id,
+                confirmed: p.confirmed,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Delete one row from a table in a Google Doc, with everything in its \
+                       cells. Name the table by any paragraph inside it — docs_list_paragraphs \
+                       marks those with in_table true — and count the table's own rows from 1. \
+                       The rest of the table stays exactly as it is, column widths included. \
+                       Deleting the last row of a table deletes the table itself in Docs, so \
+                       that is refused here and docs_delete_table is the tool for it. Nothing on \
+                       this side puts a deleted row back. Pass the revision_id from \
+                       docs_list_paragraphs and confirmed=true after the person has seen every \
+                       paragraph that would go. One write moves every paragraph number and \
+                       changes the revision id."
+    )]
+    async fn docs_delete_table_row(
+        &self,
+        Parameters(p): Parameters<DocsDeleteRowParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        self.delete_row_or_column(
+            &call,
+            docs::Axis::Row,
+            TableEdit {
+                account: &p.account,
+                doc_id: p.doc_id.trim(),
+                paragraph: p.paragraph,
+                number: p.row,
+                cells: &[],
+                expect: &p.expect,
+                revision_id: &p.revision_id,
+                confirmed: p.confirmed,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Delete one column from a table in a Google Doc, with everything in its \
+                       cells. Name the table by any paragraph inside it — docs_list_paragraphs \
+                       marks those with in_table true — and count the table's own columns from \
+                       1. The rest of the table stays exactly as it is. Deleting the last column \
+                       of a table deletes the table itself in Docs, so that is refused here and \
+                       docs_delete_table is the tool for it. Nothing on this side puts a deleted \
+                       column back. Pass the revision_id from docs_list_paragraphs and \
+                       confirmed=true after the person has seen every paragraph that would go. \
+                       One write moves every paragraph number and changes the revision id."
+    )]
+    async fn docs_delete_table_column(
+        &self,
+        Parameters(p): Parameters<DocsDeleteColumnParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        self.delete_row_or_column(
+            &call,
+            docs::Axis::Column,
+            TableEdit {
+                account: &p.account,
+                doc_id: p.doc_id.trim(),
+                paragraph: p.paragraph,
+                number: p.column,
+                cells: &[],
+                expect: &p.expect,
+                revision_id: &p.revision_id,
+                confirmed: p.confirmed,
+            },
+        )
+        .await
+    }
+}
+
+/// What the four structural table tools all take. The two halves of each pair
+/// differ only in which way round they go, so they share one body and the
+/// axis says the rest.
+struct TableEdit<'a> {
+    account: &'a str,
+    doc_id: &'a str,
+    /// The paragraph that names the table: any cell of it.
+    paragraph: u32,
+    /// The row or the column the caller counted, from 1.
+    number: u32,
+    /// The text for a new row or column, and empty for a delete.
+    cells: &'a [String],
+    expect: &'a str,
+    revision_id: &'a str,
+    confirmed: bool,
+}
+
+impl Gmcp {
+    /// One row or one column into a table that is already there, previewed
+    /// the way every other write is and then written in the two batches
+    /// [`docs::apply_insert_row_or_column`] explains.
+    async fn insert_row_or_column(
+        &self,
+        call: &Call,
+        axis: docs::Axis,
+        edit: TableEdit<'_>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(call, edit.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = edit.doc_id.to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_insert_row_or_column(
+            &outline,
+            edit.revision_id,
+            axis,
+            edit.paragraph as usize,
+            edit.number as usize,
+            edit.cells,
+            edit.expect,
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let line = plan.line();
+        if !edit.confirmed {
+            let place = match axis {
+                docs::Axis::Row => format!("under row {}", edit.number),
+                docs::Axis::Column => format!("to the right of column {}", edit.number),
+            };
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "add a {} to the {} by {} table at paragraph {} of the Google Doc {doc_id} \
+                     in `{}`",
+                    axis.one(),
+                    plan.rows,
+                    plan.columns,
+                    plan.paragraph,
+                    connection.label
+                ),
+                vec![
+                    shape(plan.rows, plan.columns, plan.new_rows, plan.new_columns),
+                    format!(
+                        "the new {} goes {place} and becomes {} {} of the table",
+                        axis.one(),
+                        axis.one(),
+                        plan.number
+                    ),
+                    match line.is_empty() {
+                        true => format!(
+                            "every cell of the new {} is blank; pass `cells` to fill them",
+                            axis.one()
+                        ),
+                        false => first_lines(&line),
+                    },
+                    format!(
+                        "this writes twice: the empty {}, and then its cells at the indexes \
+                         Google answers with",
+                        axis.one()
+                    ),
+                ],
+            ))));
+        }
+        let (paragraph, number) = (plan.paragraph, plan.number);
+        let written = docs::apply_insert_row_or_column(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "a {} was added to the table and is {} {number} of it; the table is {} by {} \
+                 now. Its cells are paragraphs {} of the document, and the rest of the table is \
+                 untouched",
+                axis.one(),
+                axis.one(),
+                written.rows,
+                written.columns,
+                numbered(&written.paragraphs)
+            ),
+            text: line,
+            next: REREAD.to_string(),
+        })))
+    }
+
+    /// One row or one column out of a table, in one request.
+    async fn delete_row_or_column(
+        &self,
+        call: &Call,
+        axis: docs::Axis,
+        edit: TableEdit<'_>,
+    ) -> Result<Json<Confirmable<dto::DocEditOut>>, ErrorData> {
+        let connection = self.account(call, edit.account, Service::Docs).await?;
+        let client = &self.google()?.client;
+        let doc_id = edit.doc_id.to_string();
+        let outline = docs::outline(client, connection.id, &doc_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let plan = docs::plan_delete_row_or_column(
+            &outline,
+            edit.revision_id,
+            axis,
+            edit.paragraph as usize,
+            edit.number as usize,
+            edit.expect,
+        )
+        .map_err(|e| self.google_err_for(&connection, e))?;
+        let listing = going_lines(&plan.going);
+        if !edit.confirmed {
+            let mut details = vec![
+                shape(plan.rows, plan.columns, plan.new_rows, plan.new_columns),
+                format!(
+                    "the whole {} {} goes, with everything in its {} cells",
+                    axis.one(),
+                    plan.number,
+                    plan.cells()
+                ),
+            ];
+            details.extend(listing.clone());
+            details.push(NO_UNDO.to_string());
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "delete {} {} of the {} by {} table at paragraph {} of the Google Doc \
+                     {doc_id} in `{}`",
+                    axis.one(),
+                    plan.number,
+                    plan.rows,
+                    plan.columns,
+                    plan.paragraph,
+                    connection.label
+                ),
+                details,
+            ))));
+        }
+        let (paragraph, number) = (plan.paragraph, plan.number);
+        let (rows, columns) = (plan.new_rows, plan.new_columns);
+        let count = plan.going.len();
+        docs::apply_delete_row_or_column(client, connection.id, &doc_id, plan)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        Ok(Json(Confirmable::Done(dto::DocEditOut {
+            account: connection.label,
+            url: format!("https://docs.google.com/document/d/{doc_id}/edit"),
+            doc_id,
+            paragraph,
+            written: format!(
+                "{} {number} was deleted from the table, with the {count} paragraph{} in its \
+                 cells; the table is {rows} by {columns} now and the rest of it is untouched",
+                axis.one(),
+                if count == 1 { "" } else { "s" }
+            ),
+            text: listing.join("\n"),
+            next: REREAD.to_string(),
+        })))
+    }
 }
 
 /// Why a staged file cannot go into a document, in the words that say what to
@@ -1716,6 +2136,21 @@ fn going_line((ordinal, text): &(usize, String)) -> String {
         true => format!("paragraph {ordinal}: {head}…"),
         false => format!("paragraph {ordinal}: {head}"),
     }
+}
+
+/// How a table is shaped now and how it would be shaped afterwards, in the
+/// one line a person reads before they agree to a row going in or coming out.
+fn shape(rows: usize, columns: usize, new_rows: usize, new_columns: usize) -> String {
+    format!("the table is {rows} by {columns} now and {new_rows} by {new_columns} after this")
+}
+
+/// A few paragraph numbers, for a sentence that names them: "5, 6".
+fn numbered(numbers: &[usize]) -> String {
+    numbers
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The beginning of what would be written, for the person to recognise. A

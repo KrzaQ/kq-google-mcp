@@ -358,6 +358,16 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("docs_style_paragraph", needs(Service::Docs, Level::Write)),
     ("docs_insert_code", needs(Service::Docs, Level::Write)),
     ("docs_insert_table", needs(Service::Docs, Level::Write)),
+    ("docs_insert_table_row", needs(Service::Docs, Level::Write)),
+    (
+        "docs_insert_table_column",
+        needs(Service::Docs, Level::Write),
+    ),
+    ("docs_delete_table_row", needs(Service::Docs, Level::Write)),
+    (
+        "docs_delete_table_column",
+        needs(Service::Docs, Level::Write),
+    ),
     ("docs_delete_paragraphs", needs(Service::Docs, Level::Write)),
     ("docs_delete_table", needs(Service::Docs, Level::Write)),
     ("docs_upload_link", needs(Service::Docs, Level::Write)),
@@ -578,7 +588,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 57);
+        assert_eq!(TOOLS.len(), 61);
     }
 
     #[test]
@@ -622,6 +632,10 @@ mod tests {
                 "docs_style_paragraph",
                 "docs_insert_code",
                 "docs_insert_table",
+                "docs_insert_table_row",
+                "docs_insert_table_column",
+                "docs_delete_table_row",
+                "docs_delete_table_column",
                 "docs_delete_paragraphs",
                 "docs_delete_table",
                 "docs_upload_link",

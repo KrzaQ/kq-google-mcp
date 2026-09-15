@@ -558,8 +558,12 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
         "docs_style_paragraph",
         "docs_insert_code",
         "docs_insert_table",
+        "docs_insert_table_row",
+        "docs_insert_table_column",
         "docs_delete_paragraphs",
         "docs_delete_table",
+        "docs_delete_table_row",
+        "docs_delete_table_column",
     ] {
         for argument in ["revision_id", "confirmed"] {
             assert!(
@@ -577,11 +581,18 @@ async fn the_write_tools_carry_the_house_rules_in_their_schemas() {
     }
     // `expect` is required where a write overwrites and optional where it
     // inserts, because inserting beside the wrong paragraph is recoverable.
+    // It is required on the four structural table tools as well: there the
+    // paragraph names a whole table rather than a neighbour, so a number that
+    // has moved would edit the wrong table.
     for tool in [
         "docs_edit_paragraph",
         "docs_style_paragraph",
         "docs_delete_paragraphs",
         "docs_delete_table",
+        "docs_insert_table_row",
+        "docs_insert_table_column",
+        "docs_delete_table_row",
+        "docs_delete_table_column",
     ] {
         assert!(required(tool).contains(&json!("expect")), "{tool}");
     }
@@ -4349,6 +4360,303 @@ async fn docs_insert_table_fills_the_cells_from_the_document_it_reads_back() {
         sent[1]["writeControl"]["requiredRevisionId"],
         ARTICLE_REVISION
     );
+    drop(server);
+}
+
+// ----- a row or a column of a table ------------------------------------------
+
+/// What `docs_article_grid.json` says the document is at: the article with a
+/// two-by-two table somebody has already filled in. Its cells are paragraphs
+/// 3 to 7, and the last cell holds two paragraphs.
+const GRID_REVISION: &str = "ALm37BW0Grid1";
+
+/// The two reads a structural table write makes: the table as it stands, and
+/// then the table with the empty row or column Google has just put in it.
+async fn grid_server(after: &str) -> MockServer {
+    let server = google_server().await;
+    let at = format!("/v1/documents/{ARTICLE}");
+    Mock::given(http_method("GET"))
+        .and(path(at.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("docs_article_grid.json")))
+        .up_to_n_times(1)
+        .named("the table as the caller read it")
+        .mount(&server)
+        .await;
+    mount(&server, "GET", &at, fixture(after)).await;
+    server
+}
+
+/// Paragraph 3 is the cell that reads "Model", which is how every one of
+/// these names the table.
+fn row_args() -> Value {
+    json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3, "below_row": 1,
+           "cells": ["Llama-3", "8 mld"], "expect": "Model",
+           "revision_id": GRID_REVISION})
+}
+
+#[tokio::test]
+async fn docs_insert_table_row_shows_the_shape_before_and_after_and_writes_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article_grid.json")).await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let shown = c
+        .ok("docs_insert_table_row", confirming(&row_args(), false))
+        .await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(
+        lines.contains("the table is 2 by 2 now and 3 by 2 after this"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("the new row goes under row 1 and becomes row 2"),
+        "{lines}"
+    );
+    assert!(lines.contains("Llama-3 | 8 mld"), "{lines}");
+    assert!(lines.contains("writes twice"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0);
+
+    // A row that does not fit the table is refused naming both counts, and
+    // costs no write either.
+    let mut wrong = row_args();
+    wrong["cells"] = json!(["Llama-3", "8 mld", "2024"]);
+    let refused = c
+        .refused("docs_insert_table_row", confirming(&wrong, true))
+        .await;
+    assert!(refused.contains("holds 3 cells"), "{refused}");
+    assert!(refused.contains("has 2 columns"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 0);
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_table_row_fills_the_new_cells_from_the_document_it_reads_back() {
+    let db = Db::open_memory().await.unwrap();
+    let server = grid_server("docs_article_grid_row.json").await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let out = c
+        .ok("docs_insert_table_row", confirming(&row_args(), true))
+        .await;
+    assert_eq!(out["paragraph"], 3);
+    assert_eq!(out["text"], "Llama-3 | 8 mld");
+    let written = out["written"].as_str().unwrap();
+    assert!(written.contains("is row 2 of it"), "{written}");
+    assert!(written.contains("3 by 2 now"), "{written}");
+    assert!(written.contains("paragraphs 5, 6"), "{written}");
+    assert!(
+        written.contains("rest of the table is untouched"),
+        "{written}"
+    );
+
+    let sent = batch_bodies(&server).await;
+    assert_eq!(sent.len(), 2, "the empty row, and then its cells");
+    // Row 1 to the person is row 0 to Docs, and the table is named by where
+    // it starts rather than by anything the model passed in.
+    assert_eq!(
+        sent[0],
+        json!({
+            "requests": [{"insertTableRow": {
+                "tableCellLocation": {
+                    "tableStartLocation": {"index": 30},
+                    "rowIndex": 0,
+                    "columnIndex": 0
+                },
+                "insertBelow": true
+            }}],
+            "writeControl": {"requiredRevisionId": GRID_REVISION}
+        })
+    );
+    // Every index here is one the re-read answered with, used from the last
+    // cell to the first so that no insert moves the next one.
+    assert_eq!(
+        sent[1]["requests"],
+        json!([
+            {"insertText": {"text": "8 mld", "location": {"index": 53}}},
+            {"insertText": {"text": "Llama-3", "location": {"index": 51}}}
+        ])
+    );
+    assert_eq!(
+        sent[1]["writeControl"]["requiredRevisionId"],
+        "ALm37BW0Grid2"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_insert_table_column_puts_the_new_cells_down_the_table() {
+    let db = Db::open_memory().await.unwrap();
+    let server = grid_server("docs_article_grid_column.json").await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3,
+                      "right_of_column": 1, "cells": ["Rok", "2023"],
+                      "expect": "Model", "revision_id": GRID_REVISION});
+    let out = c
+        .ok("docs_insert_table_column", confirming(&args, true))
+        .await;
+    let written = out["written"].as_str().unwrap();
+    assert!(written.contains("is column 2 of it"), "{written}");
+    assert!(written.contains("2 by 3 now"), "{written}");
+    // A column's cells are not next to each other: one sits in each row.
+    assert!(written.contains("paragraphs 4, 7"), "{written}");
+
+    let sent = batch_bodies(&server).await;
+    assert_eq!(
+        sent[0]["requests"],
+        json!([{"insertTableColumn": {
+            "tableCellLocation": {
+                "tableStartLocation": {"index": 30},
+                "rowIndex": 0,
+                "columnIndex": 0
+            },
+            "insertRight": true
+        }}])
+    );
+    assert_eq!(
+        sent[1]["requests"],
+        json!([
+            {"insertText": {"text": "2023", "location": {"index": 65}}},
+            {"insertText": {"text": "Rok", "location": {"index": 39}}}
+        ])
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_delete_table_row_shows_everything_in_it_and_then_takes_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article_grid.json")).await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3, "row": 2,
+                      "expect": "Model", "revision_id": GRID_REVISION});
+    let shown = c
+        .ok("docs_delete_table_row", confirming(&args, false))
+        .await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(
+        lines.contains("the table is 2 by 2 now and 1 by 2 after this"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("the whole row 2 goes, with everything in its 2 cells"),
+        "{lines}"
+    );
+    // A cell may hold more than one paragraph, and all of them go.
+    assert!(lines.contains("paragraph 5: Mistral-7B"), "{lines}");
+    assert!(lines.contains("paragraph 6: 7 mld"), "{lines}");
+    assert!(lines.contains("paragraph 7: około"), "{lines}");
+    assert!(lines.contains("cannot be undone"), "{lines}");
+    assert_eq!(batch_calls(&server).await, 0);
+
+    let out = c.ok("docs_delete_table_row", confirming(&args, true)).await;
+    let written = out["written"].as_str().unwrap();
+    assert!(written.contains("row 2 was deleted"), "{written}");
+    assert!(written.contains("3 paragraphs"), "{written}");
+    assert!(written.contains("1 by 2 now"), "{written}");
+    // Row 2 to the person is row 1 to Docs.
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([{"deleteTableRow": {"tableCellLocation": {
+            "tableStartLocation": {"index": 30},
+            "rowIndex": 1,
+            "columnIndex": 0
+        }}}])
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn docs_delete_table_column_takes_the_column_the_person_counted() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article_grid.json")).await;
+    expect_batches(&server, 1).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 3, "column": 2,
+                      "expect": "Model", "revision_id": GRID_REVISION});
+    let out = c
+        .ok("docs_delete_table_column", confirming(&args, true))
+        .await;
+    assert!(
+        out["written"]
+            .as_str()
+            .unwrap()
+            .contains("column 2 was deleted"),
+        "{out}"
+    );
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([{"deleteTableColumn": {"tableCellLocation": {
+            "tableStartLocation": {"index": 30},
+            "rowIndex": 0,
+            "columnIndex": 1
+        }}}])
+    );
+    drop(server);
+}
+
+/// The four refusals these tools share, none of which writes anything: the
+/// last row or column of a table, a paragraph that is not in a table at all,
+/// a stale revision and an `expect` the cell does not match.
+#[tokio::test]
+async fn a_structural_table_edit_is_refused_without_writing_anything() {
+    let db = Db::open_memory().await.unwrap();
+    let server = document_server(fixture("docs_article.json")).await;
+    expect_batches(&server, 0).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    // Paragraph 4 is the only cell of the article's one-by-one table, so its
+    // row and its column are both the last one.
+    for (tool, field) in [
+        ("docs_delete_table_row", "row"),
+        ("docs_delete_table_column", "column"),
+    ] {
+        let args = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 4, field: 1,
+                          "expect": "Komórka", "revision_id": ARTICLE_REVISION});
+        let refused = c.refused(tool, confirming(&args, true)).await;
+        assert!(refused.contains("docs_delete_table"), "{refused}");
+        assert!(
+            refused.contains(&format!("has one {field} left")),
+            "{refused}"
+        );
+    }
+
+    // Paragraph 2 is body text, and no table goes with it.
+    let outside = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 2, "below_row": 1,
+                         "expect": "Część", "revision_id": ARTICLE_REVISION});
+    let refused = c
+        .refused("docs_insert_table_row", confirming(&outside, true))
+        .await;
+    assert!(refused.contains("not inside a table"), "{refused}");
+    assert!(refused.contains("in_table"), "{refused}");
+
+    // The two locks, on the tool that adds and the tool that takes away.
+    let stale = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 4, "below_row": 1,
+                       "expect": "Komórka", "revision_id": "ALm37BW0Older"});
+    let refused = c
+        .refused("docs_insert_table_row", confirming(&stale, true))
+        .await;
+    assert!(refused.contains("ALm37BW0Older"), "{refused}");
+    assert!(refused.contains("docs_list_paragraphs"), "{refused}");
+
+    let wrong = json!({"account": "work", "doc_id": ARTICLE, "paragraph": 4, "row": 1,
+                       "expect": "Koniec", "revision_id": ARTICLE_REVISION});
+    let refused = c
+        .refused("docs_delete_table_row", confirming(&wrong, true))
+        .await;
+    assert!(
+        refused.contains("paragraph 4 does not start with"),
+        "{refused}"
+    );
+    assert_eq!(batch_calls(&server).await, 0);
     drop(server);
 }
 

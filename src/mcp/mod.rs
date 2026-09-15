@@ -82,8 +82,12 @@ fn instructions(portal: &str) -> String {
          the numbers and the revision_id it answers with to docs_insert_text, \
          docs_edit_paragraph, docs_style_paragraph, docs_insert_code, docs_insert_table, \
          docs_delete_paragraphs or docs_delete_table, and call it again after every write, \
-         because one write moves both. The two delete tools are the only ones here that destroy \
-         anything, and nothing on this side undoes them. docs_read answers the \
+         because one write moves both. The delete tools are the only ones here that destroy \
+         anything, and nothing on this side undoes them. A table that is already there grows and \
+         shrinks one row or one column at a time with docs_insert_table_row, \
+         docs_insert_table_column, docs_delete_table_row and docs_delete_table_column, which keep \
+         the column widths and everything else the person set by hand; deleting the table and \
+         writing it again throws all of that away. docs_read answers the \
          words and no formatting at all, so read a colour, a font or a weight back with \
          docs_read_formatting. A picture goes into a document the same way a file goes into a \
          draft: mint a URL with docs_upload_link, POST the picture to it yourself, and pass the \
