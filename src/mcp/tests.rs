@@ -4105,6 +4105,66 @@ async fn docs_insert_text_puts_a_styled_paragraph_where_it_was_told() {
     drop(server);
 }
 
+/// The house style of an article puts a blank line between its paragraphs.
+/// Before the text argument meant this, a blank line took a paragraph holding
+/// one character and an edit that emptied it: two writes and two reads a
+/// line, ten writes for five blank lines, with a stray character standing in
+/// the document in between.
+#[tokio::test]
+async fn docs_insert_text_writes_a_block_of_paragraphs_in_one_write() {
+    let db = Db::open_memory().await.unwrap();
+    let server = article_server().await;
+    expect_batches(&server, 2).await;
+    let mut c = client(&db, &server, &["docs:read", "docs:write"]).await;
+
+    let args = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                      "text": "Pierwszy\n\nDrugi", "revision_id": ARTICLE_REVISION});
+    let shown = c.ok("docs_insert_text", confirming(&args, false)).await;
+    let lines = details(&shown);
+    // The paragraphs are numbered and quoted, so the blank one is a line of
+    // the preview like the other two and the person can count it.
+    assert!(lines.contains("3 paragraphs"), "{lines}");
+    assert!(lines.contains("1: \"Pierwszy\""), "{lines}");
+    assert!(
+        lines.contains("2: \"\""),
+        "the blank paragraph shows blank: {lines}"
+    );
+    assert!(lines.contains("3: \"Drugi\""), "{lines}");
+
+    let out = c.ok("docs_insert_text", confirming(&args, true)).await;
+    assert!(
+        out["written"].as_str().unwrap().contains("3 paragraphs"),
+        "{out}"
+    );
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([{"insertText": {"text": "\nPierwszy\n\nDrugi", "location": {"index": 29}}}])
+    );
+
+    // Empty text is the blank paragraph on its own, and one write again.
+    let blank = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                       "text": "", "revision_id": ARTICLE_REVISION});
+    let shown = c.ok("docs_insert_text", confirming(&blank, false)).await;
+    let lines = details(&shown);
+    assert!(lines.contains("1 paragraph,"), "{lines}");
+    assert!(lines.contains("1: \"\""), "{lines}");
+    c.ok("docs_insert_text", confirming(&blank, true)).await;
+    assert_eq!(
+        last_batch(&server).await["requests"],
+        json!([{"insertText": {"text": "\n", "location": {"index": 29}}}])
+    );
+
+    // A whole document pasted into one call is refused, and nothing is sent.
+    let many = json!({"account": "work", "doc_id": ARTICLE, "after_paragraph": 2,
+                      "text": "x\n".repeat(201), "revision_id": ARTICLE_REVISION,
+                      "confirmed": true});
+    let refused = c.refused("docs_insert_text", many).await;
+    assert!(refused.contains("201 paragraphs"), "{refused}");
+    assert!(refused.contains("at most 200"), "{refused}");
+    assert_eq!(batch_calls(&server).await, 2);
+    drop(server);
+}
+
 #[tokio::test]
 async fn docs_style_paragraph_changes_the_style_and_leaves_the_words() {
     let db = Db::open_memory().await.unwrap();

@@ -709,10 +709,153 @@ async fn an_insert_carries_its_own_paragraph_break() {
         ])
     );
 
-    // Nothing to insert, and a paragraph that is not there.
-    assert!(docs::plan_insert(&outline, REVISION, docs::At::After(2), "\n\n", None, None).is_err());
+    // A paragraph that is not there.
     assert!(
         docs::plan_insert(&outline, REVISION, docs::At::After(9), "Akapit", None, None).is_err()
+    );
+}
+
+/// Every line of the text is a paragraph of its own, and empty text is one
+/// blank paragraph. The house style of an article puts a blank line between
+/// its paragraphs, and writing those one call at a time cost two writes and
+/// two reads a line: ten writes for five blank lines, with a stray character
+/// standing in the document in between.
+#[tokio::test]
+async fn an_insert_writes_one_paragraph_for_every_line_of_the_text() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    // Empty text is one blank paragraph and one request: the break itself.
+    let blank = docs::plan_insert(&outline, REVISION, docs::At::After(2), "", None, None).unwrap();
+    assert_eq!(blank.lines(), ["1: \"\""]);
+    assert_eq!(blank.requests(), 1);
+    docs::apply(&h.client, CONNECTION, ARTICLE, blank)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([{"insertText": {"text": "\n", "location": {"index": 29}}}])
+    );
+
+    // A blank line between two paragraphs is a blank paragraph between them,
+    // and the three go in as one insertText.
+    let block = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        "Pierwszy\n\nDrugi",
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        block.lines(),
+        ["1: \"Pierwszy\"", "2: \"\"", "3: \"Drugi\""]
+    );
+    assert_eq!(block.requests(), 1);
+    docs::apply(&h.client, CONNECTION, ARTICLE, block)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"],
+        json!([{"insertText": {"text": "\nPierwszy\n\nDrugi", "location": {"index": 29}}}])
+    );
+
+    // The style covers every paragraph the call writes: the listing goes in
+    // at 30 and runs 15 units, and the three paragraphs are 30 to 39, 39 to
+    // 40 and 40 to 46.
+    let styled = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        "Pierwszy\n\nDrugi",
+        Some("HEADING_3"),
+        None,
+    )
+    .unwrap();
+    docs::apply(&h.client, CONNECTION, ARTICLE, styled)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"][1]["updateParagraphStyle"]["range"],
+        json!({"startIndex": 30, "endIndex": 45})
+    );
+
+    // A text that ends in a blank paragraph takes the break with it, because
+    // a blank paragraph is the break and a range that stopped short of it
+    // would overlap nothing.
+    let trailing = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        "Pierwszy\n\n",
+        Some("HEADING_3"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(trailing.lines(), ["1: \"Pierwszy\"", "2: \"\""]);
+    docs::apply(&h.client, CONNECTION, ARTICLE, trailing)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", ARTICLE_BATCH).await["requests"][1]["updateParagraphStyle"]["range"],
+        json!({"startIndex": 30, "endIndex": 40})
+    );
+
+    // One trailing newline ends the last line rather than adding a paragraph.
+    let terminated = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        "Akapit\n",
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(terminated.lines(), ["1: \"Akapit\""]);
+}
+
+/// A whole document pasted into one call is refused before anything is sent,
+/// and the number that refuses it is the paragraphs, not the characters.
+#[tokio::test]
+async fn an_insert_of_more_paragraphs_than_one_call_writes_is_refused() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    let lines = |count: usize| "x\n".repeat(count);
+    let many = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        &lines(201),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(many.to_string().contains("201 paragraphs"), "{many}");
+    assert!(many.to_string().contains("at most 200"), "{many}");
+    assert!(many.to_string().contains("Nothing was written"), "{many}");
+
+    // The line before it is written, and nothing was sent for either.
+    let most = docs::plan_insert(
+        &outline,
+        REVISION,
+        docs::At::After(2),
+        &lines(200),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(most.lines().len(), 200);
+    assert_eq!(
+        h.requests()
+            .await
+            .iter()
+            .filter(|r| r.url.path() == ARTICLE_BATCH)
+            .count(),
+        0
     );
 }
 

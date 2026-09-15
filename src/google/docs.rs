@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::client::{Client, Download, Error, Result, urlencode};
-use crate::domain::limits::{TABLE_MAX_COLUMNS, TABLE_MAX_ROWS};
+use crate::domain::limits::{INSERT_MAX_PARAGRAPHS, TABLE_MAX_COLUMNS, TABLE_MAX_ROWS};
 
 /// Docs is served from its own host, never from `www.googleapis.com`.
 const DOCS: &str = "docs";
@@ -1175,6 +1175,18 @@ impl Plan {
     pub fn requests(&self) -> usize {
         self.requests.len()
     }
+
+    /// The paragraphs an insert writes, numbered and quoted, for a person to
+    /// read before they are written. A blank line is a blank paragraph and
+    /// shows here as an empty pair of quotes, so a reader can count the blank
+    /// ones instead of losing them in the run of text.
+    pub fn lines(&self) -> Vec<String> {
+        self.after
+            .split('\n')
+            .enumerate()
+            .map(|(at, text)| format!("{}: {text:?}", at + 1))
+            .collect()
+    }
 }
 
 /// A named style, as Docs spells it. `heading 2` and `Heading_2` are the same
@@ -1192,10 +1204,17 @@ pub fn named_style(style: &str) -> Result<&'static str> {
         })
 }
 
-/// Text as its own new paragraph, before or after the paragraph a caller
-/// numbered, optionally under a named style. Plain text: Docs takes the
-/// string as written, so `## Heading` would arrive as those characters, which
-/// is what the style is for.
+/// Text as new paragraphs, before or after the paragraph a caller numbered,
+/// optionally under a named style. Plain text: Docs takes the string as
+/// written, so `## Heading` would arrive as those characters, which is what
+/// the style is for.
+///
+/// Each line of the text becomes a paragraph of its own, a blank line becomes
+/// a blank paragraph, and empty text becomes one blank paragraph. A section
+/// of an article that puts a blank line between its paragraphs therefore goes
+/// in as one write: every write moves every paragraph number and spends the
+/// revision id, so five separate inserts mean five read-write-read cycles and
+/// five chances to land in the wrong place.
 pub fn plan_insert(
     outline: &Outline,
     revision_id: &str,
@@ -1205,11 +1224,18 @@ pub fn plan_insert(
     expect: Option<&str>,
 ) -> Result<Plan> {
     outline.check_revision(revision_id)?;
-    let body = text.trim_end_matches('\n');
-    if body.trim().is_empty() {
-        return Err(Error::Unsupported(
-            "there is nothing to insert: the text is empty".into(),
-        ));
+    // One trailing newline ends the last line rather than starting a
+    // paragraph of its own, so "Akapit" and "Akapit\n" are the same one
+    // paragraph. Every other newline is a paragraph break: "" is one blank
+    // paragraph and "a\n\nb" is three.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let paragraphs = body.split('\n').count();
+    if paragraphs > INSERT_MAX_PARAGRAPHS {
+        return Err(Error::Unsupported(format!(
+            "this would insert {paragraphs} paragraphs and one insert writes at most \
+             {INSERT_MAX_PARAGRAPHS}; every line of the text is a paragraph. Send the text in \
+             blocks. Nothing was written"
+        )));
     }
     let style = style.map(named_style).transpose()?;
     let neighbour = outline.paragraph(at.ordinal())?;
@@ -1219,11 +1245,19 @@ pub fn plan_insert(
     let (index, payload, text_at) = outline.insertion(at, neighbour, body);
     let mut requests = vec![insert_request(index, &payload)];
     if let Some(named_style_type) = style {
+        // One request over the whole run and not one per paragraph:
+        // `updateParagraphStyle` sets every paragraph its range touches. The
+        // range runs to the last character of the text, and one further when
+        // the text ends in a blank paragraph, because a blank paragraph is
+        // the break itself and a range that stopped short of it would overlap
+        // nothing. That break is the last character this insert writes, so
+        // the range still ends inside what was inserted.
+        let trailing_blank = body.is_empty() || body.ends_with('\n');
         requests.push(DocRequest {
             update_paragraph_style: Some(UpdateParagraphStyle {
                 range: Range {
                     start_index: text_at,
-                    end_index: text_at + index::len(body),
+                    end_index: text_at + index::len(body) + i64::from(trailing_blank),
                 },
                 paragraph_style: ParagraphStyle { named_style_type },
                 fields: "namedStyleType",

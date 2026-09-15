@@ -33,6 +33,7 @@ use rmcp::model::{CallToolResult, ErrorData};
 use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
+use super::drive::plural;
 use super::dto::{self, Confirmable, PreviewOut};
 use super::gmail::link_out;
 use super::images::{self, Kind, Source};
@@ -162,12 +163,16 @@ pub struct DocsInsertParam {
     pub after_paragraph: Option<u32>,
     /// Put the new paragraph before this one instead.
     pub before_paragraph: Option<u32>,
-    /// The text of the new paragraph, as plain text. Markdown is not
-    /// rendered: a "## " arrives as those characters.
+    /// The text to insert, as plain text. Every line of it becomes a
+    /// paragraph of its own: a blank line inserts a blank paragraph, and
+    /// empty text inserts exactly one blank paragraph. At most 200
+    /// paragraphs in one call. Markdown is not rendered: a "## " arrives as
+    /// those characters.
     pub text: String,
     /// The named style for what is inserted: NORMAL_TEXT, TITLE, SUBTITLE or
-    /// HEADING_1 to HEADING_6. Without it the new paragraph takes the style
-    /// of the one it is put beside.
+    /// HEADING_1 to HEADING_6. It is set on every paragraph the call writes.
+    /// Without it the new paragraphs take the style of the one they are put
+    /// beside.
     pub style: Option<String>,
     /// What the paragraph you named starts with, as docs_list_paragraphs
     /// reports it. Optional here, and worth passing: it catches a paragraph
@@ -962,9 +967,15 @@ impl Gmcp {
     }
 
     #[tool(
-        description = "Insert plain text as a new paragraph, after or before the paragraph you \
+        description = "Insert plain text as new paragraphs, after or before the paragraph you \
                        name — the edit docs_append cannot make, because that one only adds at the \
-                       end. Markdown is not rendered: \"## Heading\" arrives as those characters, \
+                       end. Every line of `text` becomes a paragraph of its own: a blank line \
+                       inserts a blank paragraph, empty text inserts exactly one blank paragraph, \
+                       and a block of prose with blank lines between its paragraphs goes in as \
+                       one write. Write the paragraphs whole rather than hard-wrapped, because a \
+                       wrapped line is a paragraph here too. At most 200 paragraphs in one call. \
+                       `style` is set on every paragraph the call writes. Markdown is not \
+                       rendered: \"## Heading\" arrives as those characters, \
                        which is what `style` is for. Pass the revision_id docs_list_paragraphs \
                        answered with; when the document changed since, nothing is written and you \
                        must read it again. `expect` is optional here — inserting beside the wrong \
@@ -1022,10 +1033,17 @@ impl Gmcp {
             Some(style) => format!("as {style}"),
             None => "in the style of the paragraph beside it".to_string(),
         };
+        // The paragraphs are numbered and quoted, so a blank one is a line of
+        // the preview like any other and the person can count them. A blank
+        // paragraph the person did not ask for is the one mistake this
+        // argument makes easy, and this is where it shows.
+        let written = plan.lines();
+        let count = written.len();
         if !p.confirmed {
             return Ok(Json(Confirmable::Preview(PreviewOut::new(
                 format!(
-                    "insert a new paragraph {beside} of the Google Doc {doc_id} in `{}`",
+                    "insert {count} new paragraph{} {beside} of the Google Doc {doc_id} in `{}`",
+                    plural(count, "", "s"),
                     connection.label
                 ),
                 vec![
@@ -1034,8 +1052,12 @@ impl Gmcp {
                         plan.paragraph,
                         first_lines(&plan.before)
                     ),
-                    format!("the new paragraph would read: {}", first_lines(&plan.after)),
-                    format!("it would be set {styled}"),
+                    format!(
+                        "it would insert {count} paragraph{}, one per line of the text:",
+                        plural(count, "", "s")
+                    ),
+                    first_lines(&written.join("\n")),
+                    format!("every paragraph it writes would be set {styled}"),
                 ],
             ))));
         }
@@ -1049,7 +1071,8 @@ impl Gmcp {
             doc_id,
             paragraph,
             written: format!(
-                "{} characters inserted {beside} {styled}, at index {index}",
+                "{count} paragraph{} of {} characters inserted {beside} {styled}, at index {index}",
+                plural(count, "", "s"),
                 text.chars().count()
             ),
             text,

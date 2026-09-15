@@ -48,6 +48,12 @@ pub const STAGING_SWEEP_MINUTES: u64 = 5;
 pub const INSERT_IMAGE_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub const INSERT_IMAGE_MAX_PIXELS: u64 = 25_000_000;
 
+/// The most paragraphs one insert writes. Each line of the text becomes a
+/// paragraph, so a model that pastes a whole document into one call is
+/// stopped by this number before any call is made, while a section of an
+/// article with a blank line between every paragraph goes in as one write.
+pub const INSERT_MAX_PARAGRAPHS: usize = 200;
+
 /// The largest table a tool writes. A magazine table is small, and a model
 /// that has miscounted its data is stopped by these two numbers rather than
 /// by Google, before any call is made.

@@ -354,7 +354,7 @@ fn comments_note(resolved: usize, over: usize, more: bool) -> Option<String> {
     (!said.is_empty()).then(|| said.join(". "))
 }
 
-fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+pub(super) fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
 }
 
