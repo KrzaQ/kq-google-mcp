@@ -441,6 +441,7 @@ pub fn api_err(e: ApiError) -> ErrorData {
 /// A shared `account` argument, so the schema of every tool spells it the
 /// same way.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AccountParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,

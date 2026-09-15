@@ -27,6 +27,7 @@ use crate::http::uploads;
 const REFUSED: [&str; 2] = ["TRASH", "SPAM"];
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -39,6 +40,7 @@ pub struct SearchParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadParam {
     pub account: String,
     /// The thread id, as gmail_search reports it
@@ -48,12 +50,14 @@ pub struct ThreadParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MessageParam {
     pub account: String,
     pub message_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentParam {
     pub account: String,
     pub message_id: String,
@@ -62,6 +66,7 @@ pub struct AttachmentParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentTextParam {
     pub account: String,
     pub message_id: String,
@@ -71,6 +76,7 @@ pub struct AttachmentTextParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ViewImageParam {
     pub account: String,
     pub message_id: String,
@@ -80,6 +86,7 @@ pub struct ViewImageParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDraftParam {
     pub account: String,
     /// Recipients, plain addresses or "Name <address>"
@@ -102,6 +109,7 @@ pub struct CreateDraftParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplyDraftParam {
     pub account: String,
     /// The message being replied to; its threading headers and subject are copied
@@ -121,6 +129,7 @@ pub struct ReplyDraftParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateDraftParam {
     pub account: String,
     pub draft_id: String,
@@ -142,6 +151,7 @@ pub struct UpdateDraftParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachToDraftParam {
     pub account: String,
     pub draft_id: String,
@@ -151,6 +161,7 @@ pub struct AttachToDraftParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UploadLinkParam {
     /// The name the recipient sees, e.g. "Faktura 04-2026.pdf"
     pub filename: String,
@@ -159,6 +170,7 @@ pub struct UploadLinkParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListDraftsParam {
     pub account: String,
     /// How many drafts to return; default 20, at most 100
@@ -166,12 +178,14 @@ pub struct ListDraftsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteDraftParam {
     pub account: String,
     pub draft_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModifyLabelsParam {
     pub account: String,
     /// The messages to change, by id

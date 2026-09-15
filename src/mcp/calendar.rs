@@ -26,6 +26,7 @@ use crate::google::calendar::{self, EventDraft, EventQuery, PRIMARY, When};
 const DEFAULT_DAYS: i64 = 7;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListEventsParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -44,6 +45,7 @@ pub struct ListEventsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EventParam {
     pub account: String,
     pub event_id: String,
@@ -52,6 +54,7 @@ pub struct EventParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEventParam {
     pub account: String,
     /// What the event is called
@@ -75,6 +78,7 @@ pub struct CreateEventParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateEventParam {
     pub account: String,
     pub event_id: String,
@@ -92,6 +96,7 @@ pub struct UpdateEventParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteEventParam {
     pub account: String,
     pub event_id: String,

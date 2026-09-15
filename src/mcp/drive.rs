@@ -21,6 +21,7 @@ use crate::google::text;
 use crate::http::links::{self, NewDownload, Target};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriveSearchParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -41,12 +42,14 @@ pub struct DriveSearchParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FileParam {
     pub account: String,
     pub file_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExportParam {
     pub account: String,
     pub file_id: String,
@@ -55,6 +58,7 @@ pub struct ExportParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommentsParam {
     pub account: String,
     pub file_id: String,
@@ -65,6 +69,7 @@ pub struct CommentsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadTextParam {
     pub account: String,
     pub file_id: String,

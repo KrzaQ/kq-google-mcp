@@ -2253,6 +2253,60 @@ async fn an_attachment_link_is_minted_against_the_token_and_expires() {
     );
 }
 
+/// An argument no tool knows is a refusal, not a silence.
+///
+/// serde ignores an unknown field by default, so a model that invented
+/// `limit` for a search, or passed `size_pt` to a build that predated it,
+/// was answered as though the argument had been honoured. Everything this
+/// server does about wrong-but-quiet behaviour — the attachment warning, the
+/// formula warning, `expect` — is undone if the arguments themselves are
+/// read loosely.
+#[tokio::test]
+async fn an_argument_no_tool_knows_is_refused_by_name() {
+    let db = Db::open_memory().await.unwrap();
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount(
+        &server,
+        "GET",
+        "/gmail/v1/users/me/messages",
+        fixture("gmail_messages_list.json"),
+    )
+    .await;
+    mount_summaries(&server).await;
+    let (_, _, secret) = one_of_everything(&db, &["gmail:read"], ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, Some(&server)).await, secret);
+    c.initialize().await;
+
+    // `limit` is a plausible invention: the argument is called `max`.
+    let refused = c
+        .refused(
+            "gmail_search",
+            json!({"account": "work", "query": "faktura", "limit": 5}),
+        )
+        .await;
+    assert!(refused.contains("limit"), "it names the field: {refused}");
+    assert!(refused.contains("max"), "and what it should be: {refused}");
+
+    // Nothing was asked of Google on the way to that refusal: the arguments
+    // are read before an account is even resolved.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() == "/token")
+    );
+
+    // The same argument spelled correctly still works.
+    c.ok(
+        "gmail_search",
+        json!({"account": "work", "query": "faktura", "max": 5}),
+    )
+    .await;
+}
+
 /// A file attached inline is still a file. Gmail files anything carrying a
 /// Content-ID among the inline parts, so a PDF dropped into a reply is not in
 /// `attachments` at all — and until this was fixed, the two tools that fetch

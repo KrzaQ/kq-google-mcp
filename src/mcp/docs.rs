@@ -32,6 +32,7 @@ use crate::http::links::{self, NewDownload, Target};
 use crate::http::uploads;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsReadParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -42,6 +43,7 @@ pub struct DocsReadParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsImagesParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -50,6 +52,7 @@ pub struct DocsImagesParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsImageParam {
     pub account: String,
     pub doc_id: String,
@@ -59,6 +62,7 @@ pub struct DocsImageParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsCreateParam {
     pub account: String,
     pub title: String,
@@ -73,6 +77,7 @@ pub struct DocsCreateParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsAppendParam {
     pub account: String,
     pub doc_id: String,
@@ -84,6 +89,7 @@ pub struct DocsAppendParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsReplaceParam {
     pub account: String,
     pub doc_id: String,
@@ -98,6 +104,7 @@ pub struct DocsReplaceParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsParagraphsParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -115,6 +122,7 @@ pub struct DocsParagraphsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsFormattingParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -132,6 +140,7 @@ pub struct DocsFormattingParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsInsertParam {
     pub account: String,
     pub doc_id: String,
@@ -160,6 +169,7 @@ pub struct DocsInsertParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsEditParam {
     pub account: String,
     pub doc_id: String,
@@ -183,6 +193,7 @@ pub struct DocsEditParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsStyleParam {
     pub account: String,
     pub doc_id: String,
@@ -199,6 +210,7 @@ pub struct DocsStyleParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsCodeParam {
     pub account: String,
     pub doc_id: String,
@@ -226,6 +238,7 @@ pub struct DocsCodeParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsTableParam {
     pub account: String,
     pub doc_id: String,
@@ -248,6 +261,7 @@ pub struct DocsTableParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsUploadLinkParam {
     /// What to call the file, e.g. "wykres.png". Docs gives a picture no name
     /// of its own, so this names it only while it is on its way in.
@@ -258,6 +272,7 @@ pub struct DocsUploadLinkParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsInsertImageParam {
     pub account: String,
     pub doc_id: String,
@@ -283,6 +298,7 @@ pub struct DocsInsertImageParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocsSpanParam {
     /// The first character of the span, counting from 0
     pub start: u32,

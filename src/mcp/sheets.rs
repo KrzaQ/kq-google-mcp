@@ -42,6 +42,7 @@ const FORMULA_CHARS: usize = 60;
 const MAX_ROWS_PER_CALL: u32 = 1000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SpreadsheetParam {
     /// The label of a connected account, as list_accounts reports it
     pub account: String,
@@ -85,6 +86,7 @@ impl RenderParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadRangeParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -98,6 +100,7 @@ pub struct ReadRangeParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AppendRowsParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -113,6 +116,7 @@ pub struct AppendRowsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRangeParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -126,6 +130,7 @@ pub struct UpdateRangeParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InsertRowsParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -142,6 +147,7 @@ pub struct InsertRowsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteRowsParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -158,6 +164,7 @@ pub struct DeleteRowsParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CopyFormatParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -174,6 +181,7 @@ pub struct CopyFormatParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddTabParam {
     pub account: String,
     pub spreadsheet_id: String,
@@ -184,6 +192,7 @@ pub struct AddTabParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SheetsCreateParam {
     pub account: String,
     pub title: String,
