@@ -1,0 +1,163 @@
+{
+  "documentId": "1ArTiClEdOcIdExAmPlE0123456789abcdef",
+  "title": "Wywiad z Anną",
+  "revisionId": "ALm37BW0Article1",
+  "body": {
+    "content": [
+      {
+        "startIndex": 0,
+        "endIndex": 1,
+        "sectionBreak": {
+          "sectionStyle": {}
+        }
+      },
+      {
+        "startIndex": 1,
+        "endIndex": 15,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "TITLE"
+          },
+          "elements": [
+            {
+              "startIndex": 1,
+              "endIndex": 15,
+              "textRun": {
+                "content": "Wywiad z Anną\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 15,
+        "endIndex": 30,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "elements": [
+            {
+              "startIndex": 15,
+              "endIndex": 30,
+              "textRun": {
+                "content": "Część pierwsza\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 30,
+        "endIndex": 61,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 30,
+              "endIndex": 51,
+              "textRun": {
+                "content": "Zażółć gęślą jaźń 😀 "
+              }
+            },
+            {
+              "startIndex": 51,
+              "endIndex": 61,
+              "textRun": {
+                "content": "już i już\n",
+                "textStyle": {
+                  "bold": true
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 61,
+        "endIndex": 79,
+        "table": {
+          "rows": 1,
+          "columns": 1,
+          "tableRows": [
+            {
+              "startIndex": 62,
+              "endIndex": 79,
+              "tableCells": [
+                {
+                  "startIndex": 63,
+                  "endIndex": 78,
+                  "content": [
+                    {
+                      "startIndex": 63,
+                      "endIndex": 78,
+                      "paragraph": {
+                        "paragraphStyle": {
+                          "namedStyleType": "NORMAL_TEXT"
+                        },
+                        "elements": [
+                          {
+                            "startIndex": 63,
+                            "endIndex": 78,
+                            "textRun": {
+                              "content": "Komórka tabeli\n"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 79,
+        "endIndex": 87,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 79,
+              "endIndex": 87,
+              "textRun": {
+                "content": "Koniec.\n"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "startIndex": 87,
+        "endIndex": 88,
+        "sectionBreak": {
+          "sectionStyle": {}
+        }
+      },
+      {
+        "startIndex": 88,
+        "endIndex": 97,
+        "paragraph": {
+          "paragraphStyle": {
+            "namedStyleType": "NORMAL_TEXT"
+          },
+          "elements": [
+            {
+              "startIndex": 88,
+              "endIndex": 97,
+              "textRun": {
+                "content": "Jeszcze.\n"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

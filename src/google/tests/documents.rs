@@ -1393,3 +1393,239 @@ async fn a_table_that_cannot_be_found_again_is_not_guessed_at() {
     // One batch, and nothing written into anybody else's table.
     assert_eq!(batches(&h).await.len(), 1);
 }
+
+// ----- taking content away ---------------------------------------------------
+
+/// The article read from a document this suite names rather than the usual
+/// one. Each of these fixtures is the same article with one thing added, so
+/// the indexes below are the article's own indexes wherever they overlap.
+async fn outline_of(h: &Harness, name: &str) -> docs::Outline {
+    h.mount_json("GET", ARTICLE_AT, fixture(name)).await;
+    docs::outline(&h.client, CONNECTION, ARTICLE).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_delete_takes_the_break_that_ends_each_paragraph() {
+    let h = harness().await;
+    let outline = article(&h).await;
+    mount_batch(&h).await;
+
+    // Paragraph 2 runs from where paragraph 1 ends to where paragraph 3
+    // starts, so the newline that ends it goes with it and paragraph 3 closes
+    // up behind it rather than leaving an empty line.
+    let plan = docs::plan_delete(&outline, REVISION, 2, None, "Część", None).unwrap();
+    assert_eq!((plan.from, plan.to), (2, 2));
+    assert_eq!((plan.start, plan.end), (15, 30));
+    assert_eq!(plan.going, [(2, "Część pierwsza".to_string())]);
+    assert!(plan.tables.is_empty());
+
+    docs::apply_delete(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    let body = h.last_body("POST", ARTICLE_BATCH).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 15, "endIndex": 30}}}])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], REVISION);
+}
+
+#[tokio::test]
+async fn a_range_goes_in_one_request_and_takes_the_table_inside_it() {
+    let h = harness().await;
+    // The article with one more paragraph at the end, so that paragraph 5 is
+    // not the document's last and the range below is allowed to reach it.
+    let outline = outline_of(&h, "docs_article_tail.json").await;
+    mount_batch(&h).await;
+
+    // Paragraph 3 is the Polish one, which starts at unit 30 and ends at 61
+    // for 29 characters, because the emoji in it counts two units. The range
+    // runs from there to where paragraph 6 starts, and the table between the
+    // two goes whole.
+    let plan = docs::plan_delete(&outline, REVISION, 3, Some(5), "Zażółć", Some("Koniec")).unwrap();
+    assert_eq!((plan.start, plan.end), (30, 87));
+    assert_eq!(
+        plan.going.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+        [3, 4, 5]
+    );
+    assert_eq!(plan.going[0].1, POLISH);
+    assert_eq!(plan.tables, [(1, 1)]);
+
+    docs::apply_delete(&h.client, CONNECTION, ARTICLE, plan)
+        .await
+        .unwrap();
+    // One request over the whole span and not one per paragraph: a second
+    // request would name indexes the first one had already moved.
+    let body = h.last_body("POST", ARTICLE_BATCH).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 30, "endIndex": 87}}}])
+    );
+}
+
+/// Each of these comes back from Google as a 400 that names an index and no
+/// paragraph, which is nothing a model can act on. Each one is answered here
+/// instead, in the numbers docs_list_paragraphs gave, before a request is
+/// built.
+#[tokio::test]
+async fn every_deletion_docs_refuses_is_refused_before_anything_is_sent() {
+    let h = harness().await;
+    let outline = article(&h).await;
+
+    let refusals = [
+        // A range that starts in the body and ends inside the table...
+        (
+            docs::plan_delete(&outline, REVISION, 3, Some(4), "Zażółć", Some("Komórka"))
+                .unwrap_err(),
+            "cut a table in half",
+        ),
+        // ...and one that starts inside it and ends in the body again.
+        (
+            docs::plan_delete(&outline, REVISION, 4, Some(5), "Komórka", Some("Koniec"))
+                .unwrap_err(),
+            "cut a table in half",
+        ),
+        // The newline that ends the body, which a document must keep.
+        (
+            docs::plan_delete(&outline, REVISION, 5, None, "Koniec", None).unwrap_err(),
+            "last paragraph of the document",
+        ),
+        // The newline that ends a table cell, which a cell must keep.
+        (
+            docs::plan_delete(&outline, REVISION, 4, None, "Komórka", None).unwrap_err(),
+            "last paragraph of its table cell",
+        ),
+        // The newline in front of a table, which goes only with the table.
+        (
+            docs::plan_delete(&outline, REVISION, 3, None, "Zażółć", None).unwrap_err(),
+            "in front of a table",
+        ),
+    ];
+    for (error, wanted) in &refusals {
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert!(error.to_string().contains(wanted), "{error}");
+        assert!(error.to_string().contains("Nothing was written"), "{error}");
+    }
+    // The cut range names the table, so the next call can widen or narrow.
+    assert!(
+        refusals[0].0.to_string().contains("paragraphs 4 to 4"),
+        "{}",
+        refusals[0].0
+    );
+    assert!(
+        refusals[4].0.to_string().contains("paragraph 4"),
+        "{}",
+        refusals[4].0
+    );
+
+    // The document was read and nothing else happened.
+    let posts = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .count();
+    assert_eq!(posts, 0);
+}
+
+#[tokio::test]
+async fn the_break_in_front_of_a_section_break_is_refused_as_well() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_section.json").await;
+
+    // Paragraph 5 is no longer the last of the document here, so what refuses
+    // this is the section break behind it and not the end of the body.
+    let error = docs::plan_delete(&outline, REVISION, 5, None, "Koniec", None).unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("in front of a section break"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_is_confirmed_at_both_ends_and_against_the_revision() {
+    let h = harness().await;
+    let outline = article(&h).await;
+
+    // A range with nothing said about its far end.
+    let missing = docs::plan_delete(&outline, REVISION, 1, Some(2), "Wywiad", None).unwrap_err();
+    assert!(missing.to_string().contains("expect_last"), "{missing}");
+    assert!(missing.to_string().contains("paragraph 2"), "{missing}");
+
+    // A far end that says something the paragraph does not.
+    let wrong =
+        docs::plan_delete(&outline, REVISION, 1, Some(2), "Wywiad", Some("Koniec")).unwrap_err();
+    assert!(
+        wrong
+            .to_string()
+            .contains("paragraph 2 does not start with"),
+        "{wrong}"
+    );
+    assert!(wrong.to_string().contains("Część pierwsza"), "{wrong}");
+
+    // One paragraph needs no far end, because it has none.
+    assert!(docs::plan_delete(&outline, REVISION, 2, None, "Część", None).is_ok());
+    // And a range that runs backwards is not a range.
+    let backwards =
+        docs::plan_delete(&outline, REVISION, 2, Some(1), "Część", Some("Wywiad")).unwrap_err();
+    assert!(
+        backwards.to_string().contains("runs backwards"),
+        "{backwards}"
+    );
+
+    // Both delete plans carry the same revision lock as every other write.
+    for error in [
+        docs::plan_delete(&outline, "ALm37BW0Older", 2, None, "Część", None).unwrap_err(),
+        docs::plan_delete_table(&outline, "ALm37BW0Older", 4, "Komórka").unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("docs_list_paragraphs"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ALm37BW0Older"), "{error}");
+    }
+
+    let posts = h
+        .requests()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .count();
+    assert_eq!(posts, 0);
+}
+
+#[tokio::test]
+async fn a_table_is_deleted_by_its_own_span_from_any_cell_in_it() {
+    let h = harness().await;
+    let outline = outline_of(&h, "docs_article_table.json").await;
+    mount_batch(&h).await;
+
+    // Every cell of the 2 by 2 table names the same table. A table that has
+    // just been made holds no text at all, so the words to expect are none.
+    let from_first = docs::plan_delete_table(&outline, TABLE_REVISION, 4, "").unwrap();
+    let from_last = docs::plan_delete_table(&outline, TABLE_REVISION, 7, "").unwrap();
+    for plan in [&from_first, &from_last] {
+        assert_eq!((plan.from, plan.to), (4, 7));
+        assert_eq!(plan.tables, [(2, 2)]);
+        // The table's own span. The empty paragraph in front of it, 30 to 31,
+        // is no part of it and stays where it is.
+        assert_eq!((plan.start, plan.end), (31, 42));
+    }
+    // A paragraph the body holds has no table to delete.
+    let body_text = docs::plan_delete_table(&outline, TABLE_REVISION, 8, "Zażółć").unwrap_err();
+    assert!(
+        body_text.to_string().contains("not inside a table"),
+        "{body_text}"
+    );
+
+    docs::apply_delete(&h.client, CONNECTION, ARTICLE, from_last)
+        .await
+        .unwrap();
+    let body = h.last_body("POST", ARTICLE_BATCH).await;
+    assert_eq!(
+        body["requests"],
+        json!([{"deleteContentRange": {"range": {"startIndex": 31, "endIndex": 42}}}])
+    );
+    assert_eq!(body["writeControl"]["requiredRevisionId"], TABLE_REVISION);
+}

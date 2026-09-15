@@ -9,11 +9,18 @@
 //! caller's own last write, so every write carries the revision it was planned
 //! against and is refused rather than applied once the document has moved on.
 //!
-//! Structural edits are still out: nothing here moves a paragraph or removes
-//! one. A model that can insert, replace inside one paragraph and set a named
-//! style cannot rearrange someone's article by accident. The one structure it
-//! may add is a table, and [`apply_table`] is the single write in this module
-//! that sends two batches; the comment on it says why.
+//! Structural edits are narrow. Nothing here moves a paragraph, so a model
+//! that can insert, replace inside one paragraph and set a named style cannot
+//! rearrange someone's article by accident. The one structure it may add is a
+//! table, and [`apply_table`] is the single write in this module that sends
+//! two batches; the comment on it says why.
+//!
+//! Two writes take content away, and they are the only ones here that destroy
+//! anything: [`plan_delete`] removes whole paragraphs and
+//! [`plan_delete_table`] removes a table. Docs refuses several deletions
+//! outright — a segment's last newline, half a table, the break in front of
+//! one — and [`Outline::check_deletable`] answers each of those in this
+//! server's own words before a request is built.
 
 use std::collections::HashMap;
 
@@ -576,6 +583,28 @@ impl Paragraph {
             head(&self.text, 80)
         )))
     }
+
+    /// [`Paragraph::check_expect`] where the paragraph may hold no text at
+    /// all. A blank line is a thing people delete, and every cell of a table
+    /// that has just been made is empty; a caller cannot quote words that are
+    /// not there, so an empty `expect` is how it says the paragraph is blank.
+    ///
+    /// This is still a lock and not a way past one. An empty `expect` against
+    /// a paragraph that does hold text falls through to [`check_expect`],
+    /// which refuses it.
+    pub fn check_expect_blank(&self, expect: &str) -> Result<()> {
+        if self.text.trim().is_empty() && expect.trim().is_empty() {
+            return Ok(());
+        }
+        if self.text.trim().is_empty() {
+            return Err(Error::Unsupported(format!(
+                "paragraph {} holds no text, so it does not start with {expect:?}; pass an empty \
+                 expect for a paragraph that is blank. Nothing was written",
+                self.ordinal
+            )));
+        }
+        self.check_expect(expect)
+    }
 }
 
 /// The beginning of a paragraph, for a message that has to quote it.
@@ -605,13 +634,23 @@ pub struct Outline {
     /// table that has just been made is found again: what Google answered
     /// says where each of its cells is, so nothing has to compute that.
     tables: Vec<Grid>,
+    /// Where each body element that is neither a paragraph nor a table
+    /// starts: a section break, a table of contents. None of them is
+    /// numbered, and Docs still refuses to delete the newline in front of
+    /// one, which is the end of the paragraph before it.
+    structural: Vec<i64>,
 }
 
 /// One table of the document, as Google described it.
 #[derive(Debug, Clone, PartialEq)]
 struct Grid {
-    /// Where the table itself starts, in Docs' own index.
+    /// Where the table itself starts, in Docs' own index. The newline in
+    /// front of a table belongs to the paragraph before it and not to the
+    /// table, which is why deleting that paragraph is its own refusal.
     index: i64,
+    /// One past the end of the table. Deleting a table means deleting exactly
+    /// `index` to here: the Docs API has no request that removes a table.
+    end: i64,
     rows: Vec<Vec<Cell>>,
 }
 
@@ -621,10 +660,23 @@ struct Grid {
 struct Cell {
     /// Where that paragraph starts, as Docs counts.
     index: i64,
+    /// One past the end of the cell. The last index before it is the cell's
+    /// own final newline, which Docs refuses to delete.
+    end: i64,
     /// The number `docs_list_paragraphs` gives it.
     ordinal: usize,
+    /// The number of the last paragraph of the cell, which is `ordinal` again
+    /// for a cell that holds one paragraph.
+    last: usize,
     /// True when the cell holds no text at all.
     empty: bool,
+}
+
+impl Cell {
+    /// Whether this cell is where that paragraph sits.
+    fn holds(&self, ordinal: usize) -> bool {
+        self.ordinal > 0 && (self.ordinal..=self.last).contains(&ordinal)
+    }
 }
 
 impl Grid {
@@ -632,11 +684,22 @@ impl Grid {
         self.rows.iter().flatten()
     }
 
-    /// The paragraph number of the first cell and of the last.
+    fn columns(&self) -> usize {
+        self.rows.first().map_or(0, Vec::len)
+    }
+
+    /// The first paragraph number the table covers and the last. Every
+    /// paragraph between the two sits in one of its cells.
     fn paragraphs(&self) -> (usize, usize) {
         let first = self.cells().next().map_or(0, |c| c.ordinal);
-        let last = self.cells().last().map_or(0, |c| c.ordinal);
+        let last = self.cells().last().map_or(0, |c| c.last);
         (first, last)
+    }
+
+    /// Whether this table is where that paragraph sits.
+    fn holds(&self, ordinal: usize) -> bool {
+        let (first, last) = self.paragraphs();
+        first > 0 && (first..=last).contains(&ordinal)
     }
 }
 
@@ -684,6 +747,94 @@ impl Outline {
             "{STALE}. The write named revision {asked:?} and the document is at {:?}",
             self.revision_id
         )))
+    }
+
+    /// The last index anything may be deleted at. The body ends with a
+    /// newline of Docs' own and a document must keep one, so a delete that
+    /// would run to or past it is refused.
+    fn last_deletable(&self) -> i64 {
+        (self.end_index - 1).max(1)
+    }
+
+    /// The innermost table cell a paragraph sits in, or `None` when it is
+    /// body text. Innermost, because a table cell may hold a table.
+    fn cell_of(&self, ordinal: usize) -> Option<&Cell> {
+        self.tables
+            .iter()
+            .flat_map(Grid::cells)
+            .filter(|cell| cell.holds(ordinal))
+            .min_by_key(|cell| cell.last - cell.ordinal)
+    }
+
+    /// The innermost table a paragraph sits in.
+    fn table_of(&self, ordinal: usize) -> Option<&Grid> {
+        self.tables
+            .iter()
+            .filter(|grid| grid.holds(ordinal))
+            .min_by_key(|grid| {
+                let (first, last) = grid.paragraphs();
+                last - first
+            })
+    }
+
+    /// Everything Docs itself refuses to delete, refused here first.
+    ///
+    /// The rules are the Docs API's own: a segment keeps the newline that
+    /// ends it, a table goes whole or not at all, and the newline in front of
+    /// a table goes only when the table goes with it. Each one comes back
+    /// from Google as a 400 that names an index and no paragraph, which is
+    /// nothing a model can act on, so each one is a sentence here instead.
+    fn check_deletable(&self, from: usize, to: usize, end: i64) -> Result<()> {
+        // A range that opens in one cell and closes in another — or opens in
+        // the body and closes inside a table — would take some rows of a
+        // table and leave others, and there is no such document.
+        let (opens, closes) = (self.cell_of(from), self.cell_of(to));
+        if opens.map(|cell| cell.index) != closes.map(|cell| cell.index) {
+            let (first, last) = self
+                .table_of(from)
+                .or_else(|| self.table_of(to))
+                .map_or((0, 0), Grid::paragraphs);
+            return Err(Error::Unsupported(format!(
+                "paragraphs {from} to {to} would cut a table in half, which Docs refuses: the \
+                 table covers paragraphs {first} to {last}. Widen the range past paragraph \
+                 {last} to take the whole table with it, narrow it to paragraphs inside one \
+                 cell, or delete the table on its own with docs_delete_table. Nothing was \
+                 written"
+            )));
+        }
+        if let Some(cell) = opens
+            && end >= cell.end
+        {
+            return Err(Error::Unsupported(format!(
+                "paragraph {to} is the last paragraph of its table cell, and a cell must keep \
+                 one, so Docs refuses to delete it. Empty it with docs_edit_paragraph, or take \
+                 the whole table with docs_delete_table. Nothing was written"
+            )));
+        }
+        if opens.is_none() && end > self.last_deletable() {
+            return Err(Error::Unsupported(format!(
+                "paragraph {to} is the last paragraph of the document, and the break that ends \
+                 it is the one Docs will not delete: a document must end with one. Leave it out \
+                 of the range and empty it with docs_edit_paragraph instead. Nothing was written"
+            )));
+        }
+        if let Some(grid) = self.tables.iter().find(|grid| grid.index == end) {
+            let (first, last) = grid.paragraphs();
+            return Err(Error::Unsupported(format!(
+                "paragraph {to} is the paragraph in front of a table, and Docs refuses to delete \
+                 the break in front of a table unless the table goes with it. Widen the range to \
+                 paragraph {last} so the table goes too — its cells are paragraphs {first} to \
+                 {last} — or leave paragraph {to} out of the range. Nothing was written"
+            )));
+        }
+        if self.structural.contains(&end) {
+            return Err(Error::Unsupported(format!(
+                "paragraph {to} is the paragraph in front of a section break, and Docs refuses \
+                 to delete the break in front of one. Leave paragraph {to} out of the range, or \
+                 empty it with docs_edit_paragraph. Nothing was written"
+            )));
+        }
+        Ok(())
     }
 
     /// Where an insert goes and what is written there. A paragraph is text
@@ -754,7 +905,14 @@ pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> 
     let wire = fetch(client, connection_id, document_id).await?;
     let mut paragraphs = Vec::new();
     let mut tables = Vec::new();
-    collect_paragraphs(&wire.body.content, false, &mut paragraphs, &mut tables);
+    let mut structural = Vec::new();
+    collect_paragraphs(
+        &wire.body.content,
+        false,
+        &mut paragraphs,
+        &mut tables,
+        &mut structural,
+    );
     Ok(Outline {
         document_id: wire.document_id,
         title: wire.title,
@@ -768,6 +926,7 @@ pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> 
             .unwrap_or(1),
         paragraphs,
         tables,
+        structural,
     })
 }
 
@@ -780,6 +939,7 @@ fn collect_paragraphs(
     in_table: bool,
     out: &mut Vec<Paragraph>,
     tables: &mut Vec<Grid>,
+    structural: &mut Vec<i64>,
 ) {
     for element in content {
         if let Some(wire) = &element.paragraph {
@@ -822,10 +982,12 @@ fn collect_paragraphs(
                 let mut cells = Vec::with_capacity(row.table_cells.len());
                 for cell in &row.table_cells {
                     let at = out.len();
-                    collect_paragraphs(&cell.content, true, out, tables);
+                    collect_paragraphs(&cell.content, true, out, tables, structural);
                     cells.push(Cell {
                         index: out.get(at).map_or(0, |p| p.start_index),
+                        end: cell.end_index.unwrap_or_default(),
                         ordinal: out.get(at).map_or(0, |p| p.ordinal),
+                        last: out.last().map_or(0, |p| p.ordinal),
                         empty: out[at..].iter().all(|p| p.text.is_empty()),
                     });
                 }
@@ -833,8 +995,14 @@ fn collect_paragraphs(
             }
             tables.push(Grid {
                 index: element.start_index.unwrap_or_default(),
+                end: element.end_index.unwrap_or_default(),
                 rows,
             });
+        }
+        // A section break or a table of contents is neither, and is not
+        // numbered; it is noted because a delete may not end in front of one.
+        if element.paragraph.is_none() && element.table.is_none() {
+            structural.push(element.start_index.unwrap_or_default());
         }
     }
 }
@@ -1025,15 +1193,7 @@ pub fn plan_edit(
         requests.push(insert_request(start, replace));
         index::len(replace)
     };
-    requests.push(DocRequest {
-        delete_content_range: Some(DeleteContentRange {
-            range: Range {
-                start_index: start + shift,
-                end_index: end + shift,
-            },
-        }),
-        ..DocRequest::default()
-    });
+    requests.push(delete_request(start + shift, end + shift));
     Ok(Plan {
         paragraph: ordinal,
         before: paragraph.text.clone(),
@@ -1355,6 +1515,18 @@ fn rgb(colour: &str) -> Result<RgbColor> {
         green: channel(2),
         blue: channel(4),
     })
+}
+
+fn delete_request(start: i64, end: i64) -> DocRequest {
+    DocRequest {
+        delete_content_range: Some(DeleteContentRange {
+            range: Range {
+                start_index: start,
+                end_index: end,
+            },
+        }),
+        ..DocRequest::default()
+    }
 }
 
 fn insert_request(index: i64, text: &str) -> DocRequest {
@@ -1717,6 +1889,156 @@ fn fill_requests(table: &Grid, grid: &[Vec<String>], header: bool) -> Vec<DocReq
     requests
 }
 
+// ----- taking content away ---------------------------------------------------
+
+/// Content on its way out of a document: which paragraphs go, how they read
+/// now, and the one `deleteContentRange` that takes them all together.
+///
+/// Both delete tools build this, so both are refused for the same reasons in
+/// the same words, and a preview that comes back is a delete that would go
+/// through. A range is one request over the whole span and never one request
+/// per paragraph: Docs applies a batch in order, so a second request would
+/// name indexes the first one had already moved.
+#[derive(Debug)]
+pub struct DeletePlan {
+    /// The first paragraph the delete takes, as `docs_list_paragraphs`
+    /// numbers them.
+    pub from: usize,
+    /// The last one, included.
+    pub to: usize,
+    /// Every paragraph that goes: its number, and how it reads now. This is
+    /// what the preview lists.
+    pub going: Vec<(usize, String)>,
+    /// The tables that go whole, as rows by columns. A range that swallows a
+    /// table takes the table with it, and the person has to be told that.
+    pub tables: Vec<(usize, usize)>,
+    /// The span that is deleted, in Docs' own index.
+    pub start: i64,
+    pub end: i64,
+    revision_id: String,
+    requests: Vec<DocRequest>,
+}
+
+/// Whole paragraphs, `from` to `to` and both included, with the paragraph
+/// break that ends each one, so nothing is left behind as an empty line.
+///
+/// Both ends of a range are confirmed by the caller: `expect` for the first
+/// paragraph and `expect_last` for the last. A miscount on an insert is undone
+/// by deleting what was inserted; a miscount here takes a section of somebody's
+/// article with it and nothing on this side can put it back.
+pub fn plan_delete(
+    outline: &Outline,
+    revision_id: &str,
+    from: usize,
+    to: Option<usize>,
+    expect: &str,
+    expect_last: Option<&str>,
+) -> Result<DeletePlan> {
+    outline.check_revision(revision_id)?;
+    let to = to.unwrap_or(from);
+    if to < from {
+        return Err(Error::Unsupported(format!(
+            "the range runs backwards: `from` is {from} and `to` is {to}. `from` is the first \
+             paragraph to delete and `to` the last, and both of them go"
+        )));
+    }
+    let first = outline.paragraph(from)?;
+    let last = outline.paragraph(to)?;
+    first.check_expect_blank(expect)?;
+    match expect_last {
+        Some(expect_last) => last.check_expect_blank(expect_last)?,
+        None if to != from => {
+            return Err(Error::Unsupported(format!(
+                "deleting paragraphs {from} to {to} needs `expect_last` as well: pass what \
+                 paragraph {to} starts with, as docs_list_paragraphs reports it. Both ends of a \
+                 range are confirmed here, because a range is where a miscount takes a whole \
+                 section with it and nothing here can put it back"
+            )));
+        }
+        None => {}
+    }
+    let (start, end) = (first.start_index, last.end_index);
+    outline.check_deletable(from, to, end)?;
+    Ok(DeletePlan {
+        from,
+        to,
+        going: going(outline, from, to),
+        tables: outline
+            .tables
+            .iter()
+            .filter(|grid| start <= grid.index && grid.end <= end)
+            .map(|grid| (grid.rows.len(), grid.columns()))
+            .collect(),
+        start,
+        end,
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![delete_request(start, end)],
+    })
+}
+
+/// The whole table one paragraph sits in. Any cell of it names it.
+///
+/// The Docs API has no request that removes a table, so a table is deleted by
+/// deleting its own span, exactly as Google's own guide says. That span starts
+/// at the table and not at the newline in front of it, so the paragraph before
+/// the table is left where it is.
+pub fn plan_delete_table(
+    outline: &Outline,
+    revision_id: &str,
+    paragraph: usize,
+    expect: &str,
+) -> Result<DeletePlan> {
+    outline.check_revision(revision_id)?;
+    outline.paragraph(paragraph)?.check_expect_blank(expect)?;
+    let Some(grid) = outline.table_of(paragraph) else {
+        return Err(Error::Unsupported(format!(
+            "paragraph {paragraph} is not inside a table, so there is no table to delete: it is \
+             body text. docs_list_paragraphs marks the paragraphs that are in one with in_table, \
+             and this tool takes any cell of the table you mean. Nothing was written"
+        )));
+    };
+    let (from, to) = grid.paragraphs();
+    Ok(DeletePlan {
+        from,
+        to,
+        going: going(outline, from, to),
+        tables: vec![(grid.rows.len(), grid.columns())],
+        start: grid.index,
+        end: grid.end,
+        revision_id: revision_id.trim().to_string(),
+        requests: vec![delete_request(grid.index, grid.end)],
+    })
+}
+
+/// The paragraphs a delete takes, numbered as the listing numbers them.
+fn going(outline: &Outline, from: usize, to: usize) -> Vec<(usize, String)> {
+    outline.paragraphs[from - 1..to]
+        .iter()
+        .map(|p| (p.ordinal, p.text.clone()))
+        .collect()
+}
+
+/// The one `batchUpdate` a delete sends, against the revision it was planned
+/// for. A document that moved in between refuses the batch rather than
+/// deleting whatever now stands at those indexes.
+pub async fn apply_delete(
+    client: &Client,
+    connection_id: i64,
+    document_id: &str,
+    plan: DeletePlan,
+) -> Result<()> {
+    batch(
+        client,
+        connection_id,
+        document_id,
+        plan.requests,
+        plan.revision_id,
+    )
+    .await
+    .map_err(stale)?;
+    Ok(())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireDocument {
@@ -1874,6 +2196,9 @@ struct WireTableRow {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WireTableCell {
+    /// One past the end of the cell, which is where its own last newline
+    /// sits. A delete that would take that newline is refused.
+    end_index: Option<i64>,
     content: Vec<WireElement>,
 }
 
