@@ -76,6 +76,10 @@ pub struct InlineImage {
     /// Docs' own id for the object. A download link stores this, because a
     /// label moves when somebody adds a picture above it.
     pub object_id: String,
+    /// Which paragraph holds the picture, as `docs_list_paragraphs` numbers
+    /// them. A caption goes in a paragraph of its own above or below that
+    /// one, and nothing else in the answer says where the picture is.
+    pub paragraph: usize,
     pub alt_title: Option<String>,
     pub alt_text: Option<String>,
     /// How large the picture is *in the document*, in points. Docs says
@@ -153,8 +157,9 @@ pub async fn images(
     document_id: &str,
 ) -> Result<DocumentImages> {
     let wire = fetch(client, connection_id, document_id).await?;
+    let images = read_body(&wire).images;
     Ok(DocumentImages {
-        images: inline_images(&wire),
+        images,
         document_id: wire.document_id,
         title: wire.title,
     })
@@ -177,52 +182,66 @@ pub async fn open_image(client: &Client, image: &InlineImage) -> Result<Download
     client.follow_content_uri(uri).await
 }
 
-/// The pictures, labelled in the order the body meets them.
+/// What one walk of the body found.
 ///
-/// `inlineObjects` is a JSON object keyed by object id, and that order means
-/// nothing at all. The labels must follow the body, because `image1` is what
-/// the markdown export calls the first picture in the document, and that
-/// export is the text a model has already read. So the body is walked instead,
-/// tables included, and each reference is taken where it is met.
-fn inline_images(wire: &WireDocument) -> Vec<InlineImage> {
-    let mut referenced = Vec::new();
-    walk(&wire.body.content, &mut referenced);
-    let mut images: Vec<InlineImage> = Vec::new();
-    for object_id in referenced {
+/// The paragraph numbers and the picture labels are two halves of one fact —
+/// which paragraph holds which picture — so one walk produces both. Two walks
+/// over the same body would each be right on its own and could still disagree
+/// about which paragraph a picture sits in.
+#[derive(Debug, Default)]
+struct Body {
+    paragraphs: Vec<Paragraph>,
+    /// The tables, in the order the body meets them.
+    tables: Vec<Grid>,
+    /// Where each body element that is neither a paragraph nor a table starts.
+    structural: Vec<i64>,
+    /// The pictures, labelled in the order the body meets them.
+    images: Vec<InlineImage>,
+}
+
+impl Body {
+    /// Take the picture the body has just met, in paragraph `paragraph`, and
+    /// answer the label it is known by from here on.
+    ///
+    /// This is the one place a label is made. `image1` is what Drive's
+    /// markdown export calls the first picture in the document, which is the
+    /// text a model has already read, so the counting follows the body and
+    /// not the `inlineObjects` map, whose order means nothing at all. The
+    /// paragraph listing and the picture listing both say `image3` of the
+    /// same picture because both take it from here.
+    fn met_image(
+        &mut self,
+        object_id: &str,
+        objects: &HashMap<String, WireInlineObject>,
+        paragraph: usize,
+    ) -> Option<String> {
         // A reference to an object the document does not describe is nothing
         // this server can show or fetch, so it is not given a label either.
-        let Some(object) = wire.inline_objects.get(&object_id) else {
-            continue;
-        };
-        let embedded = &object.inline_object_properties.embedded_object;
-        images.push(InlineImage {
-            label: format!("image{}", images.len() + 1),
-            object_id,
+        let embedded = &objects
+            .get(object_id)?
+            .inline_object_properties
+            .embedded_object;
+        let label = format!("image{}", self.images.len() + 1);
+        self.images.push(InlineImage {
+            label: label.clone(),
+            object_id: object_id.to_string(),
+            paragraph,
             alt_title: some(&embedded.title),
             alt_text: some(&embedded.description),
             width_pt: embedded.size.width.magnitude.map(round),
             height_pt: embedded.size.height.magnitude.map(round),
             content_uri: some(&embedded.image_properties.content_uri),
         });
+        Some(label)
     }
-    images
 }
 
-/// Every `inlineObjectElement` under this content, in reading order. A table
-/// carries content of its own, so the walk goes through its cells.
-fn walk(content: &[WireElement], out: &mut Vec<String>) {
-    for element in content {
-        for run in element.paragraph.iter().flat_map(|p| &p.elements) {
-            if let Some(inline) = &run.inline_object_element {
-                out.push(inline.inline_object_id.clone());
-            }
-        }
-        for row in element.table.iter().flat_map(|t| &t.table_rows) {
-            for cell in &row.table_cells {
-                walk(&cell.content, out);
-            }
-        }
-    }
+/// The body, walked once: every paragraph numbered and every picture
+/// labelled, tables included.
+fn read_body(wire: &WireDocument) -> Body {
+    let mut body = Body::default();
+    collect(&wire.body.content, false, &wire.inline_objects, &mut body);
+    body
 }
 
 fn some(value: &str) -> Option<String> {
@@ -461,6 +480,11 @@ pub struct Paragraph {
     /// True when the paragraph sits in a table cell. It is numbered like any
     /// other, because the body meets it like any other.
     pub in_table: bool,
+    /// The pictures the paragraph holds, by the label `docs_list_images`
+    /// gives them and Drive's markdown export writes: `image3`. A picture
+    /// carries no text, so a paragraph holding one and a blank paragraph read
+    /// alike everywhere else.
+    pub images: Vec<String>,
     /// The text runs, each with the index Docs gave it. An offset into `text`
     /// becomes a document index only through these: an inline picture takes
     /// an index and carries no text, so the two do not run in step.
@@ -1012,16 +1036,7 @@ impl Outline {
 /// same read every write starts with.
 pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> Result<Outline> {
     let wire = fetch(client, connection_id, document_id).await?;
-    let mut paragraphs = Vec::new();
-    let mut tables = Vec::new();
-    let mut structural = Vec::new();
-    collect_paragraphs(
-        &wire.body.content,
-        false,
-        &mut paragraphs,
-        &mut tables,
-        &mut structural,
-    );
+    let body = read_body(&wire);
     Ok(Outline {
         document_id: wire.document_id,
         title: wire.title,
@@ -1033,28 +1048,29 @@ pub async fn outline(client: &Client, connection_id: i64, document_id: &str) -> 
             .filter_map(|e| e.end_index)
             .max()
             .unwrap_or(1),
-        paragraphs,
-        tables,
-        structural,
+        paragraphs: body.paragraphs,
+        tables: body.tables,
+        structural: body.structural,
     })
 }
 
 /// Every paragraph under this content, in the order the body meets it. A
 /// table carries content of its own, so the walk goes through its cells and
-/// the paragraphs in them are numbered where they are met — the same walk the
-/// pictures take, for the same reason.
-fn collect_paragraphs(
+/// the paragraphs in them are numbered where they are met — and the pictures
+/// in them are labelled where they are met, by the same walk.
+fn collect(
     content: &[WireElement],
     in_table: bool,
-    out: &mut Vec<Paragraph>,
-    tables: &mut Vec<Grid>,
-    structural: &mut Vec<i64>,
+    objects: &HashMap<String, WireInlineObject>,
+    body: &mut Body,
 ) {
     for element in content {
         if let Some(wire) = &element.paragraph {
+            let ordinal = body.paragraphs.len() + 1;
             let start_index = element.start_index.unwrap_or_default();
             let mut cursor = start_index;
             let mut runs: Vec<Run> = Vec::new();
+            let mut images: Vec<String> = Vec::new();
             for part in &wire.elements {
                 let at = part.start_index.unwrap_or(cursor);
                 if let Some(run) = &part.text_run {
@@ -1065,19 +1081,27 @@ fn collect_paragraphs(
                     });
                     cursor = at + index::len(&run.content);
                 } else {
-                    // A picture takes one index and carries no text.
+                    // A picture takes one index and carries no text. It is
+                    // the whole of what the paragraph holds, so the listing
+                    // says which picture it is; without that a paragraph
+                    // holding a screenshot reads exactly like a blank line.
+                    if let Some(inline) = &part.inline_object_element {
+                        let met = body.met_image(&inline.inline_object_id, objects, ordinal);
+                        images.extend(met);
+                    }
                     cursor = at + 1;
                 }
             }
             let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
-            out.push(Paragraph {
-                ordinal: out.len() + 1,
+            body.paragraphs.push(Paragraph {
+                ordinal,
                 style: some(&wire.paragraph_style.named_style_type)
                     .unwrap_or_else(|| "NORMAL_TEXT".to_string()),
                 start_index,
                 end_index: element.end_index.unwrap_or(start_index),
                 text: joined.strip_suffix('\n').unwrap_or(&joined).to_string(),
                 in_table,
+                images,
                 runs,
             });
         }
@@ -1090,19 +1114,20 @@ fn collect_paragraphs(
             for row in &table.table_rows {
                 let mut cells = Vec::with_capacity(row.table_cells.len());
                 for cell in &row.table_cells {
-                    let at = out.len();
-                    collect_paragraphs(&cell.content, true, out, tables, structural);
+                    let at = body.paragraphs.len();
+                    collect(&cell.content, true, objects, body);
+                    let held = &body.paragraphs[at..];
                     cells.push(Cell {
-                        index: out.get(at).map_or(0, |p| p.start_index),
+                        index: held.first().map_or(0, |p| p.start_index),
                         end: cell.end_index.unwrap_or_default(),
-                        ordinal: out.get(at).map_or(0, |p| p.ordinal),
-                        last: out.last().map_or(0, |p| p.ordinal),
-                        empty: out[at..].iter().all(|p| p.text.is_empty()),
+                        ordinal: held.first().map_or(0, |p| p.ordinal),
+                        last: held.last().map_or(0, |p| p.ordinal),
+                        empty: held.iter().all(|p| p.text.is_empty()),
                     });
                 }
                 rows.push(cells);
             }
-            tables.push(Grid {
+            body.tables.push(Grid {
                 index: element.start_index.unwrap_or_default(),
                 end: element.end_index.unwrap_or_default(),
                 rows,
@@ -1111,7 +1136,8 @@ fn collect_paragraphs(
         // A section break or a table of contents is neither, and is not
         // numbered; it is noted because a delete may not end in front of one.
         if element.paragraph.is_none() && element.table.is_none() {
-            structural.push(element.start_index.unwrap_or_default());
+            body.structural
+                .push(element.start_index.unwrap_or_default());
         }
     }
 }

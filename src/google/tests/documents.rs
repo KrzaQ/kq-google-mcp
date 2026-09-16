@@ -312,6 +312,92 @@ async fn a_content_uri_that_is_not_googles_is_refused_and_never_fetched() {
     assert_eq!(paths, ["/token", IMAGES_AT]);
 }
 
+const FIGURES_DOC: &str = "1FiGuReSdOcIdExAmPlE0123456789abcdef";
+const FIGURES_AT: &str = "/v1/documents/1FiGuReSdOcIdExAmPlE0123456789abcdef";
+
+#[tokio::test]
+async fn a_picture_and_the_paragraph_that_holds_it_are_the_same_fact() {
+    let h = harness().await;
+    h.mount_json("GET", IMAGES_AT, fixture("docs_document_images.json"))
+        .await;
+
+    let held = docs::images(&h.client, CONNECTION, IMAGES_DOC)
+        .await
+        .unwrap();
+    let outline = docs::outline(&h.client, CONNECTION, IMAGES_DOC)
+        .await
+        .unwrap();
+
+    // Each picture says which paragraph holds it, and the paragraph says
+    // which picture it holds. The two walks are one walk, so they agree.
+    assert_eq!(
+        held.images
+            .iter()
+            .map(|i| (i.label.as_str(), i.paragraph))
+            .collect::<Vec<_>>(),
+        [("image1", 1), ("image2", 2), ("image3", 3)]
+    );
+    assert_eq!(
+        outline
+            .paragraphs
+            .iter()
+            .map(|p| p.images.clone())
+            .collect::<Vec<_>>(),
+        [vec!["image1"], vec!["image2"], vec!["image3"]]
+    );
+    for image in &held.images {
+        let paragraph = outline.paragraph(image.paragraph).unwrap();
+        assert!(
+            paragraph.images.contains(&image.label),
+            "{} says paragraph {} and that paragraph says {:?}",
+            image.label,
+            image.paragraph,
+            paragraph.images
+        );
+    }
+
+    // image2 sits in a table cell, which is numbered like any other
+    // paragraph, and image3 is a drawing nothing can fetch. Both mark their
+    // paragraph: a caller counting figures needs to know they are there.
+    assert!(outline.paragraph(2).unwrap().in_table);
+    assert_eq!(held.images[2].content_uri, None);
+    assert_eq!(outline.paragraph(3).unwrap().text, "");
+}
+
+#[tokio::test]
+async fn a_paragraph_that_holds_a_picture_is_not_a_blank_paragraph() {
+    let h = harness().await;
+    h.mount_json("GET", FIGURES_AT, fixture("docs_document_figures.json"))
+        .await;
+    let outline = docs::outline(&h.client, CONNECTION, FIGURES_DOC)
+        .await
+        .unwrap();
+
+    // Paragraphs 3, 5 and 7 are the blank lines the house style puts between
+    // paragraphs; 4 and 6 hold the pictures. All five are empty text.
+    for ordinal in [3, 4, 5, 6, 7] {
+        assert_eq!(outline.paragraph(ordinal).unwrap().text, "");
+        assert_eq!(outline.paragraph(ordinal).unwrap().chars(), 0);
+    }
+    assert!(outline.paragraph(3).unwrap().images.is_empty());
+    assert_eq!(outline.paragraph(4).unwrap().images, ["image1"]);
+    assert!(outline.paragraph(5).unwrap().images.is_empty());
+    // One paragraph may hold more than one picture.
+    assert_eq!(outline.paragraph(6).unwrap().images, ["image2", "image3"]);
+    assert!(outline.paragraph(7).unwrap().images.is_empty());
+
+    let held = docs::images(&h.client, CONNECTION, FIGURES_DOC)
+        .await
+        .unwrap();
+    assert_eq!(
+        held.images
+            .iter()
+            .map(|i| (i.label.as_str(), i.paragraph))
+            .collect::<Vec<_>>(),
+        [("image1", 4), ("image2", 6), ("image3", 6)]
+    );
+}
+
 // ----- the document as numbered paragraphs -----------------------------------
 
 const ARTICLE: &str = "1ArTiClEdOcIdExAmPlE0123456789abcdef";

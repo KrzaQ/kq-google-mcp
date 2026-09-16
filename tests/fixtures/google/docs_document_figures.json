@@ -1,0 +1,69 @@
+{
+  "documentId": "1FiGuReSdOcIdExAmPlE0123456789abcdef",
+  "title": "Cztery zrzuty ekranu",
+  "revisionId": "ALm37BW2Figures",
+  "tabs": [],
+  "inlineObjects": {
+    "kix.figure1": {
+      "objectId": "kix.figure1",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "imageProperties": {"contentUri": "https://lh7-us.googleusercontent.com/docsz/AbCdEfFigure1"},
+          "size": {"height": {"magnitude": 240, "unit": "PT"}, "width": {"magnitude": 420, "unit": "PT"}}
+        }
+      }
+    },
+    "kix.figure2": {
+      "objectId": "kix.figure2",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "imageProperties": {"contentUri": "https://lh7-us.googleusercontent.com/docsz/AbCdEfFigure2"},
+          "size": {"height": {"magnitude": 120, "unit": "PT"}, "width": {"magnitude": 200, "unit": "PT"}}
+        }
+      }
+    },
+    "kix.figure3": {
+      "objectId": "kix.figure3",
+      "inlineObjectProperties": {
+        "embeddedObject": {
+          "imageProperties": {"contentUri": "https://lh7-us.googleusercontent.com/docsz/AbCdEfFigure3"},
+          "size": {"height": {"magnitude": 120, "unit": "PT"}, "width": {"magnitude": 200, "unit": "PT"}}
+        }
+      }
+    }
+  },
+  "body": {
+    "content": [
+      {"startIndex": 0, "endIndex": 1, "sectionBreak": {"sectionStyle": {}}},
+      {"startIndex": 1, "endIndex": 22, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "TITLE"},
+        "elements": [{"startIndex": 1, "endIndex": 22, "textRun": {"content": "Cztery zrzuty ekranu\n"}}]}},
+      {"startIndex": 22, "endIndex": 29, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [{"startIndex": 22, "endIndex": 29, "textRun": {"content": "Wstęp.\n"}}]}},
+      {"startIndex": 29, "endIndex": 30, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [{"startIndex": 29, "endIndex": 30, "textRun": {"content": "\n"}}]}},
+      {"startIndex": 30, "endIndex": 32, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [
+          {"startIndex": 30, "endIndex": 31, "inlineObjectElement": {"inlineObjectId": "kix.figure1", "textStyle": {}}},
+          {"startIndex": 31, "endIndex": 32, "textRun": {"content": "\n"}}]}},
+      {"startIndex": 32, "endIndex": 33, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [{"startIndex": 32, "endIndex": 33, "textRun": {"content": "\n"}}]}},
+      {"startIndex": 33, "endIndex": 36, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [
+          {"startIndex": 33, "endIndex": 34, "inlineObjectElement": {"inlineObjectId": "kix.figure2", "textStyle": {}}},
+          {"startIndex": 34, "endIndex": 35, "inlineObjectElement": {"inlineObjectId": "kix.figure3", "textStyle": {}}},
+          {"startIndex": 35, "endIndex": 36, "textRun": {"content": "\n"}}]}},
+      {"startIndex": 36, "endIndex": 37, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [{"startIndex": 36, "endIndex": 37, "textRun": {"content": "\n"}}]}},
+      {"startIndex": 37, "endIndex": 44, "paragraph": {
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+        "elements": [{"startIndex": 37, "endIndex": 44, "textRun": {"content": "Ryc. 1\n"}}]}}
+    ]
+  }
+}
