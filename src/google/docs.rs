@@ -174,8 +174,10 @@ pub async fn open_image(client: &Client, image: &InlineImage) -> Result<Download
         .filter(|uri| !uri.is_empty())
         .ok_or_else(|| {
             Error::Unsupported(format!(
-                "{} is a drawing or a chart rather than a picture, so there are no image bytes \
-                 to fetch; open the document to see it",
+                "{} is a drawing or a chart rather than a picture, so Docs offers no image \
+                 bytes to fetch. It is still readable: export the document with \
+                 drive_export_link format=\"pdf\", where Google draws it, and look at the page \
+                 it sits on",
                 image.label
             ))
         })?;

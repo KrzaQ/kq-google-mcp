@@ -590,7 +590,7 @@ pub struct DocImageOut {
     pub width_pt: Option<i64>,
     pub height_pt: Option<i64>,
     /// A drawing or a chart has no picture of its own, so there is nothing to
-    /// look at or to download; open the document to see it.
+    /// fetch or to download. It can still be read: the PDF export draws it.
     pub fetchable: bool,
 }
 

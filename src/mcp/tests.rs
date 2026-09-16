@@ -3550,6 +3550,10 @@ async fn a_document_says_which_pictures_it_holds_and_what_to_call_them() {
         )
         .await;
     assert!(refused.contains("drawing"), "{refused}");
+    // And it says how to read it anyway. A drawing has no bytes to fetch, but
+    // the PDF export draws it, so the refusal is a route rather than a wall.
+    assert!(refused.contains("drive_export_link"), "{refused}");
+    assert!(refused.contains("pdf"), "{refused}");
 }
 
 #[tokio::test]
