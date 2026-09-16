@@ -5209,6 +5209,162 @@ async fn docs_read_formatting_answers_runs_a_span_can_be_written_from() {
     drop(server);
 }
 
+/// The article of four screenshots: blank paragraphs and picture paragraphs,
+/// which read alike in everything but the labels.
+const FIGURES: &str = "1FiGuReSdOcIdExAmPlE0123456789abcdef";
+
+async fn figures_server() -> MockServer {
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{FIGURES}"),
+        fixture("docs_document_figures.json"),
+    )
+    .await;
+    server
+}
+
+#[tokio::test]
+async fn a_paragraph_that_holds_a_picture_says_so_and_a_blank_one_says_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = figures_server().await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let listed = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": FIGURES}),
+        )
+        .await;
+    let rows = listed["paragraphs"].as_array().unwrap();
+    assert_eq!(rows.len(), 8);
+    // Paragraphs 3 to 7 are all empty: three blank lines and two paragraphs
+    // holding pictures. Before the labels, a caller writing a caption could
+    // not tell which was which and had to guess from the spacing.
+    for row in &rows[2..7] {
+        assert_eq!(row["chars"], 0);
+        assert_eq!(row["text"], "");
+    }
+    assert_eq!(rows[3]["images"], json!(["image1"]));
+    // A paragraph may hold more than one picture.
+    assert_eq!(rows[5]["images"], json!(["image2", "image3"]));
+    // A paragraph that holds none carries no field at all, not an empty list.
+    for blank in [2, 4, 6] {
+        assert!(
+            rows[blank].get("images").is_none(),
+            "paragraph {} answered {}",
+            blank + 1,
+            rows[blank]
+        );
+    }
+    assert!(rows[0].get("images").is_none(), "{}", rows[0]);
+
+    // The same fact from the other end: each picture says which paragraph
+    // holds it, in the numbering the listing just used.
+    let held = c
+        .ok(
+            "docs_list_images",
+            json!({"account": "work", "doc_id": FIGURES}),
+        )
+        .await;
+    assert_eq!(
+        held["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| (i["image"].clone(), i["paragraph"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (json!("image1"), json!(4)),
+            (json!("image2"), json!(6)),
+            (json!("image3"), json!(6)),
+        ]
+    );
+
+    // And a caller already reading formatting reads the same marker, which is
+    // the only thing in that answer that separates a picture from a blank
+    // line: both come back with no runs.
+    let formatting = c
+        .ok(
+            "docs_read_formatting",
+            json!({"account": "work", "doc_id": FIGURES}),
+        )
+        .await;
+    let styled = formatting["paragraphs"].as_array().unwrap();
+    for at in [2, 3, 4, 5, 6] {
+        assert_eq!(styled[at]["runs"], json!([]), "{}", styled[at]);
+    }
+    assert_eq!(styled[3]["images"], json!(["image1"]));
+    assert_eq!(styled[5]["images"], json!(["image2", "image3"]));
+    assert!(styled[2].get("images").is_none(), "{}", styled[2]);
+
+    // One naming scheme across the three tools: the labels a caller reads in
+    // the listing are the labels it passes to docs_view_image.
+    let labels = |rows: &Vec<Value>| -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r["images"].as_array().cloned().unwrap_or_default())
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect()
+    };
+    let named: Vec<String> = held["images"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["image"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(labels(rows), named);
+    assert_eq!(labels(styled), named);
+    assert_eq!(named, ["image1", "image2", "image3"]);
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_picture_in_a_table_cell_names_the_paragraph_the_listing_numbers_it() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/v1/documents/{PICTURE_DOC}"),
+        fixture("docs_document_images.json"),
+    )
+    .await;
+    let mut c = client(&db, &server, &["docs:read"]).await;
+
+    let rows = c
+        .ok(
+            "docs_list_paragraphs",
+            json!({"account": "work", "doc_id": PICTURE_DOC}),
+        )
+        .await;
+    let rows = rows["paragraphs"].as_array().unwrap().clone();
+    // A table cell is numbered like any other paragraph, and the picture in
+    // it is labelled where the body meets it.
+    assert_eq!(rows[1]["in_table"], true);
+    assert_eq!(rows[1]["images"], json!(["image2"]));
+    // A paragraph that holds a picture and words says both.
+    assert_eq!(rows[0]["text"], "Revenue held up.");
+    assert_eq!(rows[0]["images"], json!(["image1"]));
+
+    let held = c
+        .ok(
+            "docs_list_images",
+            json!({"account": "work", "doc_id": PICTURE_DOC}),
+        )
+        .await;
+    let images = held["images"].as_array().unwrap();
+    assert_eq!(images[1]["image"], "image2");
+    assert_eq!(images[1]["paragraph"], rows[1]["paragraph"]);
+    // A drawing has no picture behind it to fetch and still occupies its
+    // place: it is a figure a caller counting figures has to know about.
+    assert_eq!(images[2]["fetchable"], false);
+    assert_eq!(images[2]["paragraph"], 3);
+    assert_eq!(rows[2]["images"], json!(["image3"]));
+    assert_eq!(rows[2]["text"], "");
+    drop(server);
+}
+
 // ----- a picture in a document ------------------------------------------------
 
 /// A small PNG, the size a diagram actually is. `png()` is 1600x1200 and slow

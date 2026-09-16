@@ -579,6 +579,9 @@ pub struct DocImageOut {
     /// Docs' own id for the object, which also works as `image` and which
     /// stays the same when a picture is added above this one.
     pub object_id: String,
+    /// The paragraph the picture sits in, as docs_list_paragraphs numbers
+    /// them. Write a caption in a paragraph of its own above or below it.
+    pub paragraph: usize,
     /// The alt text, when the document carries any.
     pub alt_title: Option<String>,
     pub alt_text: Option<String>,
@@ -596,6 +599,7 @@ impl From<docs::InlineImage> for DocImageOut {
         Self {
             image: i.label,
             object_id: i.object_id,
+            paragraph: i.paragraph,
             alt_title: i.alt_title,
             alt_text: i.alt_text,
             width_pt: i.width_pt,
@@ -635,6 +639,11 @@ pub struct DocParagraphOut {
     pub chars: usize,
     /// True when the paragraph sits in a table cell.
     pub in_table: bool,
+    /// The pictures this paragraph holds, by the labels docs_list_images and
+    /// the text of docs_read use: ["image3"]. Absent when it holds none, so a
+    /// paragraph that carries a picture is told apart from a blank line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     pub text: String,
     /// True when `text` was cut to keep the answer small; ask for this
     /// paragraph again with full=true to read all of it.
@@ -670,6 +679,11 @@ pub struct DocRunsOut {
     /// How many characters the paragraph holds.
     pub chars: usize,
     pub in_table: bool,
+    /// The pictures this paragraph holds, by the labels docs_list_images and
+    /// the text of docs_read use. A picture carries no runs, so a paragraph
+    /// holding one answers no runs at all, exactly like a blank line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// The runs, in order and covering the paragraph end to end.
     pub runs: Vec<DocRunOut>,
 }

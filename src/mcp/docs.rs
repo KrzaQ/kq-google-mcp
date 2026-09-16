@@ -515,11 +515,12 @@ impl Gmcp {
     }
 
     #[tool(
-        description = "What pictures a Google Doc holds, in the order they appear in it: the \
-                       label to call each one by, the alt text where the document carries any, \
-                       and how large it is on the page. docs_read leaves the pictures out of the \
-                       text and names them image1, image2 and so on; this says what they are, and \
-                       docs_view_image shows one."
+        description = "What pictures a Google Doc holds, in the order they appear in it: the label \
+                       to call each one by, which paragraph it sits in as docs_list_paragraphs \
+                       numbers them, the alt text where the document carries any, and how large it \
+                       is on the page. docs_read leaves the pictures out of the text and names them \
+                       image1, image2 and so on; this says what they are, and docs_view_image shows \
+                       one."
     )]
     async fn docs_list_images(
         &self,
@@ -798,15 +799,20 @@ impl Gmcp {
 
     #[tool(
         description = "A Google Doc as numbered paragraphs: for each one its number, its named \
-                       style (HEADING_2, NORMAL_TEXT, …), how many characters it holds and its \
-                       text, and the document's revision_id once at the top. This is the read \
-                       every careful edit starts from — docs_insert_text, docs_edit_paragraph, \
-                       docs_style_paragraph and docs_insert_code all take a paragraph number and \
-                       that revision_id. The text of each paragraph is cut unless full=true, and \
-                       from and to narrow the range, so one paragraph can be read exactly without \
-                       pulling a whole article. Numbering follows the body, table cells included. \
-                       One write moves every number and changes the revision id, so read again \
-                       after each write."
+                       style (HEADING_2, NORMAL_TEXT, …), how many characters it holds, the labels \
+                       of any pictures it holds and its text, and the document's revision_id once \
+                       at the top. This is the read every careful edit starts from — \
+                       docs_insert_text, docs_edit_paragraph, docs_style_paragraph and \
+                       docs_insert_code all take a paragraph number and that revision_id. The text \
+                       of each paragraph is cut unless full=true, and from and to narrow the range, \
+                       so one paragraph can be read exactly without pulling a whole article. \
+                       Numbering follows the body, table cells included. A picture carries no text, \
+                       so `images` is what tells its paragraph from a blank line: [\"image3\"] \
+                       means that paragraph holds the picture docs_read and docs_list_images both \
+                       call image3. A paragraph that holds none has no `images` at all, and a \
+                       caption goes in a paragraph of its own above or below the one that holds the \
+                       picture. One write moves every number and changes the revision id, so read \
+                       again after each write."
     )]
     async fn docs_list_paragraphs(
         &self,
@@ -846,6 +852,7 @@ impl Gmcp {
                 style: paragraph.style.clone(),
                 chars: paragraph.chars(),
                 in_table: paragraph.in_table,
+                images: paragraph.images.clone(),
                 text,
                 truncated,
             });
@@ -883,16 +890,19 @@ impl Gmcp {
                        listing docs_insert_code coloured. For each paragraph it answers the named \
                        style and the text runs; a run is {start, end, text} plus only the \
                        properties the document sets on it — colour as #rrggbb, bold, italic, font \
-                       and size in points — so a paragraph nobody styled comes back as one bare \
-                       run rather than a wall of defaults. start and end count characters from \
-                       the beginning of the paragraph, the same units docs_insert_code takes for \
-                       its spans, so what comes out here can be fed back in. Two things to expect \
-                       before you conclude the document is wrong: Docs merges neighbouring \
-                       characters that share a style into one run, so a listing written as twenty \
-                       spans reads back as fewer runs than that, and the comparison to make is \
-                       what colour sits at a given offset rather than how many runs there are. \
-                       Ask for one paragraph with `paragraph`, or a range with from and to; the \
-                       answer is capped and says which paragraph to ask from next."
+                       and size in points — so a paragraph nobody styled comes back as one bare run \
+                       rather than a wall of defaults. A paragraph that holds pictures lists their \
+                       labels in `images`, the same ones docs_list_paragraphs and docs_list_images \
+                       give. A picture has no runs of its own, so without that marker it reads here \
+                       exactly like a blank line. start and end count characters from the beginning \
+                       of the paragraph, the same units docs_insert_code takes for its spans, so \
+                       what comes out here can be fed back in. Two things to expect before you \
+                       conclude the document is wrong: Docs merges neighbouring characters that \
+                       share a style into one run, so a listing written as twenty spans reads back \
+                       as fewer runs than that, and the comparison to make is what colour sits at a \
+                       given offset rather than how many runs there are. Ask for one paragraph with \
+                       `paragraph`, or a range with from and to; the answer is capped and says \
+                       which paragraph to ask from next."
     )]
     async fn docs_read_formatting(
         &self,
@@ -938,6 +948,7 @@ impl Gmcp {
                 style: paragraph.style.clone(),
                 chars: paragraph.chars(),
                 in_table: paragraph.in_table,
+                images: paragraph.images.clone(),
                 runs,
             });
         }
