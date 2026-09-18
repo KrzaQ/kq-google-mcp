@@ -87,9 +87,13 @@ async fn a_message_is_read_with_its_text_attachments_and_inline_images() {
         ]
     );
 
-    // The PDF is an attachment with the id the attachments endpoint needs.
+    // The PDF is an attachment with the id the attachments endpoint needs,
+    // and with the part id that says where it sits. Gmail mints a new
+    // attachment id on every read and reports the same part id every time,
+    // so the part id is the one worth keeping.
     assert_eq!(message.attachments.len(), 1);
     let pdf = &message.attachments[0];
+    assert_eq!(pdf.part_id, "1");
     assert_eq!(pdf.id, "ANGjdJ8pdfQ3");
     assert_eq!(pdf.filename, "q3-figures.pdf");
     assert_eq!(pdf.mime_type, "application/pdf");
@@ -99,6 +103,7 @@ async fn a_message_is_read_with_its_text_attachments_and_inline_images() {
     // angle brackets stripped, because `cid:` in the body has none.
     assert_eq!(message.inline_images.len(), 1);
     let chart = &message.inline_images[0];
+    assert_eq!(chart.part_id, "0.1");
     assert_eq!(chart.content_id, "chart-q3@example.test");
     assert_eq!(chart.attachment_id.as_deref(), Some("ANGjdJ8chartPNG"));
     assert_eq!(chart.mime_type, "image/png");

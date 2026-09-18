@@ -8,6 +8,7 @@
 //! the wire) all live in that path.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::Body;
@@ -2520,6 +2521,61 @@ async fn gmail_server() -> MockServer {
     server
 }
 
+/// A `messages.get` that answers a different `attachmentId` every time, which
+/// is what Gmail does: the id is minted by the read rather than stored with
+/// the part. A fixture that answers one id for ever cannot tell a tool that
+/// resolves the file afresh from one that trusts what the caller kept.
+fn rotating_ids(
+    body: Value,
+    reads: Arc<AtomicUsize>,
+) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
+    move |_: &wiremock::Request| {
+        let read = reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut body = body.clone();
+        stamp_ids(&mut body, read);
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+/// Every `attachmentId` in the tree, marked with the read that minted it.
+fn stamp_ids(value: &mut Value, read: usize) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::String(id)) = fields.get_mut("attachmentId") {
+                *id = format!("{id}-read{read}");
+            }
+            for (_, child) in fields.iter_mut() {
+                stamp_ids(child, read);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|i| stamp_ids(i, read)),
+        _ => {}
+    }
+}
+
+/// The attachment id in the last fetch Gmail received.
+async fn last_fetched_id(server: &MockServer) -> String {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            r.url
+                .path()
+                .split("/attachments/")
+                .nth(1)
+                .map(str::to_string)
+        })
+        .next_back()
+        .expect("no attachment was fetched at all")
+}
+
+/// What the CSV's attachment id is after the reads made so far.
+fn newest_id(reads: &AtomicUsize) -> String {
+    format!("ANGjdJ8csvSep-read{}", reads.load(Ordering::SeqCst))
+}
+
 /// One person with everything connected, and an initialised client for a
 /// token with these scopes.
 async fn client(db: &Db, server: &MockServer, scopes: &[&str]) -> Client {
@@ -2884,16 +2940,237 @@ async fn gmail_attachment_text_extracts_the_attachment_and_says_what_it_cut() {
         cut["text"]
     );
 
-    // An attachment id the message does not have is refused with the ones it
-    // does, rather than fetched.
-    let missing = c
-        .refused(
+    // A name the message does not carry means the only file it has, because
+    // there is nothing else it could mean. A caller holding an attachment id
+    // from an earlier read is in exactly that position: Gmail has thrown the
+    // id away and the file is still there.
+    let only = c
+        .ok(
             "gmail_attachment_text",
             json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc",
-                   "attachment_id": "nope"}),
+                   "part": "ANGjdJ8csvFromLastWeek"}),
         )
         .await;
-    assert!(missing.contains("september-hours.csv"), "{missing}");
+    assert_eq!(only["filename"], "september-hours.csv");
+    drop(server);
+}
+
+/// Gmail mints a fresh `attachmentId` every time a message is read. Two reads
+/// of one message, seconds apart, named the same 762-byte CSV by two
+/// different ids, so the id a caller was holding was dead by the time it came
+/// back: the tool answered "message X has no part Y" and offered a third id
+/// that died just as fast. Four downloads failed in a row that way.
+///
+/// The fixture that answered one id for ever is what let this ship, so the
+/// mock here rotates the id on every read, as Gmail does.
+#[tokio::test]
+async fn an_attachment_is_reached_by_its_part_though_gmail_rotates_its_id() {
+    use base64::Engine;
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    Mock::given(http_method("GET"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5fc"))
+        .respond_with(rotating_ids(
+            fixture("gmail_message_csv.json"),
+            reads.clone(),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(
+            r"^/gmail/v1/users/me/messages/18f0a1b2c3d4e5fc/attachments/.+$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "size": CSV.len(),
+            "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(CSV),
+        })))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    // The measurement itself: one message, two reads, two ids — and one part.
+    let read = json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc"});
+    let first = c.ok("gmail_get_message", read.clone()).await;
+    let second = c.ok("gmail_get_message", read).await;
+    assert_ne!(
+        first["attachments"][0]["attachment_id"], second["attachments"][0]["attachment_id"],
+        "the mock has to rotate the id or this test guards nothing"
+    );
+    assert_eq!(first["attachments"][0]["part"], "1");
+    assert_eq!(second["attachments"][0]["part"], "1");
+
+    // The part id reaches the file, and Gmail is asked for it by the id of
+    // the read this call made, not by anything the caller held.
+    let by_part = c
+        .ok(
+            "gmail_attachment_text",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc", "part": "1"}),
+        )
+        .await;
+    assert_eq!(by_part["text"], CSV);
+    assert_eq!(last_fetched_id(&server).await, newest_id(&reads));
+
+    // So does the filename.
+    let by_name = c
+        .ok(
+            "gmail_attachment_text",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc",
+                   "part": "september-hours.csv"}),
+        )
+        .await;
+    assert_eq!(by_name["text"], CSV);
+    assert_eq!(last_fetched_id(&server).await, newest_id(&reads));
+
+    // And so does the dead id from the very first read, under its old name.
+    let stale = first["attachments"][0]["attachment_id"].as_str().unwrap();
+    let by_stale = c
+        .ok(
+            "gmail_attachment_text",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc",
+                   "attachment_id": stale}),
+        )
+        .await;
+    assert_eq!(by_stale["text"], CSV);
+    let fetched = last_fetched_id(&server).await;
+    assert_eq!(fetched, newest_id(&reads));
+    assert_ne!(fetched, stale, "the caller's id is never the one sent");
+
+    // A download link carries the same freshly resolved id.
+    let link = c
+        .ok(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fc", "part": "1"}),
+        )
+        .await;
+    let id = link["url"].as_str().unwrap().rsplit('/').next().unwrap();
+    let row = db.get_link(id).await.unwrap().unwrap();
+    assert_eq!(row.target["attachment_id"], newest_id(&reads));
+    drop(server);
+}
+
+/// Two files and one name: the right part is fetched. And a name that fits
+/// neither is refused with what the message does hold, by the handles that
+/// will still work in a minute.
+#[tokio::test]
+async fn a_file_among_several_is_named_by_its_filename_and_a_wrong_name_is_refused() {
+    use base64::Engine;
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    Mock::given(http_method("GET"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5fd"))
+        .respond_with(rotating_ids(
+            fixture("gmail_message_two_files.json"),
+            reads.clone(),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(
+            r"^/gmail/v1/users/me/messages/18f0a1b2c3d4e5fd/attachments/.+$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "size": 3,
+            "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("pdf"),
+        })))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    // The part id picks one of the two, with no single file to fall back on.
+    let first = c
+        .ok(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fd", "part": "1"}),
+        )
+        .await;
+    assert_eq!(first["filename"], "invoice-9001.pdf");
+
+    let second = c
+        .ok(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fd",
+                   "part": "invoice-9002.pdf"}),
+        )
+        .await;
+    assert_eq!(second["filename"], "invoice-9002.pdf");
+    let id = second["url"].as_str().unwrap().rsplit('/').next().unwrap();
+    let row = db.get_link(id).await.unwrap().unwrap();
+    assert_eq!(
+        row.target["attachment_id"],
+        format!("ANGjdJ8inv9002-read{}", reads.load(Ordering::SeqCst))
+    );
+
+    // Nothing to fall back on with two files, so the refusal has to teach.
+    let refused = c
+        .refused(
+            "gmail_attachment_link",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5fd",
+                   "part": "invoice-9003.pdf"}),
+        )
+        .await;
+    assert!(refused.contains("part 1"), "{refused}");
+    assert!(refused.contains("part 2"), "{refused}");
+    assert!(refused.contains("invoice-9001.pdf"), "{refused}");
+    assert!(refused.contains("invoice-9002.pdf"), "{refused}");
+    assert!(
+        refused.contains("new attachment id every time"),
+        "it says why an id from an earlier read is missing: {refused}"
+    );
+    drop(server);
+}
+
+/// A picture is named the same way as any other part, and an inline one keeps
+/// its `Content-ID`, which is the one name Gmail does not rotate either.
+#[tokio::test]
+async fn gmail_view_image_resolves_a_picture_against_the_read_it_just_made() {
+    use base64::Engine;
+    let db = Db::open_memory().await.unwrap();
+    let server = gmail_server().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    Mock::given(http_method("GET"))
+        .and(path("/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6"))
+        .respond_with(rotating_ids(
+            fixture("gmail_message_full.json"),
+            reads.clone(),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("GET"))
+        .and(path_regex(
+            r"^/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6/attachments/.+$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "size": png().len(),
+            "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(png()),
+        })))
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["gmail:read"]).await;
+
+    let listed = c
+        .ok(
+            "gmail_get_message",
+            json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6"}),
+        )
+        .await;
+    assert_eq!(listed["inline_images"][0]["part"], "0.1");
+
+    for named in ["0.1", "chart.png", "chart-q3@example.test"] {
+        let v = c
+            .call(
+                "gmail_view_image",
+                json!({"account": "work", "message_id": "18f0a1b2c3d4e5f6", "part": named}),
+            )
+            .await;
+        assert!(!is_error(&v), "{named}: {}", error_text(&v));
+        assert_eq!(
+            last_fetched_id(&server).await,
+            format!("ANGjdJ8chartPNG-read{}", reads.load(Ordering::SeqCst)),
+            "{named} was fetched by an id from an older read"
+        );
+    }
     drop(server);
 }
 

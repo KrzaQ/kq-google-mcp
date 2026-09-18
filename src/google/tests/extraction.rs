@@ -329,6 +329,7 @@ async fn a_gmail_attachment_is_fetched_and_extracted() {
     )
     .await;
     let attachment = gmail::Attachment {
+        part_id: "1".into(),
         id: "ANGjdJ8txt".into(),
         filename: "hello.txt".into(),
         mime_type: "text/plain".into(),

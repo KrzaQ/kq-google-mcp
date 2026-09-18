@@ -61,8 +61,11 @@ pub struct MessageParam {
 pub struct AttachmentParam {
     pub account: String,
     pub message_id: String,
-    /// The attachment id from the message's `attachments`
-    pub attachment_id: String,
+    /// Which file: the `part` of one of the message's `attachments` or
+    /// `inline_images`, or its filename. Gmail's `attachment_id` changes
+    /// every time the message is read; `part` does not
+    #[serde(alias = "attachment_id")]
+    pub part: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -70,7 +73,11 @@ pub struct AttachmentParam {
 pub struct AttachmentTextParam {
     pub account: String,
     pub message_id: String,
-    pub attachment_id: String,
+    /// Which file: the `part` of one of the message's `attachments` or
+    /// `inline_images`, or its filename. Gmail's `attachment_id` changes
+    /// every time the message is read; `part` does not
+    #[serde(alias = "attachment_id")]
+    pub part: String,
     /// Stop after this many characters, with a notice saying what was cut
     pub max_chars: Option<u32>,
 }
@@ -80,9 +87,12 @@ pub struct AttachmentTextParam {
 pub struct ViewImageParam {
     pub account: String,
     pub message_id: String,
-    /// The attachment id of a picture, or the `content_id` of an inline image
-    /// from the message's `inline_images`
-    pub attachment_id: String,
+    /// Which picture: the `part` of one of the message's `attachments` or
+    /// `inline_images`, the `content_id` of an inline one, or its filename.
+    /// Gmail's `attachment_id` changes every time the message is read;
+    /// `part` does not
+    #[serde(alias = "attachment_id")]
+    pub part: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -346,9 +356,14 @@ impl Gmcp {
     }
 
     #[tool(
-        description = "A download URL for one attachment. The link lives 15 minutes and may be \
-                       fetched a few times; give it to the person or curl it. For something you \
-                       want to read yourself, use gmail_attachment_text instead."
+        description = "A download URL for one attachment. Name the file by the `part` \
+                       gmail_get_message reports, or by its filename: Gmail mints a new \
+                       attachment id every time a message is read, so an id you are holding \
+                       names nothing, while a part id is the same on every read. The old name \
+                       of this argument, `attachment_id`, still works and takes the same three \
+                       things. The link lives 15 minutes and may be fetched a few times; give \
+                       it to the person or curl it. For something you want to read yourself, \
+                       use gmail_attachment_text instead."
     )]
     async fn gmail_attachment_link(
         &self,
@@ -360,7 +375,9 @@ impl Gmcp {
             gmail::get_message(&self.google()?.client, connection.id, p.message_id.trim())
                 .await
                 .map_err(|e| self.google_err_for(&connection, e))?;
-        let attachment = find_attachment(&message, p.attachment_id.trim())?;
+        // The id the link carries comes from the read this call just made,
+        // never from the caller: the one the caller passed is a read old.
+        let attachment = resolve_part(&message, p.part.trim())?;
         let minted = links::mint(
             &self.state,
             call.principal.user().id,
@@ -383,8 +400,12 @@ impl Gmcp {
 
     #[tool(
         description = "The text of one attachment, extracted on the server: PDF through poppler, \
-                       DOCX from its document part, CSV and plain text as they are. Long text is \
-                       cut with a notice saying how much was left out."
+                       DOCX from its document part, CSV and plain text as they are. Name the \
+                       file by the `part` gmail_get_message reports, or by its filename: Gmail \
+                       mints a new attachment id every time a message is read, so an id you are \
+                       holding names nothing, while a part id is the same on every read. The old \
+                       name of this argument, `attachment_id`, still works and takes the same \
+                       three things. Long text is cut with a notice saying how much was left out."
     )]
     async fn gmail_attachment_text(
         &self,
@@ -396,13 +417,13 @@ impl Gmcp {
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        let attachment = find_attachment(&message, p.attachment_id.trim())?;
+        let attachment = resolve_part(&message, p.part.trim())?;
         let extraction = text::gmail_attachment(
             client,
             connection.id,
             &self.extractor,
             &message.id,
-            &attachment,
+            &attachment.attachment(),
         )
         .await
         .map_err(|e| self.google_err_for(&connection, e))?;
@@ -419,9 +440,14 @@ impl Gmcp {
 
     #[tool(
         description = "One picture from a message, downscaled and returned as an image you can \
-                       look at. Takes an attachment id or the Content-ID of an inline image. The \
-                       picture is visible only in the turn it is fetched; call again to look \
-                       later. Formats this server cannot decode (HEIC, SVG) are link-only."
+                       look at. Name it by the `part` gmail_get_message reports, by the \
+                       Content-ID of an inline image, or by its filename: Gmail mints a new \
+                       attachment id every time a message is read, so an id you are holding \
+                       names nothing, while a part id is the same on every read. The old name \
+                       of this argument, `attachment_id`, still works and takes the same three \
+                       things. The picture is visible only in the turn it is fetched; call again \
+                       to look later. Formats this server cannot decode (HEIC, SVG) are \
+                       link-only."
     )]
     async fn gmail_view_image(
         &self,
@@ -433,7 +459,7 @@ impl Gmcp {
         let message = gmail::get_message(client, connection.id, p.message_id.trim())
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
-        let picture = find_picture(&message, p.attachment_id.trim())?;
+        let picture = find_picture(&message, p.part.trim())?;
         let bytes = gmail::get_attachment(client, connection.id, &message.id, &picture.id)
             .await
             .map_err(|e| self.google_err_for(&connection, e))?;
@@ -1127,51 +1153,147 @@ fn label_ids(labels: &[gmail::Label], wanted: &[String]) -> Result<Vec<String>, 
     Ok(out)
 }
 
-/// The part a caller named, wherever Gmail filed it.
+/// One fetchable part of a message, as the read that is happening right now
+/// reports it.
 ///
 /// A file attached inline — a PDF dropped into a reply, or a forwarded one —
-/// carries a `Content-ID`, so Gmail puts it among the inline parts rather
+/// carries a `Content-ID`, so Gmail files it among the inline parts rather
 /// than the attachments. It is still a file with an attachment id, and
-/// `messages.attachments.get` fetches it the same way, so refusing it here
-/// only meant a supplier's invoice could not be read at all. Anything with an
-/// attachment id is fetchable, whichever array it was listed under, and a
-/// `Content-ID` is taken too because that is the only name an HTML body uses.
-fn find_attachment(
-    message: &gmail::Message,
-    attachment_id: &str,
-) -> Result<gmail::Attachment, ErrorData> {
-    if let Some(found) = message.attachments.iter().find(|a| a.id == attachment_id) {
-        return Ok(found.clone());
+/// `messages.attachments.get` fetches it the same way, so both arrays are one
+/// list here.
+#[derive(Clone)]
+struct Part {
+    /// Where the part sits in the message. The same on every read.
+    part_id: String,
+    /// What the attachments endpoint is called with. Minted by the read this
+    /// value came from, and good for that read only.
+    id: String,
+    content_id: Option<String>,
+    filename: String,
+    mime_type: String,
+    size: u64,
+}
+
+impl Part {
+    /// What to call the part when talking to the caller about it.
+    fn name(&self) -> &str {
+        if !self.filename.is_empty() {
+            return &self.filename;
+        }
+        match &self.content_id {
+            Some(cid) if !cid.is_empty() => cid,
+            _ => &self.part_id,
+        }
     }
-    let inline = message.inline_images.iter().find(|i| {
-        i.attachment_id.as_deref() == Some(attachment_id) || i.content_id == attachment_id
+
+    fn attachment(&self) -> gmail::Attachment {
+        gmail::Attachment {
+            part_id: self.part_id.clone(),
+            id: self.id.clone(),
+            filename: self.filename.clone(),
+            mime_type: self.mime_type.clone(),
+            size: self.size,
+        }
+    }
+}
+
+/// Every part of the message a tool can fetch, attachments first.
+fn parts_of(message: &gmail::Message) -> Vec<Part> {
+    let attachments = message.attachments.iter().map(|a| Part {
+        part_id: a.part_id.clone(),
+        id: a.id.clone(),
+        content_id: None,
+        filename: a.filename.clone(),
+        mime_type: a.mime_type.clone(),
+        size: a.size,
     });
-    if let Some(inline) = inline
-        && let Some(id) = &inline.attachment_id
-    {
-        return Ok(gmail::Attachment {
-            id: id.clone(),
-            filename: inline.filename.clone(),
-            mime_type: inline.mime_type.clone(),
-            size: inline.size,
-        });
-    }
-    // Naming both counts matters: "it has none" was the old answer to a
-    // message carrying two inline files, which sent the caller looking for
-    // the wrong problem.
-    let names = |ids: Vec<String>| match ids.is_empty() {
-        true => "none".to_string(),
-        false => ids.join(", "),
+    let inline = message.inline_images.iter().map(|i| Part {
+        part_id: i.part_id.clone(),
+        id: i.attachment_id.clone().unwrap_or_default(),
+        content_id: Some(i.content_id.clone()),
+        filename: i.filename.clone(),
+        mime_type: i.mime_type.clone(),
+        size: i.size,
+    });
+    attachments.chain(inline).collect()
+}
+
+/// A `Content-ID` without its angle brackets, which is how a `cid:` in an
+/// HTML body spells it.
+fn bare_cid(value: &str) -> &str {
+    value.trim_start_matches('<').trim_end_matches('>')
+}
+
+/// The part a caller named, resolved against the message as it reads today.
+///
+/// Gmail mints a new attachment id every time a message is read, so the id a
+/// caller is holding names nothing by the time it comes back: the tools kept
+/// answering "message X has no part Y" and naming, as the alternative, a
+/// third id that was already dead as well. The part id is the same on every
+/// read, so it is the handle the tools hand out, and the fetch that follows
+/// uses the attachment id from the read this call just made.
+///
+/// Four names are tried in turn, and each one has to pick out exactly one
+/// part: the part id, a `Content-ID`, a filename, then an attachment id from
+/// this read. A message with one part and nothing matched is the last case —
+/// a caller holding a stale id means that file, and there is nothing else it
+/// could mean.
+fn resolve_part(message: &gmail::Message, wanted: &str) -> Result<Part, ErrorData> {
+    let parts = parts_of(message);
+    let one = |f: &dyn Fn(&Part) -> bool| {
+        let mut hits = parts.iter().filter(|p| f(p));
+        match (hits.next(), hits.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
     };
-    Err(bad(format!(
-        "message {} has no part {attachment_id:?}. Its {} attachments: {}. Its {} inline parts: {}",
+    let found = one(&|p| !p.part_id.is_empty() && p.part_id == wanted)
+        .or_else(|| {
+            one(&|p| match &p.content_id {
+                Some(cid) => !cid.is_empty() && bare_cid(cid) == bare_cid(wanted),
+                None => false,
+            })
+        })
+        .or_else(|| one(&|p| !p.filename.is_empty() && p.filename.eq_ignore_ascii_case(wanted)))
+        .or_else(|| one(&|p| !p.id.is_empty() && p.id == wanted))
+        .or_else(|| match parts.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        });
+    let part = found.ok_or_else(|| bad(no_such_part(message, wanted)))?;
+    if part.id.is_empty() {
+        return Err(bad(format!(
+            "{} is carried in the message body rather than stored as an attachment, so it \
+             cannot be fetched on its own",
+            part.name()
+        )));
+    }
+    Ok(part)
+}
+
+/// What the message does hold, by the handles that will still work in a
+/// minute.
+///
+/// Naming both counts matters: "it has none" was the old answer to a message
+/// carrying two inline files, which sent the caller looking for the wrong
+/// problem. Naming the part rather than the attachment id matters for the
+/// same reason: an id out of this listing is dead as soon as it is printed.
+fn no_such_part(message: &gmail::Message, wanted: &str) -> String {
+    let names = |listed: Vec<String>| match listed.is_empty() {
+        true => "none".to_string(),
+        false => listed.join(", "),
+    };
+    format!(
+        "message {} has no part {wanted:?}. Its {} attachments: {}. Its {} inline parts: {}. \
+         Gmail mints a new attachment id every time a message is read, so an id from an earlier \
+         read is not one of these; name the part or the filename.",
         message.id,
         message.attachments.len(),
         names(
             message
                 .attachments
                 .iter()
-                .map(|a| format!("{} ({})", a.filename, a.id))
+                .map(|a| format!("{} (part {})", a.filename, a.part_id))
                 .collect()
         ),
         message.inline_images.len(),
@@ -1180,87 +1302,29 @@ fn find_attachment(
                 .inline_images
                 .iter()
                 .map(|i| format!(
-                    "{} ({})",
-                    i.filename,
-                    i.attachment_id.as_deref().unwrap_or(&i.content_id)
+                    "{} (part {}, Content-ID {})",
+                    i.filename, i.part_id, i.content_id
                 ))
                 .collect()
         ),
-    )))
+    )
 }
 
-/// A picture named either by attachment id or by `Content-ID`, which is how an
-/// inline image in an HTML body is referred to.
-struct Picture {
-    id: String,
-    filename: String,
-    mime_type: String,
-}
-
-/// The named part, once it is established that it is a picture at all. An
-/// attachment id is an attachment id: nothing stops a model from handing over
-/// the PDF's, and downloading one to feed it to an image decoder would waste
-/// the fetch and answer with a decoding error instead of the two tools that do
-/// read a PDF. This mirrors `drive_view_image`.
-fn find_picture(message: &gmail::Message, wanted: &str) -> Result<Picture, ErrorData> {
-    let picture = locate_picture(message, wanted)?;
+/// The named part, once it is established that it is a picture at all. A
+/// caller names parts the same way for every tool: nothing stops a model from
+/// handing over the PDF, and downloading one to feed it to an image decoder
+/// would waste the fetch and answer with a decoding error instead of the two
+/// tools that do read a PDF. This mirrors `drive_view_image`.
+fn find_picture(message: &gmail::Message, wanted: &str) -> Result<Part, ErrorData> {
+    let picture = resolve_part(message, wanted)?;
     if !picture.mime_type.starts_with("image/") {
         return Err(refuse(format!(
             "{} is a {}, not a picture; use gmail_attachment_text or gmail_attachment_link",
-            picture.filename, picture.mime_type
+            picture.name(),
+            picture.mime_type
         )));
     }
     Ok(picture)
-}
-
-fn locate_picture(message: &gmail::Message, wanted: &str) -> Result<Picture, ErrorData> {
-    let bare = wanted.trim_start_matches('<').trim_end_matches('>');
-    if let Some(a) = message.attachments.iter().find(|a| a.id == wanted) {
-        return Ok(Picture {
-            id: a.id.clone(),
-            filename: a.filename.clone(),
-            mime_type: a.mime_type.clone(),
-        });
-    }
-    let inline = message.inline_images.iter().find(|i| {
-        i.attachment_id.as_deref() == Some(wanted)
-            || i.content_id.trim_start_matches('<').trim_end_matches('>') == bare
-    });
-    if let Some(i) = inline {
-        let id = i.attachment_id.clone().ok_or_else(|| {
-            bad(format!(
-                "the inline image {} is embedded in the message body rather than stored as an \
-                 attachment, so it cannot be fetched separately",
-                i.content_id
-            ))
-        })?;
-        return Ok(Picture {
-            id,
-            filename: i.filename.clone(),
-            mime_type: i.mime_type.clone(),
-        });
-    }
-    let mut known: Vec<String> = message
-        .attachments
-        .iter()
-        .filter(|a| a.mime_type.starts_with("image/"))
-        .map(|a| format!("{} ({})", a.filename, a.id))
-        .collect();
-    known.extend(
-        message
-            .inline_images
-            .iter()
-            .map(|i| format!("{} ({})", i.filename, i.content_id)),
-    );
-    Err(bad(format!(
-        "message {} has no picture {wanted:?}; it has {}",
-        message.id,
-        if known.is_empty() {
-            "none".to_string()
-        } else {
-            known.join(", ")
-        }
-    )))
 }
 
 /// A staged upload that cannot be read is this server's problem; every other

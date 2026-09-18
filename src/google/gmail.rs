@@ -14,6 +14,12 @@
 //! already carries, and raw is the only format that brings them in the same
 //! answer.
 //!
+//! A part has two names and only one of them lasts. Gmail mints a fresh
+//! `attachmentId` on every read of the same message, so an id is good for the
+//! fetch that follows this read and for nothing else. `partId` — "0", "1",
+//! "1.1" — is the same on every read, so it is the name this server hands out
+//! and takes back, and it resolves the fetch id again each time.
+//!
 //! `mail-parser` does the part of the job Google leaves alone: decoding header
 //! values (RFC 2047 words, address lists, identifier lists), taking a raw
 //! draft apart, and turning an HTML-only body into something readable.
@@ -101,7 +107,13 @@ impl Message {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Attachment {
-    /// What `messages.attachments.get` is called with.
+    /// Where the part sits in the message: "1", "0.1" and so on. Gmail
+    /// reports the same one on every read, so this is the handle a caller
+    /// keeps.
+    pub part_id: String,
+    /// What `messages.attachments.get` is called with. Gmail mints a new one
+    /// on every read of the message, so it is good for the fetch that follows
+    /// this read and dead by the next one.
     pub id: String,
     pub filename: String,
     pub mime_type: String,
@@ -112,6 +124,8 @@ pub struct Attachment {
 /// `Content-ID` because that is the only name the body uses for it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InlineImage {
+    /// Where the part sits in the message, as on an `Attachment`.
+    pub part_id: String,
     /// The `Content-ID` header with its angle brackets stripped.
     pub content_id: String,
     pub attachment_id: Option<String>,
@@ -953,6 +967,7 @@ struct WireMessage {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WirePart {
+    part_id: String,
     mime_type: String,
     filename: String,
     headers: Vec<WireHeader>,
@@ -1144,6 +1159,7 @@ impl WirePart {
                 .trim_end_matches('>');
             if !content_id.is_empty() {
                 out.inline.push(InlineImage {
+                    part_id: self.part_id.clone(),
                     content_id: content_id.to_string(),
                     attachment_id: self.body.attachment_id.clone(),
                     filename: self.filename.clone(),
@@ -1155,6 +1171,7 @@ impl WirePart {
         }
         if self.is_attachment() {
             out.attachments.push(Attachment {
+                part_id: self.part_id.clone(),
                 id: self.body.attachment_id.clone().unwrap_or_default(),
                 filename: self.filename.clone(),
                 mime_type: self.mime_type.clone(),

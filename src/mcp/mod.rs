@@ -119,6 +119,9 @@ fn instructions(portal: &str) -> String {
          15 minutes and may be fetched a few times. Give it to the person, or curl it. For text \
          there is no need for a link at all: gmail_attachment_text and drive_read_text extract it \
          server-side.\n\
+         A file inside a message is named by the `part` gmail_get_message reports for it, or by \
+         its filename. Gmail mints a new attachment id every time a message is read, so an id you \
+         noted a moment ago names nothing; a part id is the same on every read.\n\
          gmail_view_image, drive_view_image and docs_view_image return the picture itself, \
          downscaled. It is only \
          visible in the turn it was fetched; to look again later, call the tool again. In Claude \

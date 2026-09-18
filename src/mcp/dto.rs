@@ -154,8 +154,8 @@ pub struct MessageOut {
     /// from the HTML one.
     pub text_from_html: bool,
     pub attachments: Vec<AttachmentOut>,
-    /// Pictures embedded in the body. `gmail_view_image` takes either the
-    /// `attachment_id` or the `content_id` of one of these.
+    /// Pictures embedded in the body. `gmail_view_image` takes the `part` of
+    /// one of these, or its `content_id`.
     pub inline_images: Vec<InlineImageOut>,
 }
 
@@ -183,6 +183,12 @@ impl MessageOut {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AttachmentOut {
+    /// Where the file sits in the message. This is the handle to keep: it is
+    /// the same on every read, and it is what the attachment tools take.
+    pub part: String,
+    /// What Gmail's own attachments endpoint is called with. Gmail mints a
+    /// new one every time the message is read, so it is worthless a minute
+    /// from now; `part` is not.
     pub attachment_id: String,
     pub filename: String,
     pub mime_type: String,
@@ -192,6 +198,7 @@ pub struct AttachmentOut {
 impl From<&gmail::Attachment> for AttachmentOut {
     fn from(a: &gmail::Attachment) -> Self {
         Self {
+            part: a.part_id.clone(),
             attachment_id: a.id.clone(),
             filename: a.filename.clone(),
             mime_type: a.mime_type.clone(),
@@ -202,7 +209,10 @@ impl From<&gmail::Attachment> for AttachmentOut {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct InlineImageOut {
+    /// Where the picture sits in the message, as on an attachment.
+    pub part: String,
     pub content_id: String,
+    /// Fresh from this read only. See `AttachmentOut`.
     pub attachment_id: Option<String>,
     pub filename: String,
     pub mime_type: String,
@@ -212,6 +222,7 @@ pub struct InlineImageOut {
 impl From<&gmail::InlineImage> for InlineImageOut {
     fn from(i: &gmail::InlineImage) -> Self {
         Self {
+            part: i.part_id.clone(),
             content_id: i.content_id.clone(),
             attachment_id: i.attachment_id.clone(),
             filename: i.filename.clone(),
