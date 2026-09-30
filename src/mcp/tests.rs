@@ -6599,6 +6599,25 @@ async fn a_calendar_write_carries_the_person_s_zone_beside_the_time() {
     drop(server);
 }
 
+/// A listing says how long it may be cached and by whom.
+///
+/// Protocol 2026-07-28 makes both fields required, and a client on that
+/// version rejects a listing without them outright: the server looked broken
+/// to every Claude Code session once mcp-remote 0.14.3 started validating
+/// them. The list differs per token, so it must never be shared across
+/// authorization contexts.
+#[tokio::test]
+async fn a_tool_listing_says_it_is_private_and_not_to_be_cached() {
+    let db = Db::open_memory().await.unwrap();
+    let (_, _, secret) = one_of_everything(&db, &["gmail:read"], ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, None).await, secret);
+    c.initialize().await;
+    let (status, v) = c.rpc("tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["ttlMs"], json!(0), "{v}");
+    assert_eq!(v["result"]["cacheScope"], json!("private"), "{v}");
+}
+
 /// What a tool publishes and what it accepts must be the same list.
 ///
 /// A client discovers arguments from the schema, so a field the struct takes

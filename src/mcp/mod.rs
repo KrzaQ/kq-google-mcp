@@ -43,8 +43,8 @@ use rmcp::ServerHandler;
 use rmcp::handler::server::tool::{Extension, ToolRouter};
 use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    CacheScope, CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars;
 use rmcp::service::RequestContext;
@@ -485,7 +485,15 @@ impl ServerHandler for Gmcp {
             .into_iter()
             .filter(|t| allowed.contains(&t.name.as_ref()))
             .collect();
-        Ok(ListToolsResult::with_all_items(tools))
+        // Protocol 2026-07-28 requires every listing to say how long it may be
+        // cached and by whom, and rmcp leaves both unset when a server builds
+        // the result itself, as this one must to filter by token. A client on
+        // that version refuses a listing without them, so the whole server
+        // looks broken to it. Private because the list depends on the token
+        // that asked; zero because a deploy can change it at any moment.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     /// The scope check the listing already made, made again — a client may
