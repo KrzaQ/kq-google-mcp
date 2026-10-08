@@ -533,6 +533,8 @@ pub struct Revisable {
     /// The revision that holds the content now. Drive reports it only for a
     /// file with binary content, so a Google Doc has none.
     pub head_revision_id: Option<String>,
+    /// True when the file is in the bin.
+    pub trashed: bool,
 }
 
 /// `files.get` for a file whose content is about to be replaced: the fields a
@@ -540,12 +542,14 @@ pub struct Revisable {
 pub async fn revisable(client: &Client, connection_id: i64, file_id: &str) -> Result<Revisable> {
     let request = client
         .get(&format!("drive/v3/files/{}", urlencode(file_id)))?
-        .query(&[("fields", format!("{FILE_FIELDS},headRevisionId"))]);
+        .query(&[("fields", format!("{FILE_FIELDS},headRevisionId,trashed"))]);
     let mut wire: WireFile = client.json(connection_id, request).await?;
     let head_revision_id = wire.head_revision_id.take().filter(|r| !r.is_empty());
+    let trashed = wire.trashed;
     Ok(Revisable {
         file: wire.into(),
         head_revision_id,
+        trashed,
     })
 }
 
@@ -699,6 +703,8 @@ struct WireFile {
     owners: Vec<WireOwner>,
     /// Present only when it was asked for, as [`revisable`] does.
     head_revision_id: Option<String>,
+    /// Present only when it was asked for, as [`revisable`] does.
+    trashed: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

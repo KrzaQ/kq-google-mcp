@@ -8313,6 +8313,42 @@ async fn a_type_mismatch_and_a_google_file_are_refused_before_any_write() {
     drop(server);
 }
 
+/// A file in the bin is one the person threw away, so its content is not
+/// replaced and nothing in its history is pinned.
+#[tokio::test]
+async fn a_file_in_the_bin_is_refused_before_any_write() {
+    const BINNED: &str = "1BiNnEdFiLeIdExAmPlE0123456789abcd";
+    let db = Db::open_memory().await.unwrap();
+    let server = revising(0, 0).await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{BINNED}"),
+        json!({"id": BINNED, "name": "Faktura 02-2026.pdf", "mimeType": "application/pdf",
+               "modifiedTime": "2026-09-30T08:15:00.000Z", "parents": [FOLDER],
+               "size": "16", "headRevisionId": "0B-head", "trashed": true}),
+    )
+    .await;
+    let mut a = uploading(&db, &server).await;
+    let pdf = upload_file(&mut a, "Faktura 02-2026.pdf", INVOICE).await;
+
+    for confirmed in [false, true] {
+        let refused = a
+            .client
+            .refused(
+                "drive_update_file",
+                json!({"account": "work", "file_id": BINNED, "upload_id": pdf["upload_id"],
+                       "confirmed": confirmed}),
+            )
+            .await;
+        assert!(refused.contains("in the bin"), "{refused}");
+        assert!(refused.contains("Nothing was changed"), "{refused}");
+    }
+    assert!(drive_writes(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
 /// A preview names the file, its folder by name, both sizes, the current
 /// modified time and the new name, says where the old version stays, and
 /// pins nothing.
@@ -8419,7 +8455,8 @@ async fn a_file_at_its_keep_forever_limit_is_refused_before_any_write() {
         );
         assert!(refused.contains("already has 200"), "{refused}");
         assert!(refused.contains("Manage versions"), "{refused}");
-        assert!(refused.contains("unpins"), "{refused}");
+        assert!(refused.contains("deletes an old"), "{refused}");
+        assert!(!refused.contains("unpin"), "{refused}");
         assert!(refused.contains("still staged"), "{refused}");
     }
     assert!(drive_writes(&server).await.is_empty());

@@ -820,6 +820,17 @@ impl Gmcp {
         let file = read.file;
         let unchanged =
             format!("Nothing was changed, and the upload `{upload_id}` is still staged");
+        // A file in the bin is one the person threw away. Rewriting it in
+        // place would put content where they no longer look, and pin a version
+        // in a file they meant to be rid of.
+        if read.trashed {
+            return Err(refuse(format!(
+                "{:?} is in the bin, so this server will not replace its content. {unchanged}. \
+                 The person restores it in Drive first, or the upload is stored as a new file \
+                 with drive_upload",
+                file.name
+            )));
+        }
         if file.is_google_native() {
             return Err(refuse(format!(
                 "{:?} is a {}, a Google file with no file content of its own to replace. A \
@@ -939,8 +950,8 @@ impl Gmcp {
                 if kept.more {
                     note.push_str(&format!(
                         " The file has more versions than one read lists, so it may have \
-                         reached the limit of {} versions kept forever; the person can unpin \
-                         or delete an old version under Manage versions in Drive.",
+                         reached the limit of {} versions kept forever; the person can delete \
+                         an old version under Manage versions in Drive.",
                         drive::KEEP_FOREVER_MAX
                     ));
                 }
@@ -1062,8 +1073,9 @@ fn limit_refusal(file: &drive::FileMeta, kept: usize, upload_id: &str) -> String
         "Drive keeps at most {} versions of one file forever, and {:?} already has {kept}. This \
          server replaces a file's content only after it has marked the current version keep \
          forever, so nothing was replaced, and the upload `{upload_id}` is still staged. To make \
-         room, the person opens Manage versions for this file in Drive and unpins or deletes an \
-         old version kept forever; this server does neither. To keep both, store the upload as \
+         room, the person opens Manage versions for this file in Drive and deletes an old \
+         version kept forever, which Drive does not let anyone set back to purgeable; this \
+         server deletes nothing. To keep both, store the upload as \
          a new file with drive_upload",
         drive::KEEP_FOREVER_MAX,
         file.name
