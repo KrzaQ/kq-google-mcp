@@ -1,6 +1,6 @@
 //! Drive: search, metadata, download, export, the two file creations that
-//! make a Doc out of markdown and a Sheet out of CSV, and the one that stores
-//! a file as it is.
+//! make a Doc out of markdown and a Sheet out of CSV, the one that stores a
+//! file as it is, and the folders a file goes into.
 //!
 //! Shared drives are deliberately out of this release: every call goes against
 //! the person's own corpus, so `supportsAllDrives` is never set and a file
@@ -245,12 +245,88 @@ pub async fn folder(client: &Client, connection_id: i64, folder_id: &str) -> Res
         .get(&format!("drive/v3/files/{}", urlencode(folder_id)))?
         .query(&[("fields", FOLDER_FIELDS)]);
     let wire: WireFolder = client.json(connection_id, request).await?;
-    Ok(Folder {
-        id: wire.id,
-        name: wire.name,
-        mime_type: wire.mime_type,
-        trashed: wire.trashed,
+    Ok(wire.into())
+}
+
+/// How many folders of one name a lookup reads. One is the answer a path
+/// wants and two already refuse it; the rest are only there to be named.
+const NAMED_FOLDERS_PAGE: u32 = 10;
+
+/// The folders of one name directly inside one parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedFolders {
+    /// Oldest first.
+    pub folders: Vec<Folder>,
+    /// True when Drive had more than one page of them.
+    pub more: bool,
+}
+
+/// The `q` that finds the folders called `name` directly inside `parent`, or
+/// inside the root of My Drive when there is no parent. A folder in the bin
+/// is never found: a path that went through one would put the file in the bin
+/// too.
+pub fn named_folder_query(parent: Option<&str>, name: &str) -> String {
+    format!(
+        "name = '{}' and mimeType = '{FOLDER_MIME}' and '{}' in parents and trashed = false",
+        escape(name),
+        escape(parent.unwrap_or("root"))
+    )
+}
+
+/// `files.list` for the folders called `name` directly inside `parent`, or
+/// inside the root of My Drive when `parent` is `None`.
+///
+/// Drive allows any number of folders with one name in one place, so the
+/// answer is a list. The reference does not say whether `name =` ignores
+/// case, so only a folder whose name is exactly `name` is kept.
+pub async fn folders_named(
+    client: &Client,
+    connection_id: i64,
+    parent: Option<&str>,
+    name: &str,
+) -> Result<NamedFolders> {
+    let request = client.get("drive/v3/files")?.query(&[
+        ("q", named_folder_query(parent, name)),
+        ("fields", format!("files({FOLDER_FIELDS}),nextPageToken")),
+        ("pageSize", NAMED_FOLDERS_PAGE.to_string()),
+        ("orderBy", "createdTime".to_string()),
+    ]);
+    let wire: WireFolderList = client.json(connection_id, request).await?;
+    Ok(NamedFolders {
+        more: wire.next_page_token.is_some(),
+        folders: wire
+            .files
+            .into_iter()
+            .filter(|f| f.name == name && f.mime_type == FOLDER_MIME && !f.trashed)
+            .map(Into::into)
+            .collect(),
     })
+}
+
+/// `files.create` for a folder: metadata only, with no media part, so it goes
+/// to the metadata endpoint and not the upload one. `parent` absent puts the
+/// folder in the root of My Drive. Drive never refuses a second folder of the
+/// same name: it holds both.
+pub async fn create_folder(
+    client: &Client,
+    connection_id: i64,
+    name: &str,
+    parent: Option<&str>,
+) -> Result<FileMeta> {
+    let mut metadata = serde_json::json!({
+        "name": name,
+        "mimeType": FOLDER_MIME,
+    });
+    // Left out rather than sent empty, for the reason `create` gives.
+    if let Some(id) = parent {
+        metadata["parents"] = serde_json::json!([id]);
+    }
+    let request = client
+        .post("drive/v3/files")?
+        .query(&[("fields", FILE_FIELDS)])
+        .json(&metadata);
+    let wire: WireFile = client.json(connection_id, request).await?;
+    Ok(wire.into())
 }
 
 /// One comment thread in the margin of a file, with the replies under it.
@@ -493,6 +569,24 @@ struct WireFolder {
     name: String,
     mime_type: String,
     trashed: bool,
+}
+
+impl From<WireFolder> for Folder {
+    fn from(w: WireFolder) -> Self {
+        Folder {
+            id: w.id,
+            name: w.name,
+            mime_type: w.mime_type,
+            trashed: w.trashed,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireFolderList {
+    files: Vec<WireFolder>,
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

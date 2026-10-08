@@ -6787,6 +6787,10 @@ async fn only_a_drive_write_token_sees_the_upload_tools() {
         "{names:?}"
     );
     assert!(!names.contains(&"drive_upload".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"drive_create_folder".to_string()),
+        "{names:?}"
+    );
     assert!(names.contains(&"drive_search".to_string()), "{names:?}");
     // And a call made anyway names the scope it lacks.
     let refused = c
@@ -6802,7 +6806,17 @@ async fn only_a_drive_write_token_sees_the_upload_tools() {
         "{names:?}"
     );
     assert!(names.contains(&"drive_upload".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"drive_create_folder".to_string()),
+        "{names:?}"
+    );
     let tools = c.tools().await;
+    let create = tools
+        .iter()
+        .find(|t| t["name"] == "drive_create_folder")
+        .unwrap();
+    let required = create["inputSchema"]["required"].as_array().unwrap();
+    assert!(required.contains(&json!("confirmed")), "{create}");
     let upload = tools.iter().find(|t| t["name"] == "drive_upload").unwrap();
     let required = upload["inputSchema"]["required"].as_array().unwrap();
     assert!(required.contains(&json!("confirmed")), "{upload}");
@@ -7142,5 +7156,230 @@ async fn somebody_elses_upload_is_not_stored_in_drive() {
     }
     assert!(drive_uploads(&server).await.is_empty());
     assert_eq!(anna.staged_files(), 1, "and it is still Anna's");
+    drop(server);
+}
+
+// ----- a folder in Drive -----------------------------------------------------
+
+/// The folder drive_folder_created.json describes, made in the root.
+const NEW_TOPOLOGIA: &str = "1ToPoLoGiAnEwFoLdErIdExAmPlE012345";
+/// The folder drive_subfolder_created.json describes, made inside it.
+const NEW_NOTATKI: &str = "1NoTaTkInEwFoLdErIdExAmPlE01234567";
+/// The folders drive_folders_one.json and drive_folders_two.json describe:
+/// folders called "topologia" that were already in the root.
+const OLD_TOPOLOGIA: &str = "1ToPoLoGiAhAnDmAdEiDeXaMpLe0123456";
+const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+/// The `q` that looks for a folder called `name` directly inside `parent`.
+fn named(parent: &str, name: &str) -> String {
+    format!(
+        "name = '{name}' and mimeType = '{FOLDER_MIME}' and '{parent}' in parents and trashed = false"
+    )
+}
+
+/// Answer a lookup for the folders called `name` inside `parent` with a
+/// fixture. A lookup the test did not mount matches nothing, and wiremock
+/// answers it 404.
+async fn mount_lookup(server: &MockServer, parent: &str, name: &str, answer: &str) {
+    Mock::given(http_method("GET"))
+        .and(path("/drive/v3/files"))
+        .and(query_param("q", named(parent, name)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture(answer)))
+        .named(format!("the folders called {name} in {parent}"))
+        .mount(server)
+        .await;
+}
+
+/// Answer the creation of a folder called `name` with a fixture.
+async fn mount_create(server: &MockServer, name: &str, answer: &str) {
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .and(wiremock::matchers::body_partial_json(json!({"name": name})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture(answer)))
+        .named(format!("files.create {name}"))
+        .mount(server)
+        .await;
+}
+
+/// The folder a test names as a parent by id: the one
+/// drive_folder_created.json describes, as `files.get` answers it.
+async fn mount_new_topologia(server: &MockServer) {
+    mount(
+        server,
+        "GET",
+        &format!("/drive/v3/files/{NEW_TOPOLOGIA}"),
+        json!({"id": NEW_TOPOLOGIA, "name": "topologia", "mimeType": FOLDER_MIME,
+               "trashed": false}),
+    )
+    .await;
+}
+
+/// Every folder Drive was asked to create, oldest first, as the JSON body
+/// it was sent.
+async fn folders_created(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/drive/v3/files")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// A preview names the parent by its name, says whether a folder of that
+/// name is already there, and creates nothing.
+#[tokio::test]
+async fn drive_create_folder_previews_the_parent_by_name_and_creates_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_new_topologia(&server).await;
+    mount_lookup(&server, NEW_TOPOLOGIA, "notatki", "drive_folders_none.json").await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_one.json").await;
+    let mut c = client(&db, &server, &["drive:read", "drive:write"]).await;
+
+    let shown = c
+        .ok(
+            "drive_create_folder",
+            json!({"account": "work", "name": " notatki ", "parent": NEW_TOPOLOGIA,
+                   "confirmed": false}),
+        )
+        .await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("called \"notatki\""), "{lines}");
+    assert!(
+        lines.contains(&format!("the folder \"topologia\" ({NEW_TOPOLOGIA})")),
+        "{lines}"
+    );
+    assert!(lines.contains("no folder called \"notatki\""), "{lines}");
+
+    // In the root, beside a folder of the same name: the preview says so and
+    // names the one already there.
+    let shown = c
+        .ok(
+            "drive_create_folder",
+            json!({"account": "work", "name": "topologia", "confirmed": false}),
+        )
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("root of My Drive"), "{lines}");
+    assert!(lines.contains("already there"), "{lines}");
+    assert!(lines.contains(OLD_TOPOLOGIA), "{lines}");
+
+    assert!(folders_created(&server).await.is_empty());
+    drop(server);
+}
+
+/// One `files.create`, with the folder type, the name and the parent and
+/// nothing else, and an answer that says where the folder is.
+#[tokio::test]
+async fn drive_create_folder_creates_one_folder_in_the_parent_and_answers_where() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_new_topologia(&server).await;
+    mount_create(&server, "notatki", "drive_subfolder_created.json").await;
+    let mut c = client(&db, &server, &["drive:read", "drive:write"]).await;
+
+    let out = c
+        .ok(
+            "drive_create_folder",
+            json!({"account": "work", "name": "notatki", "parent": NEW_TOPOLOGIA,
+                   "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["folder_id"], NEW_NOTATKI);
+    assert_eq!(out["name"], "notatki");
+    assert_eq!(out["parent"], "topologia");
+    assert_eq!(out["parent_id"], NEW_TOPOLOGIA);
+    assert_eq!(
+        out["url"],
+        format!("https://drive.google.com/drive/folders/{NEW_NOTATKI}")
+    );
+
+    assert_eq!(
+        folders_created(&server).await,
+        [json!({"name": "notatki", "mimeType": FOLDER_MIME, "parents": [NEW_TOPOLOGIA]})]
+    );
+    assert!(
+        drive_uploads(&server).await.is_empty(),
+        "a folder has no media"
+    );
+    drop(server);
+}
+
+/// Left out, the parent is the root of My Drive and is left out of the
+/// metadata too.
+#[tokio::test]
+async fn drive_create_folder_without_a_parent_goes_to_the_root() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_create(&server, "topologia", "drive_folder_created.json").await;
+    let mut c = client(&db, &server, &["drive:read", "drive:write"]).await;
+
+    let out = c
+        .ok(
+            "drive_create_folder",
+            json!({"account": "work", "name": "topologia", "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["folder_id"], NEW_TOPOLOGIA);
+    assert_eq!(out["parent"], "My Drive");
+    assert_eq!(
+        folders_created(&server).await,
+        [json!({"name": "topologia", "mimeType": FOLDER_MIME})]
+    );
+
+    let refused = c
+        .refused(
+            "drive_create_folder",
+            json!({"account": "work", "name": "  ", "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("name is empty"), "{refused}");
+    assert_eq!(folders_created(&server).await.len(), 1);
+    drop(server);
+}
+
+/// A parent Drive will not write into is refused in this server's words,
+/// and the folder is never made in the root instead.
+#[tokio::test]
+async fn a_parent_drive_refuses_creates_no_folder_anywhere() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{FOLDER}"),
+        fixture("drive_folder.json"),
+    )
+    .await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(fixture("drive_error_insufficient_permissions.json")),
+        )
+        .expect(1)
+        .named("the one create, refused")
+        .mount(&server)
+        .await;
+    let mut c = client(&db, &server, &["drive:read", "drive:write"]).await;
+
+    let refused = c
+        .refused(
+            "drive_create_folder",
+            json!({"account": "work", "name": "notatki", "parent": FOLDER, "confirmed": true}),
+        )
+        .await;
+    assert!(
+        refused.contains("could not be written to with the access this server holds"),
+        "{refused}"
+    );
+    assert!(refused.contains("\"Faktury 2026\""), "{refused}");
+    assert!(refused.contains("Leave `parent` out"), "{refused}");
+    let sent = folders_created(&server).await;
+    assert_eq!(sent.len(), 1, "retried");
+    assert_eq!(sent[0]["parents"], json!([FOLDER]));
     drop(server);
 }

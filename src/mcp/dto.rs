@@ -489,6 +489,22 @@ pub struct DriveUploadOut {
     pub written: String,
 }
 
+/// A folder drive_create_folder has created, and where.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DriveFolderOut {
+    pub account: String,
+    pub folder_id: String,
+    pub name: String,
+    /// The folder it is in, by name: "My Drive" for the root.
+    pub parent: String,
+    /// The parent's id, as Drive reports it.
+    pub parent_id: Option<String>,
+    /// Where the person opens the folder in Drive.
+    pub url: String,
+    /// What happened, in one line the model can repeat to the person.
+    pub written: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CommentsOut {
     pub account: String,

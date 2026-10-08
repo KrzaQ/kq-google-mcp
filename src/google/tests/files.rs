@@ -385,3 +385,132 @@ async fn comments_are_asked_for_with_the_replies_and_the_quoted_text() {
     // Nothing here asks for the deleted comments, whose content Google strips.
     assert!(!query.contains_key("includeDeleted"));
 }
+
+#[tokio::test]
+async fn a_folder_is_created_with_the_folder_type_and_its_parent_and_nothing_else() {
+    let h = harness().await;
+    h.mount_json(
+        "POST",
+        "/drive/v3/files",
+        fixture("drive_subfolder_created.json"),
+    )
+    .await;
+
+    let folder = drive::create_folder(
+        &h.client,
+        CONNECTION,
+        "notatki",
+        Some("1ToPoLoGiAnEwFoLdErIdExAmPlE012345"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(folder.id, "1NoTaTkInEwFoLdErIdExAmPlE01234567");
+    assert_eq!(folder.mime_type, drive::FOLDER_MIME);
+    assert_eq!(folder.parents, ["1ToPoLoGiAnEwFoLdErIdExAmPlE012345"]);
+    assert!(folder.size.is_none(), "a folder has no bytes");
+
+    // The metadata endpoint, with a JSON body and no media part: the three
+    // fields a folder needs, and nothing else.
+    let request = h.last("POST", "/drive/v3/files").await;
+    assert!(
+        request.headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"),
+        "{:?}",
+        request.headers
+    );
+    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+    assert!(!query.contains_key("uploadType"), "{query:?}");
+    assert!(!query.contains_key("supportsAllDrives"), "{query:?}");
+    assert_eq!(
+        h.last_body("POST", "/drive/v3/files").await,
+        json!({
+            "name": "notatki",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": ["1ToPoLoGiAnEwFoLdErIdExAmPlE012345"],
+        })
+    );
+
+    // In the root, the parent is left out rather than sent empty.
+    drive::create_folder(&h.client, CONNECTION, "topologia", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.last_body("POST", "/drive/v3/files").await,
+        json!({"name": "topologia", "mimeType": "application/vnd.google-apps.folder"})
+    );
+    assert!(
+        h.requests()
+            .await
+            .iter()
+            .all(|r| !r.url.path().starts_with("/upload/")),
+        "a folder has no media to upload"
+    );
+}
+
+#[test]
+fn a_folder_name_with_an_apostrophe_cannot_end_the_query() {
+    assert_eq!(
+        drive::named_folder_query(Some("1PaReNt"), r"Bob's \ notes"),
+        r"name = 'Bob\'s \\ notes' and mimeType = 'application/vnd.google-apps.folder' and '1PaReNt' in parents and trashed = false"
+    );
+    assert_eq!(
+        drive::named_folder_query(None, "topologia"),
+        "name = 'topologia' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false"
+    );
+}
+
+#[tokio::test]
+async fn folders_of_one_name_are_all_found_and_only_that_name_is_kept() {
+    let h = harness().await;
+    let mut two = fixture("drive_folders_two.json");
+    // A folder whose name differs only in case, should Drive's `=` match it.
+    two["files"].as_array_mut().unwrap().push(json!({
+        "id": "1ToPoLoGiAcApItAlIdExAmPlE01234567",
+        "name": "Topologia",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": false
+    }));
+    h.mount_json("GET", "/drive/v3/files", two).await;
+
+    let found = drive::folders_named(&h.client, CONNECTION, None, "topologia")
+        .await
+        .unwrap();
+    assert_eq!(
+        found
+            .folders
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "1ToPoLoGiAhAnDmAdEiDeXaMpLe0123456",
+            "1ToPoLoGiAsEcOnDiDeXaMpLe012345678"
+        ]
+    );
+    assert!(!found.more);
+
+    let query: std::collections::HashMap<_, _> = h
+        .last("GET", "/drive/v3/files")
+        .await
+        .url
+        .query_pairs()
+        .into_owned()
+        .collect();
+    assert_eq!(
+        query["q"],
+        "name = 'topologia' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false"
+    );
+    assert!(query["fields"].contains("trashed"), "{query:?}");
+    assert!(query["fields"].contains("nextPageToken"), "{query:?}");
+    assert!(!query.contains_key("corpora"));
+
+    // An empty answer is no folder at all.
+    let h = harness().await;
+    h.mount_json("GET", "/drive/v3/files", fixture("drive_folders_none.json"))
+        .await;
+    let found = drive::folders_named(&h.client, CONNECTION, Some("1PaReNt"), "notatki")
+        .await
+        .unwrap();
+    assert!(found.folders.is_empty());
+}

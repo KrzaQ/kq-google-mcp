@@ -553,7 +553,7 @@ async fn the_scope_registry_says_what_each_level_unlocks() {
     assert_eq!(drive["levels"][1]["requires"], "drive:read");
     assert_eq!(
         drive["levels"][1]["tools"],
-        json!(["drive_upload_link", "drive_upload"])
+        json!(["drive_upload_link", "drive_upload", "drive_create_folder"])
     );
     assert_eq!(b["delegate"]["scope"], "delegate");
     assert!(

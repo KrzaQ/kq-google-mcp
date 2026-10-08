@@ -94,7 +94,9 @@ fn instructions(portal: &str) -> String {
          upload_id to docs_insert_image.\n\
          A file goes into Drive the same way: drive_upload_link, then the POST, then \
          drive_upload, which stores it as it is. An upload never replaces a file of the same \
-         name, and a folder Drive refuses is refused here too: the file is put nowhere else.\n\
+         name, and a folder Drive refuses is refused here too: the file is put nowhere else. \
+         drive_create_folder makes a folder, and a folder made here always takes files from \
+         this server, where one the person made by hand may not.\n\
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \

@@ -1,12 +1,12 @@
 //! The Drive tools: finding files, describing them, getting at their contents
 //! either as text a model can read or as a short-lived link a person can
-//! click, and storing a file the caller uploaded.
+//! click, storing a file the caller uploaded, and making a folder.
 //!
-//! drive_upload is the one write here, and it only ever adds a file: it never
-//! changes, moves or replaces one that is there. It takes `confirmed` like
-//! every other write, and it refuses rather than put a file anywhere but the
-//! folder it was asked for. The two tools that create a Doc or a Sheet live in
-//! `docs` and `sheets`.
+//! drive_upload and drive_create_folder are the writes here, and they only
+//! ever add: neither changes, moves or replaces what is there. They take
+//! `confirmed` like every other write, and they refuse rather than put
+//! anything anywhere but the folder they were asked for. The two tools that
+//! create a Doc or a Sheet live in `docs` and `sheets`.
 
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -113,6 +113,21 @@ pub struct DriveUploadParam {
     pub name: Option<String>,
     /// Must be true to write. Call with false first and show the person the
     /// name, the size and the folder.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriveCreateFolderParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// What to call the new folder, e.g. "topologia"
+    pub name: String,
+    /// The id of the Drive folder to create it in, as drive_search reports
+    /// it. Left out, the folder goes to the root of My Drive
+    pub parent: Option<String>,
+    /// Must be true to write. Call with false first and show the person the
+    /// name and where the folder goes.
     pub confirmed: bool,
 }
 
@@ -454,7 +469,7 @@ impl Gmcp {
             .to_string();
         let folder = match p.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
             None => None,
-            Some(id) => Some(self.destination(&connection, id).await?),
+            Some(id) => Some(self.destination(&connection, id, Putting::File).await?),
         };
         let size = staged.bytes.len();
         let into = match &folder {
@@ -547,25 +562,131 @@ impl Gmcp {
             folder: folder_name,
         })))
     }
+
+    #[tool(
+        description = "Create one folder in Google Drive: in `parent`, the id of a Drive folder \
+                       as drive_search reports it, or in the root of My Drive when `parent` is \
+                       left out. Answers the new folder's id, name, parent and Drive URL. Pass \
+                       that id as `folder` to drive_upload, or as `parent` here to go one level \
+                       deeper. This server's access to Drive covers the files it created itself, \
+                       so a folder made here is one it can always put files into, while a folder \
+                       the person made by hand may refuse them. Drive holds two folders of one \
+                       name side by side, so this makes a new folder even when one of that name \
+                       is already there; the preview says when one is. Shared drives are out of \
+                       reach. Needs confirmed=true: call once with confirmed=false, show the \
+                       person the name and where the folder goes, and create it only after they \
+                       say yes."
+    )]
+    async fn drive_create_folder(
+        &self,
+        Parameters(p): Parameters<DriveCreateFolderParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DriveFolderOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Drive).await?;
+        let client = &self.google()?.client;
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            return Err(bad("name is empty; name the folder to create"));
+        }
+        let parent = match p.parent.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            None => None,
+            Some(id) => Some(self.destination(&connection, id, Putting::Folder).await?),
+        };
+        let into = match &parent {
+            Some(f) => format!("the folder {:?} ({})", f.name, f.id),
+            None => format!("the root of {MY_DRIVE}"),
+        };
+        if !p.confirmed {
+            let there = drive::folders_named(
+                client,
+                connection.id,
+                parent.as_ref().map(|f| f.id.as_str()),
+                &name,
+            )
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+            let mut details = vec![
+                format!("the new folder is called {name:?}"),
+                format!("it goes into {into}"),
+            ];
+            details.push(if there.folders.is_empty() && !there.more {
+                format!("no folder called {name:?} is there yet")
+            } else {
+                format!(
+                    "a folder called {name:?} is already there ({}); Drive holds folders of one \
+                     name side by side, so this makes another one. To use the one already \
+                     there, pass its id as `folder` to drive_upload instead",
+                    ids(&there)
+                )
+            });
+            if parent.is_some() {
+                details.push(
+                    "if Drive refuses this folder to this server, nothing is created anywhere"
+                        .to_string(),
+                );
+            }
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "create the folder {name:?} in Drive in `{}`, in {into}",
+                    connection.label
+                ),
+                details,
+            ))));
+        }
+        // One attempt, into the parent that was asked for and nowhere else.
+        let made = match drive::create_folder(
+            client,
+            connection.id,
+            &name,
+            parent.as_ref().map(|f| f.id.as_str()),
+        )
+        .await
+        {
+            Ok(made) => made,
+            Err(e) => {
+                return Err(match &parent {
+                    Some(f) if folder_refused(&e) => {
+                        refuse(parent_refusal(f, &name, &e.to_string()))
+                    }
+                    _ => self.google_err_for(&connection, e),
+                });
+            }
+        };
+        let parent_name = parent
+            .map(|f| f.name)
+            .unwrap_or_else(|| MY_DRIVE.to_string());
+        Ok(Json(Confirmable::Done(dto::DriveFolderOut {
+            account: connection.label,
+            url: folder_url(&made),
+            written: format!("created the folder {:?} in {parent_name:?}", made.name),
+            parent_id: made.parents.first().cloned(),
+            folder_id: made.id,
+            name: made.name,
+            parent: parent_name,
+        })))
+    }
 }
 
 impl Gmcp {
-    /// The folder a file is about to go into, read so the person approving
-    /// the upload sees its name and not only its id. An id that names no
-    /// folder this account can see, names something that is not a folder, or
-    /// names a folder in the bin is refused here, before anything is written.
+    /// The folder something is about to go into, read so the person
+    /// approving the write sees its name and not only its id. An id that
+    /// names no folder this account can see, names something that is not a
+    /// folder, or names a folder in the bin is refused here, before anything
+    /// is written.
     async fn destination(
         &self,
         connection: &Connection,
         id: &str,
+        what: Putting,
     ) -> Result<drive::Folder, ErrorData> {
+        let (arg, thing) = what.words();
         let found = drive::folder(&self.google()?.client, connection.id, id).await;
         let folder = match found {
             Ok(folder) => folder,
             Err(GoogleFailure::Google(g)) if g.status == 404 => {
                 return Err(refuse(format!(
                     "there is no folder `{id}` that `{}` can see. A folder in a shared drive is \
-                     out of reach of these tools. Leave `folder` out to put the file in the \
+                     out of reach of these tools. Leave `{arg}` out to put the {thing} in the \
                      root of {MY_DRIVE}",
                     connection.label
                 )));
@@ -575,20 +696,70 @@ impl Gmcp {
         if folder.mime_type != drive::FOLDER_MIME {
             return Err(refuse(format!(
                 "`{id}` is {:?}, a {}, and not a folder; pass the id of a folder, or leave \
-                 `folder` out to put the file in the root of {MY_DRIVE}",
+                 `{arg}` out to put the {thing} in the root of {MY_DRIVE}",
                 folder.name, folder.mime_type
             )));
         }
         if folder.trashed {
             return Err(refuse(format!(
-                "the folder {:?} is in the bin, and a file put there would be in the bin too; \
-                 pick another folder, or leave `folder` out to put the file in the root of \
-                 {MY_DRIVE}",
+                "the folder {:?} is in the bin, and a {thing} put there would be in the bin \
+                 too; pick another folder, or leave `{arg}` out to put the {thing} in the root \
+                 of {MY_DRIVE}",
                 folder.name
             )));
         }
         Ok(folder)
     }
+}
+
+/// What is about to go into a folder, so a refusal names the argument the
+/// caller passed and the thing it was putting there.
+#[derive(Debug, Clone, Copy)]
+enum Putting {
+    /// drive_upload's `folder`.
+    File,
+    /// drive_create_folder's `parent`.
+    Folder,
+}
+
+impl Putting {
+    fn words(self) -> (&'static str, &'static str) {
+        match self {
+            Putting::File => ("folder", "file"),
+            Putting::Folder => ("parent", "folder"),
+        }
+    }
+}
+
+/// Where the person opens a folder: the link Drive gave, or the one every
+/// folder has when Drive gave none.
+fn folder_url(folder: &drive::FileMeta) -> String {
+    folder
+        .web_view_link
+        .clone()
+        .unwrap_or_else(|| format!("https://drive.google.com/drive/folders/{}", folder.id))
+}
+
+/// The ids of the folders a lookup found, oldest first, for a caller that has
+/// to pick one.
+fn ids(found: &drive::NamedFolders) -> String {
+    let mut said: Vec<String> = found.folders.iter().map(|f| f.id.clone()).collect();
+    if found.more {
+        said.push("and more".to_string());
+    }
+    said.join(", ")
+}
+
+/// What a caller is told when Drive refused to create a folder inside the
+/// parent it named. Nothing was created anywhere else.
+fn parent_refusal(parent: &drive::Folder, name: &str, google: &str) -> String {
+    format!(
+        "Drive refused to create the folder {name:?} inside the folder {:?} ({}): that folder \
+         could not be written to with the access this server holds. Nothing was created, and \
+         no folder was made anywhere else. Leave `parent` out to create the folder in the root \
+         of {MY_DRIVE}, where the person can move it. ({google})",
+        parent.name, parent.id
+    )
 }
 
 /// True when Drive refused the parent folder rather than the file. These are

@@ -1,0 +1,16 @@
+{
+  "id": "1NoTaTkInEwFoLdErIdExAmPlE01234567",
+  "name": "notatki",
+  "mimeType": "application/vnd.google-apps.folder",
+  "modifiedTime": "2026-10-08T09:30:01.000Z",
+  "webViewLink": "https://drive.google.com/drive/folders/1NoTaTkInEwFoLdErIdExAmPlE01234567",
+  "parents": [
+    "1ToPoLoGiAnEwFoLdErIdExAmPlE012345"
+  ],
+  "owners": [
+    {
+      "displayName": "Anna Kowalska",
+      "emailAddress": "anna@example.test"
+    }
+  ]
+}
