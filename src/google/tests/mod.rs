@@ -342,6 +342,9 @@ async fn a_google_error_keeps_its_status_and_message() {
         Error::Google(google) => {
             assert_eq!(google.status, 404);
             assert_eq!(google.message, "Requested entity was not found.");
+            // The reason is what tells one 404 or 403 from another, and the
+            // message a person reads does not change for carrying it.
+            assert_eq!(google.reason.as_deref(), Some("notFound"));
             assert_eq!(
                 google.to_string(),
                 "google returned 404: Requested entity was not found."

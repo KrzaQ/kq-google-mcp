@@ -48,6 +48,12 @@ const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 pub struct GoogleError {
     pub status: u16,
     pub message: String,
+    /// The `reason` of the first entry in the envelope's `errors` list, such
+    /// as `notFound` or `insufficientFilePermissions`. One status covers many
+    /// failures — a 403 is a missing permission, a full quota or a rate limit
+    /// — and the reason is what tells them apart. Absent when Google sent no
+    /// such list, which the OAuth endpoints never do.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -273,6 +279,7 @@ impl TokenSource {
             return Err(GoogleError {
                 status: status.as_u16(),
                 message,
+                reason: None,
             }
             .into());
         }
@@ -735,6 +742,7 @@ async fn check(response: Response) -> Result<Response> {
                 .unwrap_or("unknown error")
                 .to_string()
         }),
+        reason: api_reason(&body),
     }
     .into())
 }
@@ -765,6 +773,19 @@ fn api_error(body: &str) -> Option<String> {
     }
     let (_, message) = split_oauth_error(&value)?;
     Some(message)
+}
+
+/// The `reason` of the first entry in the envelope's `errors` list:
+/// `{"error": {"errors": [{"reason": "notFound", …}], …}}`.
+fn api_reason(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")?
+        .get("errors")?
+        .get(0)?
+        .get("reason")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The OAuth endpoints' error shape, as `(code, message)`. The code is what

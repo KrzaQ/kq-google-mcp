@@ -260,6 +260,7 @@ impl OAuth {
                     "userinfo: {}",
                     body.trim().chars().take(300).collect::<String>()
                 ),
+                reason: None,
             }
             .into());
         }
@@ -284,6 +285,7 @@ impl OAuth {
         Err(GoogleError {
             status: status.as_u16(),
             message: response.text().await.unwrap_or_default(),
+            reason: None,
         }
         .into())
     }
@@ -304,6 +306,7 @@ fn exchange_error<E: std::error::Error>(
                 Some(description) => format!("{}: {description}", response.error()),
                 None => response.error().to_string(),
             },
+            reason: None,
         }),
         RequestTokenError::Request(e) => Error::Transport(e.to_string()),
         RequestTokenError::Parse(e, _) => {
