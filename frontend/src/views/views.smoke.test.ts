@@ -417,6 +417,20 @@ describe('views', () => {
     expect(errors).toEqual([])
   })
 
+  it('TokensView creates one token when Create is pressed twice', async () => {
+    // Two submits before the first answer arrives: the second must find the
+    // first still on the wire and do nothing, or it mints a second secret.
+    const w = await render(TokensView, '/tokens')
+    await w.find('[data-testid="token-name"]').setValue('desktop')
+    await w.find('[data-testid="scope-docs:read"]').setValue(true)
+    const form = w.find('[data-testid="token-form"]')
+    await form.trigger('submit')
+    await form.trigger('submit')
+    await flushPromises()
+    expect(posted()).toBe(1)
+    expect(errors).toEqual([])
+  })
+
   it('TokensView creates the new token before it revokes the old one', async () => {
     const w = await render(TokensView, '/tokens')
     await w.findAll('[data-testid="fill-as-new"]')[0]!.trigger('click')

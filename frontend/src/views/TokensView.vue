@@ -36,6 +36,8 @@ const tokens = ref<TokenDto[]>([])
 const connections = ref<ConnectionDto[]>([])
 const created = ref<TokenCreated | null>(null)
 const error = ref<string | null>(null)
+/** True while a create, and the revokes that follow it, are on the wire. */
+const busy = ref(false)
 const revoking = ref<TokenDto | null>(null)
 const form = ref<TokenForm>(emptyForm())
 // What the last "Fill as new" had to leave out, one sentence each.
@@ -107,7 +109,7 @@ function fillFrom(t: TokenDto) {
 }
 
 function submit() {
-  if (!registry.value || blocked.value) return
+  if (!registry.value || blocked.value || busy.value) return
   const same = activeNamed(tokens.value, form.value.name)
   if (same.length > 0) clash.value = same
   else void create([])
@@ -125,6 +127,19 @@ function answerClash(revokeOld: boolean) {
  * new token exists and the old one still works, so nobody has to guess.
  */
 async function create(replaced: readonly TokenDto[]) {
+  // A second press while the first is still on the wire would mint a second
+  // token with its own secret, and a replacement would revoke the old one
+  // twice. One create at a time, whichever button started it.
+  if (!registry.value || busy.value) return
+  busy.value = true
+  try {
+    await createThenRevoke(replaced)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function createThenRevoke(replaced: readonly TokenDto[]) {
   if (!registry.value) return
   error.value = null
   try {
@@ -413,7 +428,12 @@ onMounted(load)
       </fieldset>
 
       <div class="flex items-center gap-3">
-        <button class="btn" type="submit" :disabled="blocked !== null" data-testid="token-create">
+        <button
+          class="btn"
+          type="submit"
+          :disabled="blocked !== null || busy"
+          data-testid="token-create"
+        >
           Create token
         </button>
         <span v-if="blocked" class="text-xs text-muted">{{ blocked }}</span>
