@@ -227,6 +227,93 @@ async fn a_doc_is_made_out_of_markdown_in_one_multipart_upload() {
     assert!(!body.contains("\"parents\""), "{body}");
 }
 
+/// An upload is stored as it is: the metadata names the type the content
+/// carries, so Drive has nothing to convert it into, and the bytes arrive
+/// unchanged whether or not they are text.
+#[tokio::test]
+async fn a_file_is_stored_as_it_is_and_never_converted() {
+    let h = harness().await;
+    h.mount_json(
+        "POST",
+        "/upload/drive/v3/files",
+        fixture("drive_file_uploaded.json"),
+    )
+    .await;
+    // Not UTF-8, and holding a CRLF and a boundary-like line, so a body that
+    // was ever turned into text on the way would not come out the same.
+    let bytes = b"%PDF-1.7\r\n--gmcp\r\n\xff\xfe\x00\x01".to_vec();
+
+    let stored = drive::upload(
+        &h.client,
+        CONNECTION,
+        "Faktura 04-2026.pdf",
+        "application/pdf",
+        &bytes,
+        Some("1FaKtUrYfOlDeRiDeXaMpLe0123456789"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.id, "1UpLoAdEdFiLeIdExAmPlE0123456789abcd");
+    assert_eq!(stored.size, Some(16));
+
+    let request = h.last("POST", "/upload/drive/v3/files").await;
+    let body = &request.body;
+    let text = String::from_utf8_lossy(body);
+    assert!(
+        text.contains("\"mimeType\":\"application/pdf\""),
+        "the metadata names the file's own type: {text}"
+    );
+    assert!(
+        text.contains("Content-Type: application/pdf\r\n\r\n"),
+        "the content part carries no charset: {text}"
+    );
+    assert!(
+        body.windows(bytes.len()).any(|w| w == bytes.as_slice()),
+        "the bytes arrive exactly as they were given"
+    );
+
+    // A Google type is how a conversion is asked for, so it is refused before
+    // anything is sent.
+    let before = h.requests().await.len();
+    let refused = drive::upload(
+        &h.client,
+        CONNECTION,
+        "notes",
+        drive::DOCUMENT_MIME,
+        b"# notes",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.to_string().contains("stored as it is"), "{refused}");
+    assert_eq!(h.requests().await.len(), before);
+}
+
+/// A folder is read with the one field that decides whether a file may go
+/// into it at all.
+#[tokio::test]
+async fn a_folder_is_read_with_whether_it_is_in_the_bin() {
+    let h = harness().await;
+    h.mount_json(
+        "GET",
+        "/drive/v3/files/1FaKtUrYfOlDeRiDeXaMpLe0123456789",
+        fixture("drive_folder.json"),
+    )
+    .await;
+    let folder = drive::folder(&h.client, CONNECTION, "1FaKtUrYfOlDeRiDeXaMpLe0123456789")
+        .await
+        .unwrap();
+    assert_eq!(folder.name, "Faktury 2026");
+    assert_eq!(folder.mime_type, drive::FOLDER_MIME);
+    assert!(!folder.trashed);
+    let request = h
+        .last("GET", "/drive/v3/files/1FaKtUrYfOlDeRiDeXaMpLe0123456789")
+        .await;
+    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+    assert!(query["fields"].contains("trashed"), "{query:?}");
+    assert!(!query.contains_key("supportsAllDrives"), "{query:?}");
+}
+
 #[tokio::test]
 async fn comments_are_asked_for_with_the_replies_and_the_quoted_text() {
     let h = harness().await;

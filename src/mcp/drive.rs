@@ -1,7 +1,12 @@
-//! The Drive tools: finding files, describing them, and getting at their
-//! contents either as text a model can read or as a short-lived link a person
-//! can click. Nothing here writes to Drive; the two tools that create files
-//! live in `docs` and `sheets`, where they need confirmation.
+//! The Drive tools: finding files, describing them, getting at their contents
+//! either as text a model can read or as a short-lived link a person can
+//! click, and storing a file the caller uploaded.
+//!
+//! drive_upload is the one write here, and it only ever adds a file: it never
+//! changes, moves or replaces one that is there. It takes `confirmed` like
+//! every other write, and it refuses rather than put a file anywhere but the
+//! folder it was asked for. The two tools that create a Doc or a Sheet live in
+//! `docs` and `sheets`.
 
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -11,14 +16,19 @@ use rmcp::model::{CallToolResult, ErrorData};
 use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 
-use super::dto;
+use super::dto::{self, Confirmable, PreviewOut};
 use super::gmail::link_out;
 use super::images::{self, Kind, Source};
 use super::{Call, Gmcp, api_err, bad, cap_text, capped, refuse};
+use crate::db::Connection;
 use crate::domain::scope::Service;
 use crate::google::drive::{self, ExportFormat};
-use crate::google::text;
+use crate::google::{Error as GoogleFailure, text};
 use crate::http::links::{self, NewDownload, Target};
+use crate::http::uploads;
+
+/// What the root of My Drive is called where a folder's name would go.
+const MY_DRIVE: &str = "My Drive";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +85,35 @@ pub struct ReadTextParam {
     pub file_id: String,
     /// Stop after this many characters, with a notice saying what was cut
     pub max_chars: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriveUploadLinkParam {
+    /// What the file is called, e.g. "Faktura 04-2026.pdf". drive_upload
+    /// stores it under this name unless it is given another
+    pub filename: String,
+    /// What the file is, e.g. application/pdf. Left out, the filename decides
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriveUploadParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// The upload_id you read back from POSTing the file to a
+    /// drive_upload_link URL
+    pub upload_id: String,
+    /// The id of the Drive folder to put the file in, as drive_search reports
+    /// it. Left out, the file goes to the root of My Drive
+    pub folder: Option<String>,
+    /// What to call the file in Drive. Left out, it keeps the name it was
+    /// uploaded under
+    pub name: Option<String>,
+    /// Must be true to write. Call with false first and show the person the
+    /// name, the size and the folder.
+    pub confirmed: bool,
 }
 
 #[tool_router(router = drive_router, vis = "pub(crate)")]
@@ -324,6 +363,264 @@ impl Gmcp {
             note: comments_note(resolved, over, read.more),
         }))
     }
+
+    #[tool(
+        description = "A URL to upload one file to, so it can be stored in Google Drive. Putting \
+                       a file in Drive takes three steps and you do the middle one yourself: call \
+                       this, then POST the bytes to the `url` it answers \
+                       (`curl --data-binary @report.pdf URL`), then pass the `upload_id` you read \
+                       back to drive_upload. This server cannot read a file on your machine, so \
+                       uploading it is the only way. A file may be at most 25 MB. There is no \
+                       `account` here because a staged file belongs to you and not to a Drive: \
+                       drive_upload decides which account and which folder it lands in. The URL \
+                       takes one upload and lives 15 minutes; the file itself waits an hour to be \
+                       used and is forgotten once it is. This is the Drive twin of \
+                       gmail_upload_link and docs_upload_link — same staging, its own name."
+    )]
+    async fn drive_upload_link(
+        &self,
+        Parameters(p): Parameters<DriveUploadLinkParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<dto::UploadLinkOut>, ErrorData> {
+        let filename = p.filename.trim();
+        if filename.is_empty() {
+            return Err(bad("filename is empty; name the file you are uploading"));
+        }
+        let minted = uploads::mint(
+            &self.state,
+            uploads::NewUpload {
+                user_id: call.principal.user().id,
+                token_id: self.token_id(&call)?,
+                filename: filename.to_string(),
+                mime_type: p.content_type.clone(),
+            },
+        );
+        Ok(Json(dto::UploadLinkOut {
+            url: minted.url,
+            filename: minted.filename,
+            expires_at: dto::at_zone(minted.expires_at, call.tz),
+            note: "POST the file to this URL as the whole request body — \
+                   `curl --data-binary @/path/to/file URL` — and pass the upload_id it answers \
+                   to drive_upload. The URL works once and for 15 minutes."
+                .into(),
+        }))
+    }
+
+    #[tool(
+        description = "Store a file in Google Drive as it is, with no conversion: a PDF stays a \
+                       PDF and a spreadsheet stays the file it was. Upload it first with \
+                       drive_upload_link and pass the upload_id here. `folder` is the id of a \
+                       Drive folder, as drive_search reports it; left out, the file goes to the \
+                       root of My Drive. `name` is what the file is called in Drive, and left \
+                       out it keeps the name it was uploaded under. An upload never replaces an \
+                       existing file: if the folder already holds one of the same name, Drive \
+                       holds both side by side. Shared drives are out of reach. A folder the \
+                       person made in Drive may not take a file from this server; when it does \
+                       not, nothing is uploaded anywhere, the upload stays staged, and leaving \
+                       `folder` out puts the file in the root of My Drive instead. Needs \
+                       confirmed=true: call once with confirmed=false, show the person the name, \
+                       the size and the folder, and write only after they say yes. The upload \
+                       is spent once Drive has the file, so upload it again to store it twice."
+    )]
+    async fn drive_upload(
+        &self,
+        Parameters(p): Parameters<DriveUploadParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DriveUploadOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Drive).await?;
+        let client = &self.google()?.client;
+        let upload_id = p.upload_id.trim().to_string();
+        let user_id = call.principal.user().id;
+        // Read without being spent: a preview and every refusal below leave
+        // the upload_id good for the next attempt.
+        let staged = self
+            .state
+            .staging
+            .peek(user_id, &upload_id)
+            .map_err(|e| bad(e.to_string()))?;
+        if staged.mime_type.starts_with(drive::GOOGLE_APPS_PREFIX) {
+            return Err(bad(format!(
+                "{} was uploaded as {}, which is a type Drive converts a file into; drive_upload \
+                 stores a file as it is. Upload it again with the type it really has",
+                staged.filename, staged.mime_type
+            )));
+        }
+        let name = p
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&staged.filename)
+            .to_string();
+        let folder = match p.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            None => None,
+            Some(id) => Some(self.destination(&connection, id).await?),
+        };
+        let size = staged.bytes.len();
+        let into = match &folder {
+            Some(f) => format!("the folder {:?} ({})", f.name, f.id),
+            None => format!("the root of {MY_DRIVE}"),
+        };
+        if !p.confirmed {
+            let mut details = vec![
+                format!("the file is called {name:?} in Drive"),
+                format!(
+                    "it is {} ({size} bytes) of {}, stored as it is with no conversion",
+                    uploads::megabytes(size),
+                    staged.mime_type
+                ),
+                format!("it goes into {into}"),
+            ];
+            if name != staged.filename {
+                details.push(format!("it was uploaded as {:?}", staged.filename));
+            }
+            details.push(
+                "an upload never replaces a file: if one of the same name is already there, \
+                 Drive holds both"
+                    .to_string(),
+            );
+            if folder.is_some() {
+                details.push(
+                    "if Drive refuses this folder to this server, nothing is uploaded anywhere \
+                     and the upload stays staged"
+                        .to_string(),
+                );
+            }
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "upload {name:?} to Drive in `{}`, into {into}",
+                    connection.label
+                ),
+                details,
+            ))));
+        }
+        // One attempt, into the folder that was asked for and nowhere else. A
+        // refusal is answered as one; it is never retried into the root.
+        let stored = match drive::upload(
+            client,
+            connection.id,
+            &name,
+            &staged.mime_type,
+            &staged.bytes,
+            folder.as_ref().map(|f| f.id.as_str()),
+        )
+        .await
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                return Err(match &folder {
+                    Some(f) if folder_refused(&e) => {
+                        refuse(folder_refusal(f, &upload_id, &e.to_string()))
+                    }
+                    _ => self.google_err_for(&connection, e),
+                });
+            }
+        };
+        // Drive has the file, so the upload is spent now and not before.
+        if let Err(e) = self
+            .state
+            .staging
+            .take(user_id, std::slice::from_ref(&upload_id))
+        {
+            tracing::warn!("spending the upload {upload_id} after Drive stored it: {e}");
+        }
+        let folder_name = folder
+            .map(|f| f.name)
+            .unwrap_or_else(|| MY_DRIVE.to_string());
+        let size = stored.size.unwrap_or(size as u64);
+        Ok(Json(Confirmable::Done(dto::DriveUploadOut {
+            account: connection.label,
+            url: stored
+                .web_view_link
+                .clone()
+                .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", stored.id)),
+            written: format!(
+                "stored {:?} ({}) in {folder_name:?}",
+                stored.name,
+                uploads::megabytes(size as usize)
+            ),
+            folder_id: stored.parents.first().cloned(),
+            file_id: stored.id,
+            name: stored.name,
+            mime_type: stored.mime_type,
+            size,
+            folder: folder_name,
+        })))
+    }
+}
+
+impl Gmcp {
+    /// The folder a file is about to go into, read so the person approving
+    /// the upload sees its name and not only its id. An id that names no
+    /// folder this account can see, names something that is not a folder, or
+    /// names a folder in the bin is refused here, before anything is written.
+    async fn destination(
+        &self,
+        connection: &Connection,
+        id: &str,
+    ) -> Result<drive::Folder, ErrorData> {
+        let found = drive::folder(&self.google()?.client, connection.id, id).await;
+        let folder = match found {
+            Ok(folder) => folder,
+            Err(GoogleFailure::Google(g)) if g.status == 404 => {
+                return Err(refuse(format!(
+                    "there is no folder `{id}` that `{}` can see. A folder in a shared drive is \
+                     out of reach of these tools. Leave `folder` out to put the file in the \
+                     root of {MY_DRIVE}",
+                    connection.label
+                )));
+            }
+            Err(e) => return Err(self.google_err_for(connection, e)),
+        };
+        if folder.mime_type != drive::FOLDER_MIME {
+            return Err(refuse(format!(
+                "`{id}` is {:?}, a {}, and not a folder; pass the id of a folder, or leave \
+                 `folder` out to put the file in the root of {MY_DRIVE}",
+                folder.name, folder.mime_type
+            )));
+        }
+        if folder.trashed {
+            return Err(refuse(format!(
+                "the folder {:?} is in the bin, and a file put there would be in the bin too; \
+                 pick another folder, or leave `folder` out to put the file in the root of \
+                 {MY_DRIVE}",
+                folder.name
+            )));
+        }
+        Ok(folder)
+    }
+}
+
+/// True when Drive refused the parent folder rather than the file. These are
+/// the three answers the Drive reference gives for a file the app may not
+/// write or cannot see: `notFound` (404), and `insufficientFilePermissions`
+/// and `appNotAuthorizedToFile` (403). Every other 403 — a full quota, a rate
+/// limit — is about the account and not the folder, and is passed through.
+fn folder_refused(e: &GoogleFailure) -> bool {
+    match e {
+        GoogleFailure::Google(g) => {
+            g.status == 404
+                || (g.status == 403
+                    && matches!(
+                        g.reason.as_deref(),
+                        Some("insufficientFilePermissions" | "appNotAuthorizedToFile")
+                    ))
+        }
+        _ => false,
+    }
+}
+
+/// What a caller is told when Drive refused the folder. The file was put
+/// nowhere else, and the caller's next step is in the message.
+fn folder_refusal(folder: &drive::Folder, upload_id: &str, google: &str) -> String {
+    format!(
+        "Drive refused to put the file into the folder {:?} ({}): that folder could not be \
+         written to with the access this server holds. Nothing was uploaded, and the file was \
+         not put anywhere else. The upload `{upload_id}` is still staged: call drive_upload \
+         again with the same upload_id and leave `folder` out to put the file in the root of \
+         {MY_DRIVE}, where the person can move it. ({google})",
+        folder.name, folder.id
+    )
 }
 
 /// What the answer leaves out, in the one line a model reads before it decides

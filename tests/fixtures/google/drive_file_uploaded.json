@@ -1,0 +1,17 @@
+{
+  "id": "1UpLoAdEdFiLeIdExAmPlE0123456789abcd",
+  "name": "Faktura 04-2026.pdf",
+  "mimeType": "application/pdf",
+  "modifiedTime": "2026-10-08T09:30:00.000Z",
+  "size": "16",
+  "webViewLink": "https://drive.google.com/file/d/1UpLoAdEdFiLeIdExAmPlE0123456789abcd/view?usp=drivesdk",
+  "parents": [
+    "1FaKtUrYfOlDeRiDeXaMpLe0123456789"
+  ],
+  "owners": [
+    {
+      "displayName": "Anna Kowalska",
+      "emailAddress": "anna@example.test"
+    }
+  ]
+}

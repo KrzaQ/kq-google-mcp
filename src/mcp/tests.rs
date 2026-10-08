@@ -360,6 +360,7 @@ const EVERYTHING: &[&str] = &[
     "gmail:draft",
     "gmail:modify",
     "drive:read",
+    "drive:write",
     "docs:read",
     "docs:write",
     "sheets:read",
@@ -6653,9 +6654,14 @@ async fn every_tool_publishes_the_arguments_it_accepts() {
             "{} publishes no properties: {schema}",
             tool["name"]
         );
-        // Every tool takes an account, except the three that belong to a
-        // person rather than to a mailbox or a document.
-        let accountless = ["list_accounts", "gmail_upload_link", "docs_upload_link"];
+        // Every tool takes an account, except the four that belong to a
+        // person rather than to a mailbox, a document or a Drive.
+        let accountless = [
+            "list_accounts",
+            "gmail_upload_link",
+            "docs_upload_link",
+            "drive_upload_link",
+        ];
         assert!(
             schema["properties"]["account"].is_object()
                 || accountless.contains(&tool["name"].as_str().unwrap()),
@@ -6663,4 +6669,478 @@ async fn every_tool_publishes_the_arguments_it_accepts() {
             tool["name"]
         );
     }
+}
+
+// ----- a file into Drive ------------------------------------------------------
+
+const FOLDER: &str = "1FaKtUrYfOlDeRiDeXaMpLe0123456789";
+const UPLOADED: &str = "1UpLoAdEdFiLeIdExAmPlE0123456789abcd";
+/// Sixteen bytes, as drive_file_uploaded.json says the stored file has.
+const INVOICE: &[u8] = b"%PDF-1.7 invoice";
+
+/// A Google that knows the folder and answers an upload with the stored
+/// file, and counts how many uploads it is sent.
+async fn drive_server(uploads: u64) -> MockServer {
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{FOLDER}"),
+        fixture("drive_folder.json"),
+    )
+    .await;
+    server
+        .register(
+            Mock::given(http_method("POST"))
+                .and(path("/upload/drive/v3/files"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(fixture("drive_file_uploaded.json")),
+                )
+                .expect(uploads)
+                .named("files.create upload"),
+        )
+        .await;
+    server
+}
+
+async fn uploading(db: &Db, server: &MockServer) -> Attaching {
+    Attaching::new(db, server, &["drive:read", "drive:write"]).await
+}
+
+async fn upload_file(a: &mut Attaching, filename: &str, bytes: &[u8]) -> Value {
+    a.upload_with("drive_upload_link", json!({"filename": filename}), bytes)
+        .await
+}
+
+/// Every upload Drive was sent, oldest first.
+async fn drive_uploads(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/upload/drive/v3/files")
+        .collect()
+}
+
+/// The parts of a `multipart/related` body, split on the boundary its
+/// Content-Type header names: each part's headers as text and its content as
+/// the bytes that were sent.
+fn related_parts(request: &wiremock::Request) -> Vec<(String, Vec<u8>)> {
+    let content_type = request.headers["content-type"].to_str().unwrap();
+    let boundary = content_type
+        .strip_prefix("multipart/related; boundary=")
+        .unwrap_or_else(|| panic!("not multipart/related: {content_type}"));
+    let delimiter = format!("\r\n--{boundary}").into_bytes();
+    // The first delimiter has no CRLF in front of it; give it one so every
+    // delimiter looks the same.
+    let mut body = b"\r\n".to_vec();
+    body.extend_from_slice(&request.body);
+    let mut parts = Vec::new();
+    let mut rest = &body[..];
+    while let Some(at) = rest.windows(delimiter.len()).position(|w| w == delimiter) {
+        let after = &rest[at + delimiter.len()..];
+        if after.starts_with(b"--") {
+            break;
+        }
+        let after = after
+            .strip_prefix(b"\r\n")
+            .expect("a CRLF after the boundary");
+        let end = after
+            .windows(delimiter.len())
+            .position(|w| w == delimiter)
+            .expect("a closing boundary");
+        let part = &after[..end];
+        let split = part
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("headers end in an empty line");
+        parts.push((
+            String::from_utf8_lossy(&part[..split]).to_string(),
+            part[split + 4..].to_vec(),
+        ));
+        rest = &after[end..];
+    }
+    parts
+}
+
+#[tokio::test]
+async fn only_a_drive_write_token_sees_the_upload_tools() {
+    let db = Db::open_memory().await.unwrap();
+    let anna = user(&db, "anna", "anna@example.test").await;
+    connect(&db, &anna, "work", &["drive"], false).await;
+    let (_, reader) = token(&db, &["drive:read"], Some(&anna), ClientProfile::Generic).await;
+    let (_, writer) = token(
+        &db,
+        &["drive:read", "drive:write"],
+        Some(&anna),
+        ClientProfile::Generic,
+    )
+    .await;
+    let app = app(&db, None).await;
+
+    let mut c = Client::new(app.clone(), reader);
+    c.initialize().await;
+    let names = c.names().await;
+    assert!(
+        !names.contains(&"drive_upload_link".to_string()),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"drive_upload".to_string()), "{names:?}");
+    assert!(names.contains(&"drive_search".to_string()), "{names:?}");
+    // And a call made anyway names the scope it lacks.
+    let refused = c
+        .refused("drive_upload_link", json!({"filename": "a.pdf"}))
+        .await;
+    assert!(refused.contains("drive:write"), "{refused}");
+
+    let mut c = Client::new(app, writer);
+    c.initialize().await;
+    let names = c.names().await;
+    assert!(
+        names.contains(&"drive_upload_link".to_string()),
+        "{names:?}"
+    );
+    assert!(names.contains(&"drive_upload".to_string()), "{names:?}");
+    let tools = c.tools().await;
+    let upload = tools.iter().find(|t| t["name"] == "drive_upload").unwrap();
+    let required = upload["inputSchema"]["required"].as_array().unwrap();
+    assert!(required.contains(&json!("confirmed")), "{upload}");
+    assert!(
+        upload["description"]
+            .as_str()
+            .unwrap()
+            .contains("never replaces"),
+        "{upload}"
+    );
+}
+
+/// A preview names the file, its size and type and the folder by name, and
+/// sends Drive nothing but the read of that folder.
+#[tokio::test]
+async fn drive_upload_previews_the_file_and_its_folder_and_spends_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = drive_server(0).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    assert_eq!(uploaded["mime_type"], "application/pdf");
+
+    let shown = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder": FOLDER, "confirmed": false}),
+        )
+        .await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("\"Faktura 04-2026.pdf\""), "{lines}");
+    assert!(lines.contains("16 bytes"), "{lines}");
+    assert!(lines.contains("application/pdf"), "{lines}");
+    assert!(lines.contains("no conversion"), "{lines}");
+    assert!(lines.contains("\"Faktury 2026\""), "{lines}");
+    assert!(lines.contains(FOLDER), "{lines}");
+    assert!(lines.contains("never replaces"), "{lines}");
+
+    // Without a folder, and under another name, the preview says both.
+    let shown = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "name": "Faktura kwiecień.pdf", "confirmed": false}),
+        )
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("root of My Drive"), "{lines}");
+    assert!(lines.contains("\"Faktura kwiecień.pdf\""), "{lines}");
+    assert!(
+        lines.contains("uploaded as \"Faktura 04-2026.pdf\""),
+        "{lines}"
+    );
+
+    // Nothing was stored and nothing was spent.
+    assert!(drive_uploads(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// The whole path: one multipart upload whose metadata names the file and the
+/// folder and whose content is the bytes that were posted, and an upload id
+/// that is spent once Drive has the file.
+#[tokio::test]
+async fn drive_upload_stores_the_bytes_in_the_folder_and_spends_the_upload() {
+    let db = Db::open_memory().await.unwrap();
+    let server = drive_server(1).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    let args = json!({"account": "work", "upload_id": uploaded["upload_id"],
+                      "folder": FOLDER, "name": "Faktura kwiecień.pdf", "confirmed": true});
+
+    let out = a.client.ok("drive_upload", args.clone()).await;
+    assert_eq!(out["file_id"], UPLOADED);
+    assert_eq!(out["folder"], "Faktury 2026");
+    assert_eq!(out["folder_id"], FOLDER);
+    assert_eq!(out["size"], 16);
+    assert_eq!(out["mime_type"], "application/pdf");
+    assert!(
+        out["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("https://drive.google.com/file/d/{UPLOADED}/")),
+        "{out}"
+    );
+
+    let sent = drive_uploads(&server).await;
+    assert_eq!(sent.len(), 1);
+    let request = &sent[0];
+    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+    assert_eq!(query["uploadType"], "multipart");
+    assert!(!query.contains_key("supportsAllDrives"), "{query:?}");
+    let parts = related_parts(request);
+    assert_eq!(parts.len(), 2, "one metadata part and one media part");
+    let metadata: Value = serde_json::from_slice(&parts[0].1).unwrap();
+    assert_eq!(metadata["name"], "Faktura kwiecień.pdf");
+    assert_eq!(metadata["parents"], json!([FOLDER]));
+    assert_eq!(metadata["mimeType"], "application/pdf");
+    assert!(
+        parts[1].0.contains("Content-Type: application/pdf"),
+        "{}",
+        parts[1].0
+    );
+    assert_eq!(parts[1].1, INVOICE, "the bytes arrive exactly as posted");
+
+    // Drive has the file, so the upload is spent.
+    assert_eq!(a.staged_files(), 0);
+    let again = a.client.refused("drive_upload", args).await;
+    assert!(again.contains("there is no staged upload"), "{again}");
+    assert!(again.contains("drive_upload_link"), "{again}");
+    drop(server);
+}
+
+/// Left out, the folder is left out of the metadata too, and the name is the
+/// one the file was uploaded under.
+#[tokio::test]
+async fn drive_upload_without_a_folder_goes_to_the_root_under_its_own_name() {
+    let db = Db::open_memory().await.unwrap();
+    let server = drive_server(1).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let out = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"], "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["folder"], "My Drive");
+
+    let sent = drive_uploads(&server).await;
+    let metadata: Value = serde_json::from_slice(&related_parts(&sent[0])[0].1).unwrap();
+    assert_eq!(metadata["name"], "Faktura 04-2026.pdf");
+    assert!(metadata.get("parents").is_none(), "{metadata}");
+    // The folder was never looked up: there was none to look up.
+    let reads = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with("/drive/v3/files/"))
+        .count();
+    assert_eq!(reads, 0);
+    drop(server);
+}
+
+/// The one real unknown. Drive refuses the folder in each of the three ways
+/// its reference documents for a file the app may not write or cannot see.
+/// Each is answered in this server's words, the upload stays staged, and the
+/// file is never put in the root instead.
+#[tokio::test]
+async fn a_folder_drive_refuses_leaves_the_upload_staged_and_nothing_in_the_root() {
+    for (status, refusal) in [
+        (403, "drive_error_insufficient_permissions.json"),
+        (403, "drive_error_app_not_authorized.json"),
+        (404, "drive_error_file_not_found.json"),
+    ] {
+        let db = Db::open_memory().await.unwrap();
+        let server = google_server().await;
+        mount(
+            &server,
+            "GET",
+            &format!("/drive/v3/files/{FOLDER}"),
+            fixture("drive_folder.json"),
+        )
+        .await;
+        Mock::given(http_method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(fixture(refusal)))
+            .expect(1)
+            .named("the one upload, refused")
+            .mount(&server)
+            .await;
+        let mut a = uploading(&db, &server).await;
+        let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+        let refused = a
+            .client
+            .refused(
+                "drive_upload",
+                json!({"account": "work", "upload_id": uploaded["upload_id"],
+                       "folder": FOLDER, "confirmed": true}),
+            )
+            .await;
+        assert!(
+            refused.contains("could not be written to with the access this server holds"),
+            "{refusal}: {refused}"
+        );
+        assert!(refused.contains("\"Faktury 2026\""), "{refused}");
+        assert!(refused.contains("still staged"), "{refused}");
+        assert!(
+            refused.contains("leave `folder` out to put the file in the root of My Drive"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(uploaded["upload_id"].as_str().unwrap()),
+            "{refused}"
+        );
+
+        // One attempt and no second one into the root.
+        let sent = drive_uploads(&server).await;
+        assert_eq!(sent.len(), 1, "{refusal}: retried");
+        let metadata: Value = serde_json::from_slice(&related_parts(&sent[0])[0].1).unwrap();
+        assert_eq!(metadata["parents"], json!([FOLDER]));
+        assert_eq!(a.staged_files(), 1, "{refusal}: the upload was spent");
+        drop(server);
+    }
+}
+
+/// A 403 that is about the account and not the folder is not dressed up as a
+/// folder refusal: the person has a full Drive, not a folder problem.
+#[tokio::test]
+async fn a_full_drive_is_reported_as_google_said_it_and_spends_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{FOLDER}"),
+        fixture("drive_folder.json"),
+    )
+    .await;
+    Mock::given(http_method("POST"))
+        .and(path("/upload/drive/v3/files"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(fixture("drive_error_storage_quota.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let refused = a
+        .client
+        .refused(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder": FOLDER, "confirmed": true}),
+        )
+        .await;
+    assert!(
+        refused.contains("storage quota has been exceeded"),
+        "{refused}"
+    );
+    assert!(!refused.contains("could not be written to"), "{refused}");
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// An id that is not a folder, or a folder in the bin, is refused before
+/// anything is written, and so is a folder this account cannot see.
+#[tokio::test]
+async fn a_destination_that_is_not_a_usable_folder_is_refused_before_any_upload() {
+    let db = Db::open_memory().await.unwrap();
+    let server = drive_server(0).await;
+    mount(
+        &server,
+        "GET",
+        "/drive/v3/files/1DoCuMeNtNoTaFoLdEr",
+        json!({"id": "1DoCuMeNtNoTaFoLdEr", "name": "Q3 report",
+               "mimeType": "application/vnd.google-apps.document", "trashed": false}),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/drive/v3/files/1BiNnEdFoLdEr",
+        json!({"id": "1BiNnEdFoLdEr", "name": "Stare",
+               "mimeType": "application/vnd.google-apps.folder", "trashed": true}),
+    )
+    .await;
+    Mock::given(http_method("GET"))
+        .and(path("/drive/v3/files/1NoSuChFoLdEr"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(fixture("drive_error_file_not_found.json")),
+        )
+        .mount(&server)
+        .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    for (folder, says) in [
+        ("1DoCuMeNtNoTaFoLdEr", "not a folder"),
+        ("1BiNnEdFoLdEr", "in the bin"),
+        ("1NoSuChFoLdEr", "no folder `1NoSuChFoLdEr`"),
+    ] {
+        let refused = a
+            .client
+            .refused(
+                "drive_upload",
+                json!({"account": "work", "upload_id": uploaded["upload_id"],
+                       "folder": folder, "confirmed": true}),
+            )
+            .await;
+        assert!(refused.contains(says), "{folder}: {refused}");
+        assert!(refused.contains("root of My Drive"), "{folder}: {refused}");
+    }
+    assert!(drive_uploads(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// One person's staged file is not another's to store, in their Drive or in
+/// anybody's.
+#[tokio::test]
+async fn somebody_elses_upload_is_not_stored_in_drive() {
+    let db = Db::open_memory().await.unwrap();
+    let server = drive_server(0).await;
+    let mut anna = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut anna, "prywatne.pdf", b"%PDF-1.7 mine").await;
+
+    let marta = user(&db, "marta", "marta@example.test").await;
+    connect(&db, &marta, "marta-work", &["drive"], false).await;
+    let (_, secret) = token(
+        &db,
+        &["drive:read", "drive:write"],
+        Some(&marta),
+        ClientProfile::Generic,
+    )
+    .await;
+    let mut hers = Client::new(anna.app.clone(), secret);
+    hers.initialize().await;
+    for confirmed in [false, true] {
+        let refused = hers
+            .refused(
+                "drive_upload",
+                json!({"account": "marta-work", "upload_id": uploaded["upload_id"],
+                       "confirmed": confirmed}),
+            )
+            .await;
+        assert!(refused.contains("there is no staged upload"), "{refused}");
+    }
+    assert!(drive_uploads(&server).await.is_empty());
+    assert_eq!(anna.staged_files(), 1, "and it is still Anna's");
+    drop(server);
 }

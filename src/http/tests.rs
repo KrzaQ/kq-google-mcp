@@ -540,6 +540,21 @@ async fn the_scope_registry_says_what_each_level_unlocks() {
         .unwrap();
     assert_eq!(docs["levels"][1]["scope"], "docs:write");
     assert_eq!(docs["levels"][1]["requires"], "docs:read");
+    // The token grid is drawn from this answer, so a new level shows up in
+    // the portal with no change to the frontend.
+    let drive = b["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["service"] == "drive")
+        .unwrap();
+    assert_eq!(drive["levels"][1]["scope"], "drive:write");
+    assert_eq!(drive["levels"][1]["level"], "write");
+    assert_eq!(drive["levels"][1]["requires"], "drive:read");
+    assert_eq!(
+        drive["levels"][1]["tools"],
+        json!(["drive_upload_link", "drive_upload"])
+    );
     assert_eq!(b["delegate"]["scope"], "delegate");
     assert!(
         b["clients"]

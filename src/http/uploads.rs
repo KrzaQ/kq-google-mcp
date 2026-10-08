@@ -140,8 +140,9 @@ impl fmt::Display for TakeError {
                 f,
                 "there is no staged upload `{id}`; it was never uploaded, it has expired, it was \
                  already used, or it belongs to somebody else. Mint a fresh link with \
-                 gmail_upload_link for a draft or docs_upload_link for a document, post the file \
-                 to it again and use the upload_id it answers"
+                 gmail_upload_link for a draft, docs_upload_link for a document or \
+                 drive_upload_link for Drive, post the file to it again and use the upload_id it \
+                 answers"
             ),
             Self::TooLarge { files } => {
                 let total: usize = files.iter().map(|(_, size)| size).sum();
@@ -668,10 +669,11 @@ pub async fn upload(
         mime_type: staged.mime_type,
         expires_at: staged.expires_at,
         note: format!(
-            "pass upload_id as one of `attachments` within {UPLOAD_TTL_MINUTES} minutes: to \
-             gmail_create_draft, gmail_reply_draft or gmail_update_draft for a draft you are \
-             writing, or to gmail_attach_to_draft for one that already exists. The file is \
-             attached once and then forgotten"
+            "use upload_id within {UPLOAD_TTL_MINUTES} minutes. For a draft, pass it as one \
+             of `attachments` to gmail_create_draft, gmail_reply_draft or gmail_update_draft, or \
+             to gmail_attach_to_draft for a draft that already exists; for a picture in a \
+             document, to docs_insert_image; for a file in Drive, to drive_upload. The file is \
+             used once and then forgotten"
         ),
     }))
 }

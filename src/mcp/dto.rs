@@ -470,6 +470,25 @@ impl FileOut {
     }
 }
 
+/// A file drive_upload has stored, and where.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DriveUploadOut {
+    pub account: String,
+    pub file_id: String,
+    pub name: String,
+    pub mime_type: String,
+    /// In bytes.
+    pub size: u64,
+    /// The folder the file is in, by name: "My Drive" for the root.
+    pub folder: String,
+    /// The folder's id, as Drive reports the file's parent.
+    pub folder_id: Option<String>,
+    /// Where the person opens the file in Drive.
+    pub url: String,
+    /// What happened, in one line the model can repeat to the person.
+    pub written: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CommentsOut {
     pub account: String,

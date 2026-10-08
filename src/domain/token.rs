@@ -187,6 +187,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(message, "docs:write is useless without docs:read; add it");
+        // Drive's write level is no exception: an upload starts by looking at
+        // the folder it goes into.
+        let upload = scopes(&["drive:write", "gmail:read"]);
+        let message = validate(request(&upload, Owner::Caller))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message, "drive:write is useless without drive:read; add it");
+        let both = scopes(&["drive:write", "drive:read"]);
+        assert!(validate(request(&both, Owner::Caller)).is_ok());
 
         // And a valid list comes back canonical, whatever order it went in.
         let ok = scopes(&["docs:write", "docs:read", "gmail:read"]);

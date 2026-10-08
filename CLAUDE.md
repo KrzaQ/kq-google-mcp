@@ -46,7 +46,7 @@ to say about itself is here and in `README.md`.
   sending and Google has no narrower scope. This server is the policy layer.
   That is the whole reason it exists rather than the first-party connectors.
 - **Token scopes are `service:level` strings** validated against the registry in
-  `domain/scope.rs`: `gmail:read|draft|modify`, `drive:read`,
+  `domain/scope.rs`: `gmail:read|draft|modify`, `drive:read|write`,
   `docs:read|write`, `sheets:read|write`, `calendar:read|write`, plus
   `delegate`, the only non-matrix scope. Adding a service is a code change,
   never a migration. Levels are not cumulative in storage; the UI ticks lower
@@ -75,8 +75,8 @@ to say about itself is here and in `README.md`.
   all of the user's); a delegate token sees the acting user's connections
   flagged `delegate_ok`, and only for someone who logged in through the browser
   in the last 30 days.
-- Writes to Docs, Sheets and Calendar need `confirmed=true`; Gmail drafts do
-  not, because a draft is itself the confirmation step.
+- Writes to Drive, Docs, Sheets and Calendar need `confirmed=true`; Gmail
+  drafts do not, because a draft is itself the confirmation step.
 - Files leave through short-lived download links (15 min, 3 uses), never as MCP
   payloads. The constants live in `domain/` and are constants, not
   configuration.
@@ -100,6 +100,13 @@ to say about itself is here and in `README.md`.
   together with the ones the draft already carries. Both refusals leave the
   uploads staged, so the person attaches them elsewhere rather than sending
   them again.
+- **A Drive upload refuses rather than misplaces.** `drive_upload_link` stages
+  a file the same way `gmail_upload_link` does, and `drive_upload` stores it as
+  it is, with no conversion. It only ever adds a file: it never replaces one of
+  the same name. It makes one attempt, into the folder it was asked for. When
+  Drive refuses that folder, the tool says so and never retries into the root.
+  The upload is spent only once Drive has the file, so every refusal leaves it
+  staged.
 - Every tool call, link mint and link hit is logged, with the arguments
   stripped of bodies and cut at 4 KB. Tool output is never logged.
 - **Tests must not need the network, a file on disk or an existing database.**

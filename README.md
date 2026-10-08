@@ -26,7 +26,7 @@ database and no network.
   rest, its own set of connected services and its own health. Every tool takes
   an `account` argument naming a connection by its label.
 - **Tokens** carry `service:level` scopes (`gmail:read`, `gmail:draft`,
-  `gmail:modify`, `drive:read`, `docs:read|write`, `sheets:read|write`,
+  `gmail:modify`, `drive:read|write`, `docs:read|write`, `sheets:read|write`,
   `calendar:read|write`), a connection allowlist and a client profile
   (`openwebui`, `claude-code`, `opencode`, `generic`) that decides how images
   come back. `tools/list` is filtered per token, so a model never sees a tool
@@ -38,9 +38,10 @@ database and no network.
   content, and text is extracted server-side for PDF, DOCX, CSV and plain text.
   They come in the same way round: `gmail_upload_link` mints a URL, the agent
   POSTs the bytes to it, and the upload id it reads back goes to a draft tool,
-  which attaches the file and forgets it. Nothing reads a path a model
-  supplies — the caller is on another machine — and no ticket or staged file
-  outlives a restart.
+  which attaches the file and forgets it. `drive_upload_link` and
+  `drive_upload` store a file in Drive the same way. Nothing reads a path a
+  model supplies — the caller is on another machine — and no ticket or staged
+  file outlives a restart.
 - **Every call is logged** — who, which token, which connection, which tool,
   the arguments with secrets stripped, the outcome — and the log is the
   portal's front page.

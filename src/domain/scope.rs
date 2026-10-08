@@ -37,14 +37,16 @@ pub enum Level {
     Draft,
     /// Gmail only: labels, archive, read state.
     Modify,
-    /// Docs, Sheets and Calendar: create and change content.
+    /// Drive, Docs, Sheets and Calendar: create and change content. On
+    /// Drive it is an upload and nothing more: a new file, never a change to
+    /// one that is there.
     Write,
 }
 
 /// The matrix, in canonical order.
 const REGISTRY: &[(Service, &[Level])] = &[
     (Service::Gmail, &[Level::Read, Level::Draft, Level::Modify]),
-    (Service::Drive, &[Level::Read]),
+    (Service::Drive, &[Level::Read, Level::Write]),
     (Service::Docs, &[Level::Read, Level::Write]),
     (Service::Sheets, &[Level::Read, Level::Write]),
     (Service::Calendar, &[Level::Read, Level::Write]),
@@ -344,6 +346,8 @@ pub const TOOLS: &[(&str, Option<Scope>)] = &[
     ("drive_read_text", needs(Service::Drive, Level::Read)),
     ("drive_view_image", needs(Service::Drive, Level::Read)),
     ("drive_list_comments", needs(Service::Drive, Level::Read)),
+    ("drive_upload_link", needs(Service::Drive, Level::Write)),
+    ("drive_upload", needs(Service::Drive, Level::Write)),
     ("docs_read", needs(Service::Docs, Level::Read)),
     ("docs_list_paragraphs", needs(Service::Docs, Level::Read)),
     ("docs_read_formatting", needs(Service::Docs, Level::Read)),
@@ -479,7 +483,7 @@ mod tests {
         for s in valid_scopes() {
             assert_eq!(s.parse::<Scope>().unwrap().to_string(), s);
         }
-        assert_eq!(valid_scopes().len(), 11);
+        assert_eq!(valid_scopes().len(), 12);
         assert_eq!(valid_scopes()[0], "gmail:read");
         assert_eq!(valid_scopes().last().unwrap(), "delegate");
     }
@@ -490,8 +494,12 @@ mod tests {
             Service::Gmail.levels(),
             [Level::Read, Level::Draft, Level::Modify]
         );
-        assert_eq!(Service::Drive.levels(), [Level::Read]);
-        for service in [Service::Docs, Service::Sheets, Service::Calendar] {
+        for service in [
+            Service::Drive,
+            Service::Docs,
+            Service::Sheets,
+            Service::Calendar,
+        ] {
             assert_eq!(service.levels(), [Level::Read, Level::Write]);
         }
     }
@@ -505,7 +513,7 @@ mod tests {
         assert!(message.contains("calendar:write"), "{message}");
         assert!(message.contains("delegate"), "{message}");
         // Levels do not leak across services.
-        assert!(parse(&["drive:write"]).is_err());
+        assert!(parse(&["drive:draft"]).is_err());
         assert!(parse(&["docs:draft"]).is_err());
         assert!(parse(&["gmail"]).is_err());
         assert!(parse(&["youtube:read"]).is_err());
@@ -553,6 +561,14 @@ mod tests {
             )
         );
         assert!(check_requirements(&scopes(&["docs:write", "docs:read"])).is_ok());
+        // Drive's write level follows the same rule as every other one.
+        assert_eq!(
+            check_requirements(&scopes(&["drive:write"])).unwrap_err(),
+            ScopeError::Missing(
+                Scope::Service(Service::Drive, Level::Write),
+                Scope::Service(Service::Drive, Level::Read)
+            )
+        );
         assert_eq!(
             with_requirements(&scopes(&["sheets:write", "delegate"])),
             scopes(&["sheets:read", "sheets:write", "delegate"])
@@ -588,7 +604,7 @@ mod tests {
         assert_eq!(tools_for(&scopes(&["gmail:read"])).len(), 9);
         let everything = tools_for(&parse_scopes(&valid_scopes()).unwrap());
         assert_eq!(everything.len(), TOOLS.len());
-        assert_eq!(TOOLS.len(), 61);
+        assert_eq!(TOOLS.len(), 63);
     }
 
     #[test]
@@ -641,6 +657,10 @@ mod tests {
                 "docs_upload_link",
                 "docs_insert_image",
             ]
+        );
+        assert_eq!(
+            tools_of_scope(Scope::Service(Service::Drive, Level::Write)),
+            ["drive_upload_link", "drive_upload"]
         );
     }
 

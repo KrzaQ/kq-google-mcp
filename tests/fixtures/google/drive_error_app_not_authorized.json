@@ -1,0 +1,13 @@
+{
+  "error": {
+    "errors": [
+      {
+        "domain": "global",
+        "reason": "appNotAuthorizedToFile",
+        "message": "The user has not granted the app 123456789012 write access to the file 1FaKtUrYfOlDeRiDeXaMpLe0123456789."
+      }
+    ],
+    "code": 403,
+    "message": "The user has not granted the app 123456789012 write access to the file 1FaKtUrYfOlDeRiDeXaMpLe0123456789."
+  }
+}

@@ -1,5 +1,6 @@
-//! Drive: search, metadata, download, export and the two file creations that
-//! make a Doc out of markdown and a Sheet out of CSV.
+//! Drive: search, metadata, download, export, the two file creations that
+//! make a Doc out of markdown and a Sheet out of CSV, and the one that stores
+//! a file as it is.
 //!
 //! Shared drives are deliberately out of this release: every call goes against
 //! the person's own corpus, so `supportsAllDrives` is never set and a file
@@ -14,8 +15,10 @@ use super::multipart;
 /// What Google calls a Doc, a Sheet and a folder.
 pub const DOCUMENT_MIME: &str = "application/vnd.google-apps.document";
 pub const SPREADSHEET_MIME: &str = "application/vnd.google-apps.spreadsheet";
-#[allow(dead_code)]
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+/// What every Google-native type starts with. A file stored under one of
+/// these is converted by Drive rather than kept as it is.
+pub const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
 
 /// The fields a file is asked for. Drive returns almost nothing by default,
 /// and asking for everything is both slower and noisier than this list.
@@ -63,7 +66,7 @@ impl FileMeta {
     /// A Google file has no bytes of its own and must be exported rather than
     /// downloaded.
     pub fn is_google_native(&self) -> bool {
-        self.mime_type.starts_with("application/vnd.google-apps.")
+        self.mime_type.starts_with(GOOGLE_APPS_PREFIX)
     }
 }
 
@@ -220,6 +223,36 @@ pub async fn get(client: &Client, connection_id: i64, file_id: &str) -> Result<F
     Ok(wire.into())
 }
 
+/// The fields a folder is asked for: enough to name it to the person and to
+/// tell a folder in the bin from one that is in use.
+const FOLDER_FIELDS: &str = "id,name,mimeType,trashed";
+
+/// A folder a file is about to go into, as the person would recognise it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    /// What Drive says the item is. A caller checks this against
+    /// [`FOLDER_MIME`]: an id may name a document as easily as a folder.
+    pub mime_type: String,
+    pub trashed: bool,
+}
+
+/// `files.get` for a folder, with the one field [`FILE_FIELDS`] leaves out
+/// that matters for a destination: whether it is in the bin.
+pub async fn folder(client: &Client, connection_id: i64, folder_id: &str) -> Result<Folder> {
+    let request = client
+        .get(&format!("drive/v3/files/{}", urlencode(folder_id)))?
+        .query(&[("fields", FOLDER_FIELDS)]);
+    let wire: WireFolder = client.json(connection_id, request).await?;
+    Ok(Folder {
+        id: wire.id,
+        name: wire.name,
+        mime_type: wire.mime_type,
+        trashed: wire.trashed,
+    })
+}
+
 /// One comment thread in the margin of a file, with the replies under it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Comment {
@@ -315,7 +348,7 @@ pub async fn create_doc_from_markdown(
         connection_id,
         title,
         DOCUMENT_MIME,
-        "text/markdown",
+        "text/markdown; charset=UTF-8",
         markdown.as_bytes(),
         folder_id,
     )
@@ -335,22 +368,57 @@ pub async fn create_sheet_from_csv(
         connection_id,
         title,
         SPREADSHEET_MIME,
-        "text/csv",
+        "text/csv; charset=UTF-8",
         csv.as_bytes(),
         folder_id,
     )
     .await
 }
 
+/// A file stored as it is: the bytes go in unchanged and keep their own type.
+/// The metadata names the same type the content part carries, so Drive has
+/// nothing to convert the file into. A Google-native type is refused here,
+/// because naming one is exactly how a conversion is asked for.
+///
+/// `folder_id` absent puts the file in the root of My Drive. Drive never
+/// replaces a file of the same name: it holds both.
+pub async fn upload(
+    client: &Client,
+    connection_id: i64,
+    name: &str,
+    mime_type: &str,
+    content: &[u8],
+    folder_id: Option<&str>,
+) -> Result<FileMeta> {
+    if mime_type.starts_with(GOOGLE_APPS_PREFIX) {
+        return Err(Error::Unsupported(format!(
+            "{mime_type} is a type Drive converts a file into, and an upload is stored as it is; \
+             upload the file under the type it really has"
+        )));
+    }
+    create(
+        client,
+        connection_id,
+        name,
+        mime_type,
+        mime_type,
+        content,
+        folder_id,
+    )
+    .await
+}
+
 /// `files.create` with `uploadType=multipart`: a JSON metadata part and a
-/// content part in one `multipart/related` body, which is what makes Drive
-/// convert the content into the target type.
+/// content part in one `multipart/related` body. When `target_mime` differs
+/// from the content's type, Drive converts the content into it; when the two
+/// are the same, it stores the bytes as they are. `content_type` goes into the
+/// content part's header exactly as it is given.
 async fn create(
     client: &Client,
     connection_id: i64,
     title: &str,
     target_mime: &str,
-    source_mime: &str,
+    content_type: &str,
     content: &[u8],
     folder_id: Option<&str>,
 ) -> Result<FileMeta> {
@@ -365,12 +433,7 @@ async fn create(
         metadata["parents"] = serde_json::json!([id]);
     }
     let boundary = multipart::boundary();
-    let body = multipart::related(
-        &boundary,
-        &metadata.to_string(),
-        &format!("{source_mime}; charset=UTF-8"),
-        content,
-    );
+    let body = multipart::related(&boundary, &metadata.to_string(), content_type, content);
     let request = client
         .post("upload/drive/v3/files")?
         .query(&[("uploadType", "multipart"), ("fields", FILE_FIELDS)])
@@ -421,6 +484,15 @@ struct WireFile {
     web_view_link: Option<String>,
     parents: Vec<String>,
     owners: Vec<WireOwner>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireFolder {
+    id: String,
+    name: String,
+    mime_type: String,
+    trashed: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

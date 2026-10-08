@@ -1,0 +1,13 @@
+{
+  "error": {
+    "errors": [
+      {
+        "domain": "global",
+        "message": "The user's Drive storage quota has been exceeded.",
+        "reason": "storageQuotaExceeded"
+      }
+    ],
+    "code": 403,
+    "message": "The user's Drive storage quota has been exceeded."
+  }
+}
