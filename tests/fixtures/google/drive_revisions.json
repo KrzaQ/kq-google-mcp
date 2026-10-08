@@ -1,0 +1,16 @@
+{
+  "revisions": [
+    {
+      "id": "0B1oLdErReViSiOnIdExAmPlE012345678",
+      "keepForever": true
+    },
+    {
+      "id": "0B2pUrGeAbLeReViSiOnIdExAmPlE01234",
+      "keepForever": false
+    },
+    {
+      "id": "0B3hEaDrEvIsIoNiDeXaMpLe0123456789",
+      "keepForever": false
+    }
+  ]
+}

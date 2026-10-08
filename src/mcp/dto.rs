@@ -500,6 +500,29 @@ pub struct CreatedFolderOut {
     pub name: String,
 }
 
+/// A file drive_update_file has given new content, and the version that
+/// keeps the old content.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DriveUpdateOut {
+    pub account: String,
+    /// The same id the file had before: the content changed, the file did not.
+    pub file_id: String,
+    /// The file's name now: the new one when it was renamed.
+    pub name: String,
+    pub mime_type: String,
+    /// The new content's size, in bytes.
+    pub size: u64,
+    /// When Drive took the new content, on the person's clock.
+    pub modified_time: Option<String>,
+    /// Where the person opens the file in Drive. The link has not changed.
+    pub url: String,
+    /// The version that held the content before this call. It is marked keep
+    /// forever, and the person finds it under Manage versions in Drive.
+    pub pinned_revision_id: String,
+    /// What happened, in one line the model can repeat to the person.
+    pub written: String,
+}
+
 /// A folder drive_create_folder has created, and where.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DriveFolderOut {

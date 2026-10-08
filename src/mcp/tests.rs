@@ -6827,6 +6827,10 @@ async fn only_a_drive_write_token_sees_the_upload_tools() {
         !names.contains(&"drive_create_folder".to_string()),
         "{names:?}"
     );
+    assert!(
+        !names.contains(&"drive_update_file".to_string()),
+        "{names:?}"
+    );
     assert!(names.contains(&"drive_search".to_string()), "{names:?}");
     // And a call made anyway names the scope it lacks.
     let refused = c
@@ -6853,6 +6857,16 @@ async fn only_a_drive_write_token_sees_the_upload_tools() {
         .unwrap();
     let required = create["inputSchema"]["required"].as_array().unwrap();
     assert!(required.contains(&json!("confirmed")), "{create}");
+    assert!(
+        names.contains(&"drive_update_file".to_string()),
+        "{names:?}"
+    );
+    let update = tools
+        .iter()
+        .find(|t| t["name"] == "drive_update_file")
+        .unwrap();
+    let required = update["inputSchema"]["required"].as_array().unwrap();
+    assert!(required.contains(&json!("confirmed")), "{update}");
     let upload = tools.iter().find(|t| t["name"] == "drive_upload").unwrap();
     let required = upload["inputSchema"]["required"].as_array().unwrap();
     assert!(required.contains(&json!("confirmed")), "{upload}");
@@ -7924,4 +7938,511 @@ async fn drive_search_says_how_to_list_folders() {
             .contains("mime_type \"application/vnd.google-apps.folder\""),
         "{search}"
     );
+}
+
+// ----- new content for a file in Drive ---------------------------------------
+
+/// The file drive_file_revisable.json describes: a PDF in the folder
+/// drive_folder.json describes.
+const REVISABLE: &str = "1ReViSaBlEfIlEiDeXaMpLe0123456789ab";
+/// Its head revision, as drive_file_revisable.json reports it.
+const HEAD: &str = "0B3hEaDrEvIsIoNiDeXaMpLe0123456789";
+
+fn pin_path() -> String {
+    format!("/drive/v3/files/{REVISABLE}/revisions/{HEAD}")
+}
+
+fn replace_path() -> String {
+    format!("/upload/drive/v3/files/{REVISABLE}")
+}
+
+fn ok_json(name: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(fixture(name))
+}
+
+/// A Google that knows the file, its folder and its history, and answers the
+/// pin and the replacement as it is told to, expecting each of them exactly
+/// the given number of times.
+async fn revising_server(
+    pin: ResponseTemplate,
+    pins: u64,
+    replace: ResponseTemplate,
+    replacements: u64,
+    revisions: Value,
+) -> MockServer {
+    let server = google_server().await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{REVISABLE}"),
+        fixture("drive_file_revisable.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{FOLDER}"),
+        fixture("drive_folder.json"),
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{REVISABLE}/revisions"),
+        revisions,
+    )
+    .await;
+    server
+        .register(
+            Mock::given(http_method("PATCH"))
+                .and(path(pin_path()))
+                .respond_with(pin)
+                .expect(pins)
+                .named("revisions.update keepForever"),
+        )
+        .await;
+    server
+        .register(
+            Mock::given(http_method("PATCH"))
+                .and(path(replace_path()))
+                .respond_with(replace)
+                .expect(replacements)
+                .named("files.update upload"),
+        )
+        .await;
+    server
+}
+
+/// The usual Google: every call answers as the reference says it does.
+async fn revising(pins: u64, replacements: u64) -> MockServer {
+    revising_server(
+        ok_json("drive_revision_kept.json"),
+        pins,
+        ok_json("drive_file_replaced.json"),
+        replacements,
+        fixture("drive_revisions.json"),
+    )
+    .await
+}
+
+/// Every Drive call this server made, oldest first, as "METHOD path".
+async fn drive_calls(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() != "/token")
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// Every Drive call that could have changed something.
+async fn drive_writes(server: &MockServer) -> Vec<String> {
+    drive_calls(server)
+        .await
+        .into_iter()
+        .filter(|c| !c.starts_with("GET "))
+        .collect()
+}
+
+/// The JSON metadata part of the one replacement Drive was sent.
+async fn replacement_metadata(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PATCH" && r.url.path() == replace_path())
+        .map(|r| serde_json::from_slice(&related_parts(&r)[0].1).unwrap())
+        .collect()
+}
+
+fn update_args(upload: &Value, confirmed: bool) -> Value {
+    json!({"account": "work", "file_id": REVISABLE, "upload_id": upload["upload_id"],
+           "confirmed": confirmed})
+}
+
+/// The order is the whole point: the read names the head revision, that
+/// revision is marked keep forever, and only then does the new content go
+/// out, to the same file. The upload is spent after Drive has it.
+#[tokio::test]
+async fn drive_update_file_pins_the_head_revision_before_it_replaces_the_content() {
+    let db = Db::open_memory().await.unwrap();
+    let server = revising(1, 1).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+
+    let out = a
+        .client
+        .ok("drive_update_file", update_args(&uploaded, true))
+        .await;
+    assert_eq!(out["file_id"], REVISABLE);
+    assert_eq!(out["name"], "Faktura 03-2026.pdf");
+    assert_eq!(out["size"], 16);
+    assert_eq!(out["pinned_revision_id"], HEAD);
+    assert_eq!(out["modified_time"], "2026-10-08T12:05:00+02:00");
+    assert!(
+        out["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("https://drive.google.com/file/d/{REVISABLE}/")),
+        "{out}"
+    );
+    let written = out["written"].as_str().unwrap();
+    assert!(written.contains("kept forever"), "{written}");
+    assert!(written.contains(HEAD), "{written}");
+
+    assert_eq!(
+        drive_calls(&server).await,
+        [
+            format!("GET /drive/v3/files/{REVISABLE}"),
+            format!("GET /drive/v3/files/{REVISABLE}/revisions"),
+            format!("PATCH {}", pin_path()),
+            format!("PATCH {}", replace_path()),
+        ]
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    let pin = requests
+        .iter()
+        .find(|r| r.url.path() == pin_path())
+        .unwrap();
+    let body: Value = serde_json::from_slice(&pin.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"keepForever": true}),
+        "the pin asks for nothing else"
+    );
+    let replacement = requests
+        .iter()
+        .find(|r| r.url.path() == replace_path())
+        .unwrap();
+    let query: std::collections::HashMap<_, _> =
+        replacement.url.query_pairs().into_owned().collect();
+    assert_eq!(query["uploadType"], "multipart");
+    assert!(!query.contains_key("addParents"), "{query:?}");
+    assert!(!query.contains_key("removeParents"), "{query:?}");
+    let parts = related_parts(replacement);
+    assert!(
+        parts[1].0.contains("Content-Type: application/pdf"),
+        "{}",
+        parts[1].0
+    );
+    assert_eq!(parts[1].1, INVOICE, "the bytes arrive exactly as posted");
+
+    assert_eq!(a.staged_files(), 0);
+    drop(server);
+}
+
+/// A pin Drive refuses, or answers without keeping the revision, replaces
+/// nothing: the upload is never sent and stays staged.
+#[tokio::test]
+async fn a_pin_that_fails_sends_no_new_content() {
+    let not_kept =
+        ResponseTemplate::new(200).set_body_json(json!({"id": HEAD, "keepForever": false}));
+    let backend = ResponseTemplate::new(500).set_body_json(json!({
+        "error": {
+            "errors": [{"domain": "global", "reason": "backendError", "message": "Backend Error"}],
+            "code": 500,
+            "message": "Backend Error"
+        }
+    }));
+    for (pin, cause, outcome) in [
+        (backend, "30 days", "nothing was replaced"),
+        (not_kept, "without marking it so", "Nothing was changed"),
+    ] {
+        let db = Db::open_memory().await.unwrap();
+        let server = revising_server(
+            pin,
+            1,
+            ok_json("drive_file_replaced.json"),
+            0,
+            fixture("drive_revisions.json"),
+        )
+        .await;
+        let mut a = uploading(&db, &server).await;
+        let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+
+        let refused = a
+            .client
+            .refused("drive_update_file", update_args(&uploaded, true))
+            .await;
+        assert!(refused.contains(cause), "{refused}");
+        assert!(refused.contains(outcome), "{refused}");
+        assert!(refused.contains("still staged"), "{refused}");
+        assert!(
+            refused.contains(uploaded["upload_id"].as_str().unwrap()),
+            "{refused}"
+        );
+        assert_eq!(
+            drive_writes(&server).await,
+            [format!("PATCH {}", pin_path())]
+        );
+        assert_eq!(a.staged_files(), 1);
+        drop(server);
+    }
+}
+
+/// A file this server did not create is out of reach of `drive.file`, and
+/// Drive says so at the first write, the pin. Each of the three answers the
+/// reference documents for that is refused in this server's words, and
+/// nothing is replaced.
+#[tokio::test]
+async fn a_file_drive_refuses_to_this_server_is_refused_and_nothing_is_replaced() {
+    for (status, refusal) in [
+        (403, "drive_error_app_not_authorized.json"),
+        (403, "drive_error_insufficient_permissions.json"),
+        (404, "drive_error_file_not_found.json"),
+    ] {
+        let db = Db::open_memory().await.unwrap();
+        let server = revising_server(
+            ResponseTemplate::new(status).set_body_json(fixture(refusal)),
+            1,
+            ok_json("drive_file_replaced.json"),
+            0,
+            fixture("drive_revisions.json"),
+        )
+        .await;
+        let mut a = uploading(&db, &server).await;
+        let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+
+        let refused = a
+            .client
+            .refused("drive_update_file", update_args(&uploaded, true))
+            .await;
+        assert!(
+            refused.contains("could not be written to with the access this server holds"),
+            "{refusal}: {refused}"
+        );
+        assert!(refused.contains("\"Faktura 03-2026.pdf\""), "{refused}");
+        assert!(refused.contains("Nothing was replaced"), "{refused}");
+        assert!(refused.contains("still staged"), "{refused}");
+        assert!(refused.contains("drive_upload"), "{refused}");
+        assert_eq!(a.staged_files(), 1, "{refusal}: the upload was spent");
+        drop(server);
+    }
+}
+
+/// New content Drive refuses after the pin leaves the old version pinned and
+/// nothing else changed, and the answer says exactly that.
+#[tokio::test]
+async fn a_replacement_that_fails_after_the_pin_says_the_old_version_is_kept() {
+    let db = Db::open_memory().await.unwrap();
+    let server = revising_server(
+        ok_json("drive_revision_kept.json"),
+        1,
+        ResponseTemplate::new(403).set_body_json(fixture("drive_error_storage_quota.json")),
+        1,
+        fixture("drive_revisions.json"),
+    )
+    .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+
+    let refused = a
+        .client
+        .refused("drive_update_file", update_args(&uploaded, true))
+        .await;
+    assert!(
+        refused.contains("storage quota has been exceeded"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!("The current version {HEAD}")),
+        "{refused}"
+    );
+    assert!(refused.contains("now marked keep forever"), "{refused}");
+    assert!(refused.contains("nothing else changed"), "{refused}");
+    assert!(refused.contains("still staged"), "{refused}");
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// A different type and a Google file are refused before Drive is asked to
+/// change anything, and before the history is even read.
+#[tokio::test]
+async fn a_type_mismatch_and_a_google_file_are_refused_before_any_write() {
+    const DOC: &str = "1GoOgLeDoCiDeXaMpLe0123456789abcdef";
+    let db = Db::open_memory().await.unwrap();
+    let server = revising(0, 0).await;
+    mount(
+        &server,
+        "GET",
+        &format!("/drive/v3/files/{DOC}"),
+        json!({"id": DOC, "name": "Q3 report", "mimeType": "application/vnd.google-apps.document",
+               "modifiedTime": "2026-09-30T08:15:00.000Z", "parents": [FOLDER]}),
+    )
+    .await;
+    let mut a = uploading(&db, &server).await;
+    let text = upload_file(&mut a, "faktura.txt", b"not a pdf").await;
+    let pdf = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+
+    for confirmed in [false, true] {
+        let refused = a
+            .client
+            .refused("drive_update_file", update_args(&text, confirmed))
+            .await;
+        assert!(refused.contains("application/pdf"), "{refused}");
+        assert!(refused.contains("text/plain"), "{refused}");
+        assert!(refused.contains("Nothing was changed"), "{refused}");
+
+        let refused = a
+            .client
+            .refused(
+                "drive_update_file",
+                json!({"account": "work", "file_id": DOC, "upload_id": pdf["upload_id"],
+                       "confirmed": confirmed}),
+            )
+            .await;
+        assert!(
+            refused.contains("application/vnd.google-apps.document"),
+            "{refused}"
+        );
+        assert!(refused.contains("docs_*"), "{refused}");
+        assert!(refused.contains("Nothing was changed"), "{refused}");
+    }
+    assert!(drive_writes(&server).await.is_empty());
+    assert!(
+        !drive_calls(&server)
+            .await
+            .iter()
+            .any(|c| c.ends_with("/revisions")),
+        "the history was read for a file that was refused anyway"
+    );
+    assert_eq!(a.staged_files(), 2);
+    drop(server);
+}
+
+/// A preview names the file, its folder by name, both sizes, the current
+/// modified time and the new name, says where the old version stays, and
+/// pins nothing.
+#[tokio::test]
+async fn drive_update_file_previews_the_change_and_pins_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = revising(0, 0).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 03-2026 nowa.pdf", INVOICE).await;
+
+    let mut args = update_args(&uploaded, false);
+    args["name"] = json!("Faktura 03-2026 (korekta).pdf");
+    let shown = a.client.ok("drive_update_file", args).await;
+    assert_eq!(shown["written"], false);
+    let lines = details(&shown);
+    assert!(lines.contains("\"Faktura 03-2026.pdf\""), "{lines}");
+    assert!(lines.contains("the folder \"Faktury 2026\""), "{lines}");
+    assert!(lines.contains("26112 bytes"), "{lines}");
+    assert!(lines.contains("2026-09-30T10:15:00+02:00"), "{lines}");
+    assert!(lines.contains("16 bytes"), "{lines}");
+    assert!(
+        lines.contains("renamed to \"Faktura 03-2026 (korekta).pdf\""),
+        "{lines}"
+    );
+    assert!(
+        lines
+            .contains("the current version is kept forever in the file's version history in Drive"),
+        "{lines}"
+    );
+    assert!(lines.contains("Manage versions"), "{lines}");
+    assert!(lines.contains("not appear as a second file"), "{lines}");
+
+    // Without a name, nothing is said about one.
+    let shown = a
+        .client
+        .ok("drive_update_file", update_args(&uploaded, false))
+        .await;
+    assert!(!details(&shown).contains("renamed"), "{shown}");
+
+    assert!(drive_writes(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// `name` goes into the metadata when it is given and is left out when it
+/// is not, so a replacement without one renames nothing.
+#[tokio::test]
+async fn a_new_name_reaches_the_metadata_only_when_given() {
+    let db = Db::open_memory().await.unwrap();
+    let server = revising(2, 2).await;
+    let mut a = uploading(&db, &server).await;
+
+    let first = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+    let mut args = update_args(&first, true);
+    args["name"] = json!("Faktura 03-2026 (korekta).pdf");
+    a.client.ok("drive_update_file", args).await;
+
+    let second = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+    a.client
+        .ok("drive_update_file", update_args(&second, true))
+        .await;
+
+    assert_eq!(
+        replacement_metadata(&server).await,
+        [json!({"name": "Faktura 03-2026 (korekta).pdf"}), json!({})]
+    );
+    drop(server);
+}
+
+/// A file that already has as many versions kept forever as Drive allows is
+/// refused before anything is written, in the preview too. When the head is
+/// one of them, there is nothing new to pin and the call goes through.
+#[tokio::test]
+async fn a_file_at_its_keep_forever_limit_is_refused_before_any_write() {
+    let pinned = |ids: &mut dyn Iterator<Item = String>| -> Value {
+        json!({"revisions": ids.map(|id| json!({"id": id, "keepForever": true})).collect::<Vec<_>>()})
+    };
+    let mut full = (0..200).map(|n| format!("0B0kEpT{n:03}"));
+    let mut history = pinned(&mut full);
+    history["revisions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": HEAD, "keepForever": false}));
+
+    let db = Db::open_memory().await.unwrap();
+    let server = revising_server(
+        ok_json("drive_revision_kept.json"),
+        0,
+        ok_json("drive_file_replaced.json"),
+        0,
+        history,
+    )
+    .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+    for confirmed in [false, true] {
+        let refused = a
+            .client
+            .refused("drive_update_file", update_args(&uploaded, confirmed))
+            .await;
+        assert!(
+            refused.contains("at most 200 versions of one file forever"),
+            "{refused}"
+        );
+        assert!(refused.contains("already has 200"), "{refused}");
+        assert!(refused.contains("Manage versions"), "{refused}");
+        assert!(refused.contains("unpins"), "{refused}");
+        assert!(refused.contains("still staged"), "{refused}");
+    }
+    assert!(drive_writes(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+
+    // The head is already among the 200, so pinning it takes no new place.
+    let mut full = (0..199)
+        .map(|n| format!("0B0kEpT{n:03}"))
+        .chain([HEAD.to_string()]);
+    let db = Db::open_memory().await.unwrap();
+    let server = revising_server(
+        ok_json("drive_revision_kept.json"),
+        1,
+        ok_json("drive_file_replaced.json"),
+        1,
+        pinned(&mut full),
+    )
+    .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 03-2026.pdf", INVOICE).await;
+    a.client
+        .ok("drive_update_file", update_args(&uploaded, true))
+        .await;
+    drop(server);
 }

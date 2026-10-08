@@ -2,11 +2,13 @@
 //! either as text a model can read or as a short-lived link a person can
 //! click, storing a file the caller uploaded, and making a folder.
 //!
-//! drive_upload and drive_create_folder are the writes here, and they only
-//! ever add: neither changes, moves or replaces what is there. They take
-//! `confirmed` like every other write, and they refuse rather than put
-//! anything anywhere but the folder they were asked for. The two tools that
-//! create a Doc or a Sheet live in `docs` and `sheets`.
+//! drive_upload and drive_create_folder only ever add: neither changes, moves
+//! or replaces what is there, and they refuse rather than put anything
+//! anywhere but the folder they were asked for. drive_update_file is the one
+//! write that replaces, and it replaces only content it has first made safe:
+//! the version it replaces is marked keep forever before anything else is
+//! sent. All three take `confirmed` like every other write. The two tools
+//! that create a Doc or a Sheet live in `docs` and `sheets`.
 
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -134,6 +136,24 @@ pub struct DriveCreateFolderParam {
     pub parent: Option<String>,
     /// Must be true to write. Call with false first and show the person the
     /// name and where the folder goes.
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriveUpdateFileParam {
+    /// The label of a connected account, as list_accounts reports it
+    pub account: String,
+    /// The id of the Drive file whose content is replaced, as drive_search
+    /// reports it
+    pub file_id: String,
+    /// The upload_id you read back from POSTing the new content to a
+    /// drive_upload_link URL
+    pub upload_id: String,
+    /// A new name for the file. Left out, the file keeps its name
+    pub name: Option<String>,
+    /// Must be true to write. Call with false first and show the person the
+    /// file, its folder, both sizes and where the old version stays.
     pub confirmed: bool,
 }
 
@@ -393,7 +413,8 @@ impl Gmcp {
                        a file in Drive takes three steps and you do the middle one yourself: call \
                        this, then POST the bytes to the `url` it answers \
                        (`curl --data-binary @report.pdf URL`), then pass the `upload_id` you read \
-                       back to drive_upload. This server cannot read a file on your machine, so \
+                       back to drive_upload, or to drive_update_file to replace the content of a \
+                       file already in Drive. This server cannot read a file on your machine, so \
                        uploading it is the only way. A file may be at most 25 MB. There is no \
                        `account` here because a staged file belongs to you and not to a Drive: \
                        drive_upload decides which account and which folder it lands in. The URL \
@@ -425,7 +446,7 @@ impl Gmcp {
             expires_at: dto::at_zone(minted.expires_at, call.tz),
             note: "POST the file to this URL as the whole request body — \
                    `curl --data-binary @/path/to/file URL` — and pass the upload_id it answers \
-                   to drive_upload. The URL works once and for 15 minutes."
+                   to drive_upload or drive_update_file. The URL works once and for 15 minutes."
                 .into(),
         }))
     }
@@ -578,7 +599,7 @@ impl Gmcp {
         {
             Ok(stored) => stored,
             Err(e) => {
-                let refused = place.is_some() && folder_refused(&e);
+                let refused = place.is_some() && access_refused(&e);
                 let error = match &place {
                     Some(f) if refused => {
                         refuse(folder_refusal(f, arg, &upload_id, &e.to_string()))
@@ -728,7 +749,7 @@ impl Gmcp {
             Ok(made) => made,
             Err(e) => {
                 return Err(match &parent {
-                    Some(f) if folder_refused(&e) => {
+                    Some(f) if access_refused(&e) => {
                         refuse(parent_refusal(f, &name, &e.to_string()))
                     }
                     _ => self.google_err_for(&connection, e),
@@ -748,6 +769,305 @@ impl Gmcp {
             parent: parent_name,
         })))
     }
+
+    #[tool(
+        description = "Replace the content of a file already in Google Drive with a file you \
+                       uploaded, in place: the file keeps its id, its link and its folder. \
+                       Upload the new content first with drive_upload_link and pass the \
+                       upload_id here. The upload must have the file's own type, so a PDF is \
+                       replaced only by a PDF; nothing is converted. A Google Doc, Sheet or \
+                       other Google file has no file content to replace, and the docs_* and \
+                       sheets_* tools write to it. Before anything is replaced, this server \
+                       marks the current version keep forever in the file's version history, \
+                       where the person finds it under Manage versions in Drive; it does not \
+                       appear as a second file in the folder. If Drive refuses that mark, \
+                       nothing is replaced. Drive keeps at most 200 versions of one file \
+                       forever, and a file that has reached that limit is refused. `name` \
+                       renames the file in the same call; left out, the name stays. A file the \
+                       person put in Drive by hand may not take a change from this server; \
+                       then nothing is changed and the upload stays staged, and drive_upload \
+                       can store it as a new file instead. Needs confirmed=true: call once with \
+                       confirmed=false, show the person the file, its folder, both sizes and \
+                       where the old version stays, and write only after they say yes. The \
+                       upload is spent once Drive has the new content."
+    )]
+    async fn drive_update_file(
+        &self,
+        Parameters(p): Parameters<DriveUpdateFileParam>,
+        Extension(call): Extension<Call>,
+    ) -> Result<Json<Confirmable<dto::DriveUpdateOut>>, ErrorData> {
+        let connection = self.account(&call, &p.account, Service::Drive).await?;
+        let client = &self.google()?.client;
+        let upload_id = p.upload_id.trim().to_string();
+        let user_id = call.principal.user().id;
+        let file_id = p.file_id.trim();
+        if file_id.is_empty() {
+            return Err(bad(
+                "file_id is empty; pass the id of the Drive file to replace, as drive_search \
+                 reports it",
+            ));
+        }
+        // Read without being spent: a preview and every refusal below leave
+        // the upload_id good for the next attempt.
+        let staged = self
+            .state
+            .staging
+            .peek(user_id, &upload_id)
+            .map_err(|e| bad(e.to_string()))?;
+        let read = drive::revisable(client, connection.id, file_id)
+            .await
+            .map_err(|e| self.google_err_for(&connection, e))?;
+        let file = read.file;
+        let unchanged =
+            format!("Nothing was changed, and the upload `{upload_id}` is still staged");
+        if file.is_google_native() {
+            return Err(refuse(format!(
+                "{:?} is a {}, a Google file with no file content of its own to replace. A \
+                 Google Doc is changed with the docs_* tools and a Sheet with the sheets_* \
+                 tools. {unchanged}",
+                file.name, file.mime_type
+            )));
+        }
+        if !same_type(&staged.mime_type, &file.mime_type) {
+            return Err(refuse(format!(
+                "{:?} is {}, and the upload {:?} is {}. New content must have the type the \
+                 file already has, because this tool converts nothing. {unchanged}. To keep \
+                 both, store the upload as a new file with drive_upload",
+                file.name, file.mime_type, staged.filename, staged.mime_type
+            )));
+        }
+        let Some(head) = read.head_revision_id else {
+            return Err(refuse(format!(
+                "Drive reports no current version of {:?}, so this server cannot mark it keep \
+                 forever, and it replaces no content it cannot keep. {unchanged}",
+                file.name
+            )));
+        };
+        // The history is read before the preview too, so a file at its limit
+        // is refused before the person approves anything.
+        let kept = match drive::kept_forever(client, connection.id, &file.id).await {
+            Ok(kept) => kept,
+            Err(e) if access_refused(&e) => {
+                return Err(refuse(file_refusal(&file, &upload_id, &e.to_string())));
+            }
+            Err(e) => return Err(self.google_err_for(&connection, e)),
+        };
+        let already_kept = kept.ids.contains(&head);
+        if !already_kept && kept.ids.len() >= drive::KEEP_FOREVER_MAX {
+            return Err(refuse(limit_refusal(&file, kept.ids.len(), &upload_id)));
+        }
+        let new_name = p
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && *n != file.name)
+            .map(str::to_string);
+        let size = staged.bytes.len();
+        if !p.confirmed {
+            let folder = self.folder_of(&connection, &file).await;
+            let mut details = vec![
+                format!("the file is {:?} ({}), in {folder}", file.name, file.id),
+                format!(
+                    "it is now {} of {}, last changed {}",
+                    match file.size {
+                        Some(n) => format!(
+                            "{} ({n} bytes)",
+                            uploads::megabytes(usize::try_from(n).unwrap_or(usize::MAX))
+                        ),
+                        None => "of a size Drive does not report".to_string(),
+                    },
+                    file.mime_type,
+                    dto::instant(file.modified_time, call.tz)
+                        .unwrap_or_else(|| "at a time Drive does not report".to_string())
+                ),
+                format!(
+                    "the new content is {} ({size} bytes), uploaded as {:?}",
+                    uploads::megabytes(size),
+                    staged.filename
+                ),
+            ];
+            if let Some(name) = &new_name {
+                details.push(format!("the file is renamed to {name:?}"));
+            }
+            details.push(
+                "the file keeps its id, its link and its folder; only its content changes"
+                    .to_string(),
+            );
+            details.push(
+                "the current version is kept forever in the file's version history in Drive, \
+                 where the person finds it under Manage versions; it does not appear as a \
+                 second file in the folder"
+                    .to_string(),
+            );
+            details.push(
+                "if Drive refuses to keep the current version, nothing is replaced and the \
+                 upload stays staged"
+                    .to_string(),
+            );
+            return Ok(Json(Confirmable::Preview(PreviewOut::new(
+                format!(
+                    "replace the content of {:?} in Drive in `{}`, in {folder}",
+                    file.name, connection.label
+                ),
+                details,
+            ))));
+        }
+        // The old content is made safe first. Without the mark, Drive deletes
+        // a version 30 days after newer content arrives, so new content over
+        // an unmarked version would be a delete with a delay.
+        match drive::keep_forever(client, connection.id, &file.id, &head).await {
+            Ok(revision) if revision.keep_forever => {}
+            Ok(_) => {
+                return Err(refuse(format!(
+                    "Drive answered the request to keep the current version of {:?} forever \
+                     without marking it so, and this server replaces no content it cannot \
+                     keep. {unchanged}",
+                    file.name
+                )));
+            }
+            Err(e) if access_refused(&e) => {
+                return Err(refuse(file_refusal(&file, &upload_id, &e.to_string())));
+            }
+            Err(e) => {
+                let mut note = format!(
+                    "Drive did not mark the current version of {:?} keep forever, so nothing \
+                     was replaced: new content over an unmarked version would leave the old \
+                     content to be deleted after 30 days. The upload `{upload_id}` is still \
+                     staged.",
+                    file.name
+                );
+                if kept.more {
+                    note.push_str(&format!(
+                        " The file has more versions than one read lists, so it may have \
+                         reached the limit of {} versions kept forever; the person can unpin \
+                         or delete an old version under Manage versions in Drive.",
+                        drive::KEEP_FOREVER_MAX
+                    ));
+                }
+                return Err(with_note(self.google_err_for(&connection, e), &note));
+            }
+        }
+        // The file's own type for the content part: the two were checked to
+        // be the same, and Drive's spelling of it changes nothing.
+        let replaced = match drive::replace(
+            client,
+            connection.id,
+            &file.id,
+            new_name.as_deref(),
+            &file.mime_type,
+            &staged.bytes,
+        )
+        .await
+        {
+            Ok(replaced) => replaced,
+            Err(e) => {
+                return Err(with_note(
+                    self.google_err_for(&connection, e),
+                    &format!(
+                        "The current version {head} of {:?} is now marked keep forever, and \
+                         nothing else changed: the file still has its old content and its old \
+                         name. The mark is harmless and stays. The upload `{upload_id}` is \
+                         still staged.",
+                        file.name
+                    ),
+                ));
+            }
+        };
+        // Drive has the new content, so the upload is spent now and not before.
+        if let Err(e) = self
+            .state
+            .staging
+            .take(user_id, std::slice::from_ref(&upload_id))
+        {
+            tracing::warn!("spending the upload {upload_id} after Drive took it: {e}");
+        }
+        let size = replaced.size.unwrap_or(size as u64);
+        let mut written = format!(
+            "replaced the content of {:?} with {}",
+            file.name,
+            uploads::megabytes(usize::try_from(size).unwrap_or(usize::MAX))
+        );
+        if new_name.is_some() {
+            written.push_str(&format!(" and renamed it to {:?}", replaced.name));
+        }
+        written.push_str(&format!(
+            "; the previous version {head} is kept forever in its version history, under \
+             Manage versions in Drive"
+        ));
+        Ok(Json(Confirmable::Done(dto::DriveUpdateOut {
+            account: connection.label,
+            url: replaced
+                .web_view_link
+                .clone()
+                .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", replaced.id)),
+            written,
+            file_id: replaced.id,
+            name: replaced.name,
+            mime_type: replaced.mime_type,
+            size,
+            modified_time: dto::instant(replaced.modified_time, call.tz),
+            pinned_revision_id: head,
+        })))
+    }
+}
+
+impl Gmcp {
+    /// The folder a file is in, by name, for a preview. A preview is not
+    /// refused over a name it cannot read: it falls back to the id.
+    async fn folder_of(&self, connection: &Connection, file: &drive::FileMeta) -> String {
+        let Some(id) = file.parents.first() else {
+            return "no folder this account can see".to_string();
+        };
+        let found = match self.google() {
+            Ok(google) => drive::folder(&google.client, connection.id, id).await.ok(),
+            Err(_) => None,
+        };
+        match found {
+            Some(folder) => format!("the folder {:?}", folder.name),
+            None => format!("the folder {id}"),
+        }
+    }
+}
+
+/// True when two MIME types name the same type: case and parameters such as
+/// a charset do not count.
+fn same_type(a: &str, b: &str) -> bool {
+    let essence = |t: &str| {
+        t.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    essence(a) == essence(b)
+}
+
+/// What a caller is told when Drive refused the file to this server. Nothing
+/// was changed, and the caller's next step is in the message.
+fn file_refusal(file: &drive::FileMeta, upload_id: &str, google: &str) -> String {
+    format!(
+        "Drive refused to change the file {:?} ({}): it could not be written to with the access \
+         this server holds. This server can change the files it put in Drive itself, and a file \
+         the person put there by hand is usually not one of them. Nothing was replaced, and no \
+         version was marked. The upload `{upload_id}` is still staged: drive_upload stores it as \
+         a new file instead. ({google})",
+        file.name, file.id
+    )
+}
+
+/// What a caller is told when the file already has as many versions kept
+/// forever as Drive allows.
+fn limit_refusal(file: &drive::FileMeta, kept: usize, upload_id: &str) -> String {
+    format!(
+        "Drive keeps at most {} versions of one file forever, and {:?} already has {kept}. This \
+         server replaces a file's content only after it has marked the current version keep \
+         forever, so nothing was replaced, and the upload `{upload_id}` is still staged. To make \
+         room, the person opens Manage versions for this file in Drive and unpins or deletes an \
+         old version kept forever; this server does neither. To keep both, store the upload as \
+         a new file with drive_upload",
+        drive::KEEP_FOREVER_MAX,
+        file.name
+    )
 }
 
 impl Gmcp {
@@ -1038,7 +1358,7 @@ impl Gmcp {
                 Ok(made) => made,
                 Err(e) => {
                     let error = match &parent {
-                        Some(f) if folder_refused(&e) => {
+                        Some(f) if access_refused(&e) => {
                             refuse(path_refusal(f, &name, upload_id, &e.to_string()))
                         }
                         _ => with_note(
@@ -1166,12 +1486,14 @@ fn parent_refusal(parent: &drive::Folder, name: &str, google: &str) -> String {
     )
 }
 
-/// True when Drive refused the parent folder rather than the file. These are
-/// the three answers the Drive reference gives for a file the app may not
-/// write or cannot see: `notFound` (404), and `insufficientFilePermissions`
-/// and `appNotAuthorizedToFile` (403). Every other 403 — a full quota, a rate
-/// limit — is about the account and not the folder, and is passed through.
-fn folder_refused(e: &GoogleFailure) -> bool {
+/// True when Drive refused this server the item it was writing to: the parent
+/// folder of an upload, or the file whose content drive_update_file replaces.
+/// These are the three answers the Drive reference gives for a file the app
+/// may not write or cannot see: `notFound` (404), and
+/// `insufficientFilePermissions` and `appNotAuthorizedToFile` (403). Every
+/// other 403 — a full quota, a rate limit — is about the account and not the
+/// item, and is passed through.
+fn access_refused(e: &GoogleFailure) -> bool {
     match e {
         GoogleFailure::Google(g) => {
             g.status == 404

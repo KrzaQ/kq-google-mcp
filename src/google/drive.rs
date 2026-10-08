@@ -1,6 +1,7 @@
 //! Drive: search, metadata, download, export, the two file creations that
 //! make a Doc out of markdown and a Sheet out of CSV, the one that stores a
-//! file as it is, and the folders a file goes into.
+//! file as it is, the folders a file goes into, and the replacement of a
+//! file's content with the revision it replaces marked keep forever.
 //!
 //! Shared drives are deliberately out of this release: every call goes against
 //! the person's own corpus, so `supportsAllDrives` is never set and a file
@@ -519,6 +520,142 @@ async fn create(
     Ok(wire.into())
 }
 
+/// How many revisions of one file Drive keeps forever at most. The reference
+/// on `keepForever`: "This can be set on a maximum of 200 revisions for a
+/// file."
+pub const KEEP_FOREVER_MAX: usize = 200;
+
+/// A file whose content is about to be replaced, with the one revision that
+/// the replacement makes old.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revisable {
+    pub file: FileMeta,
+    /// The revision that holds the content now. Drive reports it only for a
+    /// file with binary content, so a Google Doc has none.
+    pub head_revision_id: Option<String>,
+}
+
+/// `files.get` for a file whose content is about to be replaced: the fields a
+/// search answers, and the head revision.
+pub async fn revisable(client: &Client, connection_id: i64, file_id: &str) -> Result<Revisable> {
+    let request = client
+        .get(&format!("drive/v3/files/{}", urlencode(file_id)))?
+        .query(&[("fields", format!("{FILE_FIELDS},headRevisionId"))]);
+    let mut wire: WireFile = client.json(connection_id, request).await?;
+    let head_revision_id = wire.head_revision_id.take().filter(|r| !r.is_empty());
+    Ok(Revisable {
+        file: wire.into(),
+        head_revision_id,
+    })
+}
+
+/// How many revisions one read of `revisions.list` asks for. The reference
+/// caps the page at 1000. A file with binary content holds at most 200
+/// revisions kept forever and 100 that are not, so one page holds them all.
+const REVISIONS_PAGE: u32 = 1000;
+
+/// The revisions of a file that are marked keep forever.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptForever {
+    pub ids: Vec<String>,
+    /// True when Drive had more than one page of revisions, so `ids` may be
+    /// short.
+    pub more: bool,
+}
+
+/// `revisions.list`, reduced to the revisions kept forever.
+pub async fn kept_forever(
+    client: &Client,
+    connection_id: i64,
+    file_id: &str,
+) -> Result<KeptForever> {
+    let request = client
+        .get(&format!("drive/v3/files/{}/revisions", urlencode(file_id)))?
+        .query(&[
+            (
+                "fields",
+                "revisions(id,keepForever),nextPageToken".to_string(),
+            ),
+            ("pageSize", REVISIONS_PAGE.to_string()),
+        ]);
+    let wire: WireRevisionList = client.json(connection_id, request).await?;
+    Ok(KeptForever {
+        more: wire.next_page_token.is_some(),
+        ids: wire
+            .revisions
+            .into_iter()
+            .filter(|r| r.keep_forever)
+            .map(|r| r.id)
+            .collect(),
+    })
+}
+
+/// One revision of a file, as `revisions.update` answers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revision {
+    pub id: String,
+    pub keep_forever: bool,
+}
+
+/// `revisions.update` with `keepForever: true`. Drive purges a revision that
+/// is not the head 30 days after newer content is uploaded, unless it is
+/// marked this way. The caller checks [`Revision::keep_forever`] in the
+/// answer rather than trusting a 200.
+pub async fn keep_forever(
+    client: &Client,
+    connection_id: i64,
+    file_id: &str,
+    revision_id: &str,
+) -> Result<Revision> {
+    let request = client
+        .patch(&format!(
+            "drive/v3/files/{}/revisions/{}",
+            urlencode(file_id),
+            urlencode(revision_id)
+        ))?
+        .query(&[("fields", "id,keepForever")])
+        .json(&serde_json::json!({ "keepForever": true }));
+    let wire: WireRevision = client.json(connection_id, request).await?;
+    Ok(Revision {
+        id: wire.id,
+        keep_forever: wire.keep_forever,
+    })
+}
+
+/// `files.update` with `uploadType=multipart`: new content for an existing
+/// file, under the same id. The metadata carries `name` when one is given and
+/// nothing otherwise, so no other property of the file changes: no parent is
+/// added or removed. A Google-native type is refused, as [`upload`] refuses
+/// it, because naming one asks Drive for a conversion.
+pub async fn replace(
+    client: &Client,
+    connection_id: i64,
+    file_id: &str,
+    name: Option<&str>,
+    mime_type: &str,
+    content: &[u8],
+) -> Result<FileMeta> {
+    if mime_type.starts_with(GOOGLE_APPS_PREFIX) {
+        return Err(Error::Unsupported(format!(
+            "{mime_type} is a type Drive converts a file into, and new content is stored as it \
+             is; upload the file under the type it really has"
+        )));
+    }
+    let mut metadata = serde_json::json!({});
+    if let Some(name) = name {
+        metadata["name"] = serde_json::json!(name);
+    }
+    let boundary = multipart::boundary();
+    let body = multipart::related(&boundary, &metadata.to_string(), mime_type, content);
+    let request = client
+        .patch(&format!("upload/drive/v3/files/{}", urlencode(file_id)))?
+        .query(&[("uploadType", "multipart"), ("fields", FILE_FIELDS)])
+        .header(reqwest::header::CONTENT_TYPE, multipart::header(&boundary))
+        .body(body);
+    let wire: WireFile = client.json(connection_id, request).await?;
+    Ok(wire.into())
+}
+
 /// Refuse a format the file cannot produce, with the ones it can.
 pub fn check_export_format(file: &FileMeta, format: ExportFormat) -> Result<()> {
     let allowed = ExportFormat::allowed_for(&file.mime_type);
@@ -560,6 +697,22 @@ struct WireFile {
     web_view_link: Option<String>,
     parents: Vec<String>,
     owners: Vec<WireOwner>,
+    /// Present only when it was asked for, as [`revisable`] does.
+    head_revision_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireRevision {
+    id: String,
+    keep_forever: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WireRevisionList {
+    revisions: Vec<WireRevision>,
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

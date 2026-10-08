@@ -39,7 +39,9 @@ database and no network.
   They come in the same way round: `gmail_upload_link` mints a URL, the agent
   POSTs the bytes to it, and the upload id it reads back goes to a draft tool,
   which attaches the file and forgets it. `drive_upload_link` and
-  `drive_upload` store a file in Drive the same way. Nothing reads a path a
+  `drive_upload` store a file in Drive the same way, and `drive_update_file`
+  replaces the content of a file already there, after it has marked the old
+  version keep forever in Drive's version history. Nothing reads a path a
   model supplies — the caller is on another machine — and no ticket or staged
   file outlives a restart.
 - **Every call is logged** — who, which token, which connection, which tool,

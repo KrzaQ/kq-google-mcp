@@ -514,3 +514,137 @@ async fn folders_of_one_name_are_all_found_and_only_that_name_is_kept() {
         .unwrap();
     assert!(found.folders.is_empty());
 }
+
+const REVISABLE: &str = "1ReViSaBlEfIlEiDeXaMpLe0123456789ab";
+const HEAD: &str = "0B3hEaDrEvIsIoNiDeXaMpLe0123456789";
+
+/// The four calls behind a replacement: the read names the head revision,
+/// the list keeps only what is kept forever, the pin asks for keep forever
+/// and nothing else, and the new content goes to the upload endpoint of the
+/// same file with a name only when one is given.
+#[tokio::test]
+async fn a_file_is_read_with_its_head_revision_pinned_and_replaced_in_place() {
+    let h = harness().await;
+    h.mount_json(
+        "GET",
+        &format!("/drive/v3/files/{REVISABLE}"),
+        fixture("drive_file_revisable.json"),
+    )
+    .await;
+    h.mount_json(
+        "GET",
+        &format!("/drive/v3/files/{REVISABLE}/revisions"),
+        fixture("drive_revisions.json"),
+    )
+    .await;
+    h.mount_json(
+        "PATCH",
+        &format!("/drive/v3/files/{REVISABLE}/revisions/{HEAD}"),
+        fixture("drive_revision_kept.json"),
+    )
+    .await;
+    h.mount_json(
+        "PATCH",
+        &format!("/upload/drive/v3/files/{REVISABLE}"),
+        fixture("drive_file_replaced.json"),
+    )
+    .await;
+
+    let read = drive::revisable(&h.client, CONNECTION, REVISABLE)
+        .await
+        .unwrap();
+    assert_eq!(read.head_revision_id.as_deref(), Some(HEAD));
+    assert_eq!(read.file.size, Some(26112));
+    let query: std::collections::HashMap<_, _> = h
+        .last("GET", &format!("/drive/v3/files/{REVISABLE}"))
+        .await
+        .url
+        .query_pairs()
+        .into_owned()
+        .collect();
+    assert!(query["fields"].contains("headRevisionId"), "{query:?}");
+
+    let kept = drive::kept_forever(&h.client, CONNECTION, REVISABLE)
+        .await
+        .unwrap();
+    assert_eq!(kept.ids, ["0B1oLdErReViSiOnIdExAmPlE012345678"]);
+    assert!(!kept.more);
+
+    let pinned = drive::keep_forever(&h.client, CONNECTION, REVISABLE, HEAD)
+        .await
+        .unwrap();
+    assert_eq!(pinned.id, HEAD);
+    assert!(pinned.keep_forever);
+    assert_eq!(
+        h.last_body(
+            "PATCH",
+            &format!("/drive/v3/files/{REVISABLE}/revisions/{HEAD}")
+        )
+        .await,
+        serde_json::json!({"keepForever": true})
+    );
+
+    let bytes = b"%PDF-1.7\r\n\xff\xfe new".to_vec();
+    let at = format!("/upload/drive/v3/files/{REVISABLE}");
+    let replaced = drive::replace(
+        &h.client,
+        CONNECTION,
+        REVISABLE,
+        None,
+        "application/pdf",
+        &bytes,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced.id, REVISABLE);
+    assert_eq!(replaced.size, Some(16));
+    let request = h.last("PATCH", &at).await;
+    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+    assert_eq!(query["uploadType"], "multipart");
+    assert!(!query.contains_key("addParents"), "{query:?}");
+    assert!(!query.contains_key("removeParents"), "{query:?}");
+    let text = String::from_utf8_lossy(&request.body);
+    assert!(
+        text.contains("\r\n\r\n{}\r\n"),
+        "no name, no metadata: {text}"
+    );
+    assert!(
+        request
+            .body
+            .windows(bytes.len())
+            .any(|w| w == bytes.as_slice()),
+        "the bytes arrive exactly as they were given"
+    );
+
+    drive::replace(
+        &h.client,
+        CONNECTION,
+        REVISABLE,
+        Some("Faktura 03-2026 (korekta).pdf"),
+        "application/pdf",
+        &bytes,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&h.last("PATCH", &at).await.body).into_owned();
+    assert!(
+        text.contains("{\"name\":\"Faktura 03-2026 (korekta).pdf\"}"),
+        "{text}"
+    );
+
+    // A Google type asks for a conversion, so it is refused before anything
+    // is sent.
+    let before = h.requests().await.len();
+    let refused = drive::replace(
+        &h.client,
+        CONNECTION,
+        REVISABLE,
+        None,
+        drive::DOCUMENT_MIME,
+        b"# notes",
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.to_string().contains("stored as it is"), "{refused}");
+    assert_eq!(h.requests().await.len(), before);
+}

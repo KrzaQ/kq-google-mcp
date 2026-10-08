@@ -109,7 +109,8 @@ to say about itself is here and in `README.md`.
   staged. A folder comes from `drive_create_folder` or from `folder_path`, which
   creates each missing folder of a path, refuses a name two folders share, and
   names in every failure the folders it already created, because nothing in
-  Drive is deleted to roll back.
+  Drive is deleted to roll back. `drive_update_file` replaces a file's content
+  in place, and only after it has marked the version it replaces keep forever.
 - Every tool call, link mint and link hit is logged, with the arguments
   stripped of bodies and cut at 4 KB. Tool output is never logged.
 - **Tests must not need the network, a file on disk or an existing database.**
