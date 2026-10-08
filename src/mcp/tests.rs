@@ -7870,3 +7870,22 @@ async fn an_empty_segment_in_a_folder_path_is_refused() {
     assert_eq!(a.staged_files(), 1);
     drop(server);
 }
+
+/// drive_search finds folders through `mime_type` already, and its listing
+/// says which type that is, so a model never has to guess it.
+#[tokio::test]
+async fn drive_search_says_how_to_list_folders() {
+    let db = Db::open_memory().await.unwrap();
+    let (_, _, secret) = one_of_everything(&db, &["drive:read"], ClientProfile::Generic).await;
+    let mut c = Client::new(app(&db, None).await, secret);
+    c.initialize().await;
+    let tools = c.tools().await;
+    let search = tools.iter().find(|t| t["name"] == "drive_search").unwrap();
+    assert!(
+        search["description"]
+            .as_str()
+            .unwrap()
+            .contains("mime_type \"application/vnd.google-apps.folder\""),
+        "{search}"
+    );
+}

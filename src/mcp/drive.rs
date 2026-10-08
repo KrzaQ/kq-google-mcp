@@ -41,7 +41,8 @@ pub struct DriveSearchParam {
     /// A fragment of the file name
     pub name_contains: Option<String>,
     /// An exact MIME type, e.g. "application/pdf" or
-    /// "application/vnd.google-apps.spreadsheet"
+    /// "application/vnd.google-apps.spreadsheet"; folders are
+    /// "application/vnd.google-apps.folder"
     pub mime_type: Option<String>,
     /// Only files changed after this time. An RFC 3339 instant with an
     /// offset, or a plain 2026-09-08T14:00 or 2026-09-08 on the person's own
@@ -141,7 +142,10 @@ impl Gmcp {
     #[tool(
         description = "Find files in Drive by name, type, age or a raw Drive query, newest \
                        change first. Returns id, name, MIME type, modified time, size, owners and \
-                       the web link. Files in the bin are never listed."
+                       the web link. Files in the bin are never listed. A folder is a file too: \
+                       pass mime_type \"application/vnd.google-apps.folder\" to list folders, \
+                       and pass a folder's id as `folder` to drive_upload or as `parent` to \
+                       drive_create_folder."
     )]
     async fn drive_search(
         &self,
