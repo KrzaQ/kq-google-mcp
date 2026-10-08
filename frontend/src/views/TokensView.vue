@@ -5,6 +5,9 @@
 //
 // "Fill as new" copies a token into the form through the same rules the form
 // enforces, so replacing a token is one changed box and Create, not retyping.
+// A name an active token already carries is asked about before anything is
+// created. "Create and revoke" creates first and revokes only after that
+// succeeded, so a failure never leaves the person without a working token.
 //
 // The secret exists for one render. Everything a person needs to paste it
 // somewhere is shown next to it, because there is no second chance.
@@ -13,6 +16,7 @@ import { api } from '@/api/client'
 import type { ConnectionDto, ScopeRegistry, TokenCreated, TokenDto } from '@/api/types'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import {
+  activeNamed,
   copyNotes,
   emptyForm,
   formFromToken,
@@ -38,6 +42,9 @@ const form = ref<TokenForm>(emptyForm())
 const notes = ref<string[]>([])
 const formEl = ref<HTMLFormElement | null>(null)
 const nameEl = ref<HTMLInputElement | null>(null)
+// The active tokens that already carry the name being created. The question
+// is open while this is not empty.
+const clash = ref<TokenDto[]>([])
 // A revoked token stays in the list for the record, but the person comes here
 // to work with the active ones. The choice lasts as long as the page does.
 const showRevoked = ref(false)
@@ -49,9 +56,20 @@ const shownTokens = computed(() =>
 
 const pickerOff = computed(() => pickerDisabled(form.value.delegate))
 const blocked = computed(() => whyNotCreatable(form.value))
+const clashText = computed(() => {
+  const n = clash.value.length
+  const name = clash.value[0]?.name ?? ''
+  return n === 1
+    ? `An active token is already named "${name}". Create the new token and revoke the old one, or keep both? The old one is revoked only after the new one exists.`
+    : `${n} active tokens are already named "${name}". Create the new token and revoke the old ones, or keep them all? The old ones are revoked only after the new one exists.`
+})
 const snippets = computed(() =>
   created.value ? snippetsFor(publicOrigin(), created.value.secret) : [],
 )
+
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
 
 async function load() {
   error.value = null
@@ -62,7 +80,7 @@ async function load() {
     connections.value = c
     if (!form.value.client) form.value.client = r.clients[0] ?? 'generic'
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
+    error.value = messageOf(e)
   }
 }
 
@@ -88,16 +106,61 @@ function fillFrom(t: TokenDto) {
   nameEl.value?.focus({ preventScroll: true })
 }
 
-async function create() {
+function submit() {
   if (!registry.value || blocked.value) return
+  const same = activeNamed(tokens.value, form.value.name)
+  if (same.length > 0) clash.value = same
+  else void create([])
+}
+
+function answerClash(revokeOld: boolean) {
+  const old = clash.value
+  clash.value = []
+  void create(revokeOld ? old : [])
+}
+
+/**
+ * Create the token in the form, then revoke `replaced`. When the create
+ * fails, nothing is revoked. When a revoke fails, the message says that the
+ * new token exists and the old one still works, so nobody has to guess.
+ */
+async function create(replaced: readonly TokenDto[]) {
+  if (!registry.value) return
   error.value = null
   try {
     created.value = await api.tokens.create(tokenInput(registry.value, form.value))
-    form.value = emptyForm(registry.value.clients[0] ?? 'generic')
-    notes.value = []
+  } catch (e) {
+    error.value = messageOf(e)
+    return
+  }
+  const name = created.value.name
+  form.value = emptyForm(registry.value.clients[0] ?? 'generic')
+  notes.value = []
+
+  const failures: string[] = []
+  for (const old of replaced) {
+    try {
+      await api.tokens.revoke(old.id)
+    } catch (e) {
+      failures.push(messageOf(e))
+    }
+  }
+  if (failures.length > 0) {
+    const one = failures.length === 1
+    const which =
+      replaced.length === 1
+        ? `The old token "${replaced[0]!.name}" was not revoked`
+        : `${failures.length} of the ${replaced.length} old tokens named "${name}" ${one ? 'was' : 'were'} not revoked`
+    const still = one ? 'It is still active. Revoke it' : 'They are still active. Revoke them'
+    error.value =
+      `The new token "${name}" was created, and its secret is below. ` +
+      `${which}: ${failures[0]}. ${still} in the table.`
+  }
+
+  try {
     tokens.value = await api.tokens.list()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
+    error.value ??= messageOf(e)
   }
 }
 
@@ -109,7 +172,7 @@ async function revoke() {
     await api.tokens.revoke(t.id)
     tokens.value = await api.tokens.list()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
+    error.value = messageOf(e)
   }
 }
 
@@ -233,7 +296,7 @@ onMounted(load)
       ref="formEl"
       class="card space-y-4 p-4"
       data-testid="token-form"
-      @submit.prevent="create"
+      @submit.prevent="submit"
     >
       <h2 class="font-medium">New token</h2>
 
@@ -369,6 +432,20 @@ onMounted(load)
       danger
       @confirm="revoke"
       @cancel="revoking = null"
+    />
+
+    <ConfirmDialog
+      :open="clash.length > 0"
+      title="Name already in use"
+      :message="clashText"
+      :confirm-label="
+        clash.length === 1 ? 'Create and revoke the old one' : 'Create and revoke the old ones'
+      "
+      :other-label="clash.length === 1 ? 'Create and keep both' : 'Create and keep them all'"
+      danger
+      @confirm="answerClash(true)"
+      @other="answerClash(false)"
+      @cancel="clash = []"
     />
   </main>
 </template>

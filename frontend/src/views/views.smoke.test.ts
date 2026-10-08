@@ -27,6 +27,8 @@ const calls: string[] = []
 const bodies = new Map<string, unknown>()
 // What `GET /api/tokens` answers; a test that needs other tokens sets it.
 let tokenList: TokenDto[] = fixtures.tokens
+// Requests named here, as "METHOD /path", fail with a server error.
+const failing = new Set<string>()
 
 function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = String(input)
@@ -34,6 +36,10 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
   const method = init?.method ?? 'GET'
   calls.push(`${method} ${url}`)
   if (typeof init?.body === 'string') bodies.set(`${method} ${path}`, JSON.parse(init.body))
+  if (failing.has(`${method} ${path}`))
+    return Promise.resolve(
+      json({ error: { code: 'internal', message: 'database is locked' } }, 500),
+    )
 
   if (path === '/api/me' && method === 'PATCH') {
     const patch = init?.body as string
@@ -97,6 +103,7 @@ describe('views', () => {
     calls.length = 0
     bodies.clear()
     tokenList = fixtures.tokens
+    failing.clear()
     // jsdom lays nothing out and has no scrollIntoView; a view may still ask.
     Element.prototype.scrollIntoView = vi.fn()
     errors = []
@@ -362,6 +369,124 @@ describe('views', () => {
     expect(errors).toEqual([])
   })
 
+  // The dialog is teleported into the body, outside the wrapper.
+  function dialogButton(name: 'confirm-yes' | 'confirm-other' | 'cancel'): HTMLElement {
+    const dialog = document.querySelector('[data-testid="confirm-dialog"]')!
+    if (name === 'cancel')
+      return [...dialog.querySelectorAll('button')].find((b) => b.textContent!.trim() === 'Cancel')!
+    return dialog.querySelector(`[data-testid="${name}"]`) as HTMLElement
+  }
+
+  async function createNamed(w: Awaited<ReturnType<typeof render>>, name: string) {
+    await w.find('[data-testid="token-name"]').setValue(name)
+    await w.find('[data-testid="scope-gmail:read"]').setValue(true)
+    await w.find('[data-testid="token-form"]').trigger('submit')
+    await flushPromises()
+  }
+
+  const posted = () => calls.filter((c) => c === 'POST /api/tokens').length
+  const deleted = () => calls.filter((c) => c.startsWith('DELETE /api/tokens/'))
+
+  it('TokensView asks before reusing the name of an active token, and Cancel creates nothing', async () => {
+    const w = await render(TokensView, '/tokens')
+    await createNamed(w, ' Claude-Code ')
+    expect(posted()).toBe(0)
+    const dialog = document.querySelector('[data-testid="confirm-dialog"]')!
+    expect(dialog.textContent).toContain('An active token is already named "claude-code"')
+    expect(dialogButton('confirm-yes').textContent!.trim()).toBe('Create and revoke the old one')
+    expect(dialogButton('confirm-other').textContent!.trim()).toBe('Create and keep both')
+
+    dialogButton('cancel').click()
+    await flushPromises()
+    expect(document.querySelector('[data-testid="confirm-dialog"]')).toBeNull()
+    expect(posted()).toBe(0)
+    expect(deleted()).toEqual([])
+    // Nothing was thrown away: the person can change the name and go on.
+    expect((w.find('[data-testid="token-name"]').element as HTMLInputElement).value).toBe(
+      ' Claude-Code ',
+    )
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView does not ask when only a revoked token has the name', async () => {
+    const w = await render(TokensView, '/tokens')
+    await createNamed(w, 'LAPTOP')
+    expect(document.querySelector('[data-testid="confirm-dialog"]')).toBeNull()
+    expect(posted()).toBe(1)
+    expect(w.find('[data-testid="token-secret"]').exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView creates the new token before it revokes the old one', async () => {
+    const w = await render(TokensView, '/tokens')
+    await w.findAll('[data-testid="fill-as-new"]')[0]!.trigger('click')
+    await w.find('[data-testid="scope-docs:read"]').setValue(true)
+    await w.find('[data-testid="token-form"]').trigger('submit')
+    await flushPromises()
+    expect(posted()).toBe(0)
+
+    dialogButton('confirm-yes').click()
+    await flushPromises()
+    const create = calls.indexOf('POST /api/tokens')
+    const revoke = calls.indexOf('DELETE /api/tokens/10')
+    expect(create).toBeGreaterThanOrEqual(0)
+    expect(revoke).toBeGreaterThan(create)
+    // Only the token with the name goes, and the table is read again after.
+    expect(deleted()).toEqual(['DELETE /api/tokens/10'])
+    expect(calls.lastIndexOf('GET /api/tokens')).toBeGreaterThan(revoke)
+    expect(w.find('[data-testid="token-secret"]').exists()).toBe(true)
+    expect(w.find('[data-testid="tokens-error"]').exists()).toBe(false)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView keeps both tokens when asked to', async () => {
+    const w = await render(TokensView, '/tokens')
+    await createNamed(w, 'claude-code')
+    dialogButton('confirm-other').click()
+    await flushPromises()
+    expect(posted()).toBe(1)
+    expect(deleted()).toEqual([])
+    expect(w.find('[data-testid="token-secret"]').exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView revokes nothing when the create fails', async () => {
+    const w = await render(TokensView, '/tokens')
+    // A token made earlier in the visit leaves its secret on the screen; a
+    // failed create must not take that as its own success.
+    await createNamed(w, 'desktop')
+    expect(posted()).toBe(1)
+
+    failing.add('POST /api/tokens')
+    await createNamed(w, 'claude-code')
+    dialogButton('confirm-yes').click()
+    await flushPromises()
+    expect(posted()).toBe(2)
+    expect(deleted()).toEqual([])
+    expect(w.find('[data-testid="tokens-error"]').text()).toBe('database is locked')
+    // The form keeps what was typed, ready for another try.
+    expect((w.find('[data-testid="token-name"]').element as HTMLInputElement).value).toBe(
+      'claude-code',
+    )
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView says both facts when the revoke fails after a create', async () => {
+    failing.add('DELETE /api/tokens/10')
+    const w = await render(TokensView, '/tokens')
+    await createNamed(w, 'claude-code')
+    dialogButton('confirm-yes').click()
+    await flushPromises()
+    expect(deleted()).toEqual(['DELETE /api/tokens/10'])
+    const said = w.find('[data-testid="tokens-error"]').text()
+    expect(said).toContain('The new token "new" was created, and its secret is below.')
+    expect(said).toContain('was not revoked: database is locked.')
+    expect(said).toContain('It is still active.')
+    // The secret is the one thing that cannot be shown again.
+    expect(w.find('[data-testid="token-secret"]').text()).toContain('gg_shown_once')
+    expect(errors).toEqual([])
+  })
+
   it('TokensView ticks the read level along and disables the picker for a delegate', async () => {
     const w = await render(TokensView, '/tokens')
     await w.find('[data-testid="scope-docs:write"]').setValue(true)
@@ -378,12 +503,12 @@ describe('views', () => {
 
   it('TokensView shows the secret once, with a snippet per client', async () => {
     const w = await render(TokensView, '/tokens')
-    await w.find('[data-testid="token-name"]').setValue('claude-code')
+    await w.find('[data-testid="token-name"]').setValue('desktop')
     await w.find('[data-testid="scope-gmail:draft"]').setValue(true)
     await w.find('[data-testid="token-form"]').trigger('submit')
     await flushPromises()
     expect(bodies.get('POST /api/tokens')).toEqual({
-      name: 'claude-code',
+      name: 'desktop',
       client: 'generic',
       scopes: ['gmail:read', 'gmail:draft'],
       all_connections: true,

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { connections, registry, tokens } from '@/api/fixtures'
 import type { TokenDto } from '@/api/types'
 import {
+  activeNamed,
   copyNotes,
   emptyForm,
   formFromToken,
@@ -222,5 +223,22 @@ describe('copying a token into the form', () => {
     expect(copyNotes(copy)).toEqual([
       'Not copied: client profile emacs. This server no longer knows it, so the form uses generic.',
     ])
+  })
+})
+
+describe('a name already in use', () => {
+  it('is matched trimmed and without regard to case', () => {
+    expect(activeNamed(tokens, '  Claude-CODE ').map((t) => t.id)).toEqual([10])
+    expect(activeNamed(tokens, 'claude')).toEqual([])
+  })
+
+  it('does not count when only a revoked token carries it', () => {
+    expect(tokens.find((t) => t.name === 'laptop')?.revoked_at).toBeTruthy()
+    expect(activeNamed(tokens, 'laptop')).toEqual([])
+  })
+
+  it('finds every active token that carries it', () => {
+    const twice = [...tokens, { ...tokens[0]!, id: 12, name: 'Claude-Code' }]
+    expect(activeNamed(twice, 'claude-code').map((t) => t.id)).toEqual([10, 12])
   })
 })

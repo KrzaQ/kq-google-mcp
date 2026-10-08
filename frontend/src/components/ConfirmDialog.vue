@@ -15,8 +15,10 @@ defineProps<{
   message: string
   confirmLabel?: string
   danger?: boolean
+  /** A second way to go ahead, shown between Cancel and the confirm button. */
+  otherLabel?: string
 }>()
-const emit = defineEmits<{ confirm: []; cancel: [] }>()
+const emit = defineEmits<{ confirm: []; other: []; cancel: [] }>()
 </script>
 
 <template>
@@ -29,10 +31,18 @@ const emit = defineEmits<{ confirm: []; cancel: [] }>()
       >
         <DialogTitle class="text-lg font-semibold">{{ title }}</DialogTitle>
         <DialogDescription class="mt-2 text-sm text-muted">{{ message }}</DialogDescription>
-        <div class="mt-6 flex justify-end gap-2">
+        <div class="mt-6 flex flex-wrap justify-end gap-2">
           <DialogClose as-child>
             <button class="btn-secondary" @click="emit('cancel')">Cancel</button>
           </DialogClose>
+          <button
+            v-if="otherLabel"
+            class="btn-secondary"
+            data-testid="confirm-other"
+            @click="emit('other')"
+          >
+            {{ otherLabel }}
+          </button>
           <button
             :class="danger ? 'btn-danger' : 'btn'"
             data-testid="confirm-yes"

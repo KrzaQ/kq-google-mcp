@@ -212,3 +212,12 @@ export function copyNotes(copy: CopiedForm): string[] {
     )
   return notes
 }
+
+/**
+ * The active tokens that already carry this name, trimmed and compared
+ * without regard to case. A revoked token does not count: its name is free.
+ */
+export function activeNamed(tokens: readonly TokenDto[], name: string): TokenDto[] {
+  const want = name.trim().toLowerCase()
+  return tokens.filter((t) => !t.revoked_at && t.name.trim().toLowerCase() === want)
+}
