@@ -487,7 +487,7 @@ pub struct DriveUploadOut {
     pub url: String,
     /// The folders this call created for `folder_path`, outermost first.
     /// Absent when it created none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_folders: Vec<CreatedFolderOut>,
     /// What happened, in one line the model can repeat to the person.
     pub written: String,
@@ -699,7 +699,7 @@ pub struct DocParagraphOut {
     /// The pictures this paragraph holds, by the labels docs_list_images and
     /// the text of docs_read use: ["image3"]. Absent when it holds none, so a
     /// paragraph that carries a picture is told apart from a blank line.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     pub text: String,
     /// True when `text` was cut to keep the answer small; ask for this
@@ -739,7 +739,7 @@ pub struct DocRunsOut {
     /// The pictures this paragraph holds, by the labels docs_list_images and
     /// the text of docs_read use. A picture carries no runs, so a paragraph
     /// holding one answers no runs at all, exactly like a blank line.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// The runs, in order and covering the paragraph end to end.
     pub runs: Vec<DocRunOut>,
