@@ -52,6 +52,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 wiremock = "0.6"
 http-body-util = "0.1"
+jsonschema = "0.58.6"
 
 [profile.release]
 lto = "thin"

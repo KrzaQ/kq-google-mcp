@@ -214,10 +214,46 @@ impl Client {
     }
 
     /// A call that must have worked, with its structured content.
+    ///
+    /// The content is also checked against the output schema the same server
+    /// publishes for the tool. A strict client throws away an answer that does
+    /// not match it, even when the write behind the answer succeeded, and
+    /// nothing else in these tests would notice: a Drive upload once stored
+    /// the file and then had its answer refused, because a field the schema
+    /// required was left out whenever it was empty.
     async fn ok(&mut self, name: &str, args: Value) -> Value {
         let v = self.call(name, args).await;
         assert!(!is_error(&v), "{name} failed: {}", error_text(&v));
-        v["result"]["structuredContent"].clone()
+        let content = v["result"]["structuredContent"].clone();
+        if !content.is_null() {
+            self.conforms(name, &content).await;
+        }
+        content
+    }
+
+    /// Panics, naming every violation, when `content` does not match the
+    /// output schema `tools/list` publishes for `name`.
+    async fn conforms(&mut self, name: &str, content: &Value) {
+        let tools = self.tools().await;
+        let Some(schema) = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .map(|t| t["outputSchema"].clone())
+            .filter(|s| !s.is_null())
+        else {
+            return;
+        };
+        let validator = jsonschema::validator_for(&schema)
+            .unwrap_or_else(|e| panic!("{name} publishes an output schema that is not valid: {e}"));
+        let errors: Vec<String> = validator
+            .iter_errors(content)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{name} answered with content its own output schema rejects:\n  {}\ncontent: {content}",
+            errors.join("\n  ")
+        );
     }
 
     /// A call that must have been refused, with the message.
