@@ -684,7 +684,7 @@ fn too_large() -> ApiError {
         StatusCode::PAYLOAD_TOO_LARGE,
         "too_large",
         format!(
-            "the file is over the {} one mail may carry",
+            "the file is over the {} this server stages at once",
             megabytes(ATTACHMENT_MAX_BYTES)
         ),
     )

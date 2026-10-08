@@ -1454,8 +1454,8 @@ impl Gmcp {
                        you and not to a document: docs_insert_image decides which document it \
                        lands in. The URL takes one upload and lives 15 minutes; the file itself \
                        waits an hour to be used and is forgotten once it is. This is the Docs \
-                       twin of gmail_upload_link — same staging, its own name — and either one's \
-                       upload_id works only with the tools of its own service."
+                       twin of gmail_upload_link — same staging, its own name — so an upload_id \
+                       from either one works in any tool that takes one."
     )]
     async fn docs_upload_link(
         &self,
