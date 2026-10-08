@@ -7383,3 +7383,490 @@ async fn a_parent_drive_refuses_creates_no_folder_anywhere() {
     assert_eq!(sent[0]["parents"], json!([FOLDER]));
     drop(server);
 }
+
+// ----- a file into Drive by a folder path -----------------------------------
+
+/// The second folder drive_folders_two.json describes.
+const OTHER_TOPOLOGIA: &str = "1ToPoLoGiAsEcOnDiDeXaMpLe012345678";
+/// A "notatki" that was already inside the old "topologia".
+const OLD_NOTATKI: &str = "1NoTaTkIhAnDmAdEiDeXaMpLe012345678";
+
+/// A Google that answers an upload with the stored file inside `parent`, as
+/// drive_file_uploaded.json describes it there.
+async fn mount_upload_into(server: &MockServer, parent: &str) {
+    let mut stored = fixture("drive_file_uploaded.json");
+    stored["parents"] = json!([parent]);
+    Mock::given(http_method("POST"))
+        .and(path("/upload/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stored))
+        .named("files.create upload")
+        .mount(server)
+        .await;
+}
+
+/// A folder created inside `parent`, as drive_subfolder_created.json
+/// describes "notatki" there.
+fn notatki_inside(parent: &str) -> Value {
+    let mut made = fixture("drive_subfolder_created.json");
+    made["parents"] = json!([parent]);
+    made
+}
+
+/// Every write Drive was sent, oldest first: the name of each folder it was
+/// asked to create, and "upload" for the file.
+async fn writes(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/token")
+        .map(|r| {
+            if r.url.path() == "/upload/drive/v3/files" {
+                "upload".to_string()
+            } else {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                body["name"].as_str().unwrap().to_string()
+            }
+        })
+        .collect()
+}
+
+/// A path that is not there at all: every folder on it is created, in order,
+/// each inside the one before, and the file goes into the last.
+#[tokio::test]
+async fn a_folder_path_creates_every_missing_folder_in_order_each_inside_the_one_before() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_none.json").await;
+    mount_create(&server, "topologia", "drive_folder_created.json").await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"name": "notatki"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(notatki_inside(NEW_TOPOLOGIA)))
+        .mount(&server)
+        .await;
+    mount_upload_into(&server, NEW_NOTATKI).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let out = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": " /topologia / notatki ", "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["folder"], "notatki");
+    assert_eq!(out["folder_id"], NEW_NOTATKI);
+    assert_eq!(
+        out["created_folders"],
+        json!([{"folder_id": NEW_TOPOLOGIA, "name": "topologia"},
+               {"folder_id": NEW_NOTATKI, "name": "notatki"}])
+    );
+    assert!(
+        out["written"].as_str().unwrap().contains("\"topologia\""),
+        "{out}"
+    );
+
+    assert_eq!(writes(&server).await, ["topologia", "notatki", "upload"]);
+    assert_eq!(
+        folders_created(&server).await,
+        [
+            json!({"name": "topologia", "mimeType": FOLDER_MIME}),
+            json!({"name": "notatki", "mimeType": FOLDER_MIME, "parents": [NEW_TOPOLOGIA]}),
+        ]
+    );
+    let sent = drive_uploads(&server).await;
+    let metadata: Value = serde_json::from_slice(&related_parts(&sent[0])[0].1).unwrap();
+    assert_eq!(metadata["parents"], json!([NEW_NOTATKI]));
+    // Below a folder that is missing nothing can be there, so only the first
+    // name was looked up.
+    let lookups = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/drive/v3/files")
+        .count();
+    assert_eq!(lookups, 1);
+    assert_eq!(a.staged_files(), 0);
+    drop(server);
+}
+
+/// A folder already on the path is used and not made a second time.
+#[tokio::test]
+async fn a_folder_path_reuses_a_folder_that_is_already_there() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_one.json").await;
+    mount_lookup(&server, OLD_TOPOLOGIA, "notatki", "drive_folders_none.json").await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(notatki_inside(OLD_TOPOLOGIA)))
+        .mount(&server)
+        .await;
+    mount_upload_into(&server, NEW_NOTATKI).await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let out = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki", "confirmed": true}),
+        )
+        .await;
+    assert_eq!(
+        out["created_folders"],
+        json!([{"folder_id": NEW_NOTATKI, "name": "notatki"}])
+    );
+    assert_eq!(writes(&server).await, ["notatki", "upload"]);
+    assert_eq!(
+        folders_created(&server).await,
+        [json!({"name": "notatki", "mimeType": FOLDER_MIME, "parents": [OLD_TOPOLOGIA]})]
+    );
+    drop(server);
+
+    // The whole path already there: nothing is created at all, and the
+    // answer carries no list of created folders.
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_one.json").await;
+    Mock::given(http_method("GET"))
+        .and(path("/drive/v3/files"))
+        .and(query_param("q", named(OLD_TOPOLOGIA, "notatki")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"files": [
+            {"id": OLD_NOTATKI, "name": "notatki", "mimeType": FOLDER_MIME, "trashed": false}
+        ]})))
+        .mount(&server)
+        .await;
+    mount_upload_into(&server, OLD_NOTATKI).await;
+    let mut a = uploading(&Db::open_memory().await.unwrap(), &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    let out = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki", "confirmed": true}),
+        )
+        .await;
+    assert_eq!(out["folder"], "notatki");
+    assert_eq!(out["folder_id"], OLD_NOTATKI);
+    assert!(out.get("created_folders").is_none(), "{out}");
+    assert_eq!(writes(&server).await, ["upload"]);
+    drop(server);
+}
+
+/// Two folders of one name on the path: the call is refused with both ids,
+/// whether it is a preview or not, and nothing is created or spent.
+#[tokio::test]
+async fn two_folders_of_one_name_on_a_path_are_refused_with_both_ids() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_two.json").await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    for confirmed in [false, true] {
+        let refused = a
+            .client
+            .refused(
+                "drive_upload",
+                json!({"account": "work", "upload_id": uploaded["upload_id"],
+                       "folder_path": "topologia/notatki", "confirmed": confirmed}),
+            )
+            .await;
+        assert!(
+            refused.contains("2 folders called \"topologia\" in the root of My Drive"),
+            "{refused}"
+        );
+        assert!(refused.contains(OLD_TOPOLOGIA), "{refused}");
+        assert!(refused.contains(OTHER_TOPOLOGIA), "{refused}");
+        assert!(refused.contains("`folder`"), "{refused}");
+        assert!(refused.contains("still staged"), "{refused}");
+    }
+    assert!(writes(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// The preview walks the path and says, folder by folder, which is there
+/// and which would be made, and it makes nothing and spends nothing.
+#[tokio::test]
+async fn a_folder_path_preview_lists_each_folder_as_new_or_reused_and_creates_nothing() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_one.json").await;
+    mount_lookup(&server, OLD_TOPOLOGIA, "notatki", "drive_folders_none.json").await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let shown = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki/2026", "confirmed": false}),
+        )
+        .await;
+    assert_eq!(shown["written"], false);
+    assert!(
+        shown["action"]
+            .as_str()
+            .unwrap()
+            .contains("topologia/notatki/2026"),
+        "{shown}"
+    );
+    let lines = details(&shown);
+    assert!(
+        lines.contains(&format!(
+            "\"topologia\" (reused): the folder already in the root of My Drive, {OLD_TOPOLOGIA}"
+        )),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("\"notatki\" (new): this server creates it in the folder \"topologia\""),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("\"2026\" (new): this server creates it in the folder \"notatki\""),
+        "{lines}"
+    );
+    // The reused folder may be one the person made by hand.
+    assert!(lines.contains("made it by hand"), "{lines}");
+    assert!(lines.contains("\"Faktura 04-2026.pdf\""), "{lines}");
+
+    assert!(writes(&server).await.is_empty());
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// Folders are not transactional. Whatever this call created before a step
+/// failed is named with its id, nothing is deleted, and the upload is still
+/// staged.
+#[tokio::test]
+async fn a_failure_partway_down_a_path_names_every_folder_already_created() {
+    // The second folder cannot be created.
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_none.json").await;
+    mount_create(&server, "topologia", "drive_folder_created.json").await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"name": "notatki"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(fixture("drive_error_storage_quota.json")),
+        )
+        .mount(&server)
+        .await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    let refused = a
+        .client
+        .refused(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki", "confirmed": true}),
+        )
+        .await;
+    assert!(
+        refused.contains("storage quota has been exceeded"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!(
+            "\"topologia\" ({NEW_TOPOLOGIA}) in the root of My Drive"
+        )),
+        "{refused}"
+    );
+    assert!(refused.contains("still staged"), "{refused}");
+    assert!(refused.contains("same folder_path"), "{refused}");
+    assert_eq!(writes(&server).await, ["topologia", "notatki"]);
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+
+    // Both folders are made, and then the upload fails.
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_none.json").await;
+    mount_create(&server, "topologia", "drive_folder_created.json").await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"name": "notatki"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(notatki_inside(NEW_TOPOLOGIA)))
+        .mount(&server)
+        .await;
+    Mock::given(http_method("POST"))
+        .and(path("/upload/drive/v3/files"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(fixture("drive_error_storage_quota.json")),
+        )
+        .mount(&server)
+        .await;
+    let mut a = uploading(&Db::open_memory().await.unwrap(), &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    let refused = a
+        .client
+        .refused(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki", "confirmed": true}),
+        )
+        .await;
+    assert!(refused.contains("2 folders"), "{refused}");
+    assert!(refused.contains(NEW_TOPOLOGIA), "{refused}");
+    assert!(
+        refused.contains(&format!(
+            "\"notatki\" ({NEW_NOTATKI}) in the folder \"topologia\""
+        )),
+        "{refused}"
+    );
+    assert!(refused.contains("still staged"), "{refused}");
+    assert_eq!(writes(&server).await, ["topologia", "notatki", "upload"]);
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+
+    // A reused folder, made by hand, will not take a new folder: refused in
+    // this server's words, with nothing created and nothing made in the root.
+    let server = google_server().await;
+    mount_lookup(&server, "root", "topologia", "drive_folders_one.json").await;
+    mount_lookup(&server, OLD_TOPOLOGIA, "notatki", "drive_folders_none.json").await;
+    Mock::given(http_method("POST"))
+        .and(path("/drive/v3/files"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(fixture("drive_error_app_not_authorized.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut a = uploading(&Db::open_memory().await.unwrap(), &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+    let refused = a
+        .client
+        .refused(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "topologia/notatki", "confirmed": true}),
+        )
+        .await;
+    assert!(
+        refused.contains("could not be written to with the access this server holds"),
+        "{refused}"
+    );
+    assert!(refused.contains(OLD_TOPOLOGIA), "{refused}");
+    assert!(refused.contains("No folder was created"), "{refused}");
+    assert!(refused.contains("still staged"), "{refused}");
+    assert_eq!(writes(&server).await, ["notatki"]);
+    assert_eq!(
+        folders_created(&server).await[0]["parents"],
+        json!([OLD_TOPOLOGIA])
+    );
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// One destination, named one way: both together are refused before Drive
+/// is asked anything.
+#[tokio::test]
+async fn folder_and_folder_path_together_are_refused() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    for confirmed in [false, true] {
+        let refused = a
+            .client
+            .refused(
+                "drive_upload",
+                json!({"account": "work", "upload_id": uploaded["upload_id"],
+                       "folder": FOLDER, "folder_path": "topologia",
+                       "confirmed": confirmed}),
+            )
+            .await;
+        assert!(refused.contains("not both"), "{refused}");
+    }
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with("/drive/") || r.url.path().starts_with("/upload/"))
+        .count();
+    assert_eq!(asked, 0);
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}
+
+/// A folder name with an apostrophe in it reaches Drive escaped, so it
+/// cannot end the query string early.
+#[tokio::test]
+async fn an_apostrophe_in_a_folder_path_is_escaped_in_the_lookup() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    // Matched on the exact `q`: a lookup that is not escaped matches nothing
+    // and fails the call.
+    mount_lookup(&server, "root", r"Anna\'s notes", "drive_folders_none.json").await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    let shown = a
+        .client
+        .ok(
+            "drive_upload",
+            json!({"account": "work", "upload_id": uploaded["upload_id"],
+                   "folder_path": "Anna's notes", "confirmed": false}),
+        )
+        .await;
+    let lines = details(&shown);
+    assert!(lines.contains("\"Anna's notes\" (new)"), "{lines}");
+    drop(server);
+}
+
+/// A path is names between slashes. An empty name, a path with no name at
+/// all, and `.` or `..` are refused before Drive is asked anything.
+#[tokio::test]
+async fn an_empty_segment_in_a_folder_path_is_refused() {
+    let db = Db::open_memory().await.unwrap();
+    let server = google_server().await;
+    let mut a = uploading(&db, &server).await;
+    let uploaded = upload_file(&mut a, "Faktura 04-2026.pdf", INVOICE).await;
+
+    for (path, says) in [
+        ("topologia//notatki", "empty folder name"),
+        ("topologia/ /notatki", "empty folder name"),
+        ("topologia/notatki/", "empty folder name"),
+        ("//topologia", "empty folder name"),
+        ("/", "names no folder"),
+        ("topologia/../notatki", "not as a step up"),
+    ] {
+        let refused = a
+            .client
+            .refused(
+                "drive_upload",
+                json!({"account": "work", "upload_id": uploaded["upload_id"],
+                       "folder_path": path, "confirmed": true}),
+            )
+            .await;
+        assert!(refused.contains(says), "{path}: {refused}");
+    }
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with("/drive/") || r.url.path().starts_with("/upload/"))
+        .count();
+    assert_eq!(asked, 0);
+    assert_eq!(a.staged_files(), 1);
+    drop(server);
+}

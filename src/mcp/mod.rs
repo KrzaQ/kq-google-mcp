@@ -96,7 +96,9 @@ fn instructions(portal: &str) -> String {
          drive_upload, which stores it as it is. An upload never replaces a file of the same \
          name, and a folder Drive refuses is refused here too: the file is put nowhere else. \
          drive_create_folder makes a folder, and a folder made here always takes files from \
-         this server, where one the person made by hand may not.\n\
+         this server, where one the person made by hand may not. drive_upload's folder_path \
+         names the folder by its path from the root of My Drive and creates each folder on it \
+         that is missing.\n\
          A spreadsheet cell that displays a number may hold a formula, and writing that number \
          back over it replaces the formula with a frozen value while the sheet goes on looking \
          correct, so read with sheets_read_range render=\"formula\" before you copy or rewrite \

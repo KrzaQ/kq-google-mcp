@@ -485,8 +485,19 @@ pub struct DriveUploadOut {
     pub folder_id: Option<String>,
     /// Where the person opens the file in Drive.
     pub url: String,
+    /// The folders this call created for `folder_path`, outermost first.
+    /// Absent when it created none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub created_folders: Vec<CreatedFolderOut>,
     /// What happened, in one line the model can repeat to the person.
     pub written: String,
+}
+
+/// One folder drive_upload created on its way down a `folder_path`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CreatedFolderOut {
+    pub folder_id: String,
+    pub name: String,
 }
 
 /// A folder drive_create_folder has created, and where.

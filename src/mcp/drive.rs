@@ -106,8 +106,13 @@ pub struct DriveUploadParam {
     /// drive_upload_link URL
     pub upload_id: String,
     /// The id of the Drive folder to put the file in, as drive_search reports
-    /// it. Left out, the file goes to the root of My Drive
+    /// it. Left out, along with folder_path, the file goes to the root of My
+    /// Drive
     pub folder: Option<String>,
+    /// The folder to put the file in, as a path from the root of My Drive,
+    /// e.g. "topologia/notatki". Each folder on it that is missing is
+    /// created, as `mkdir -p` does. Give this or `folder`, never both
+    pub folder_path: Option<String>,
     /// What to call the file in Drive. Left out, it keeps the name it was
     /// uploaded under
     pub name: Option<String>,
@@ -425,16 +430,23 @@ impl Gmcp {
         description = "Store a file in Google Drive as it is, with no conversion: a PDF stays a \
                        PDF and a spreadsheet stays the file it was. Upload it first with \
                        drive_upload_link and pass the upload_id here. `folder` is the id of a \
-                       Drive folder, as drive_search reports it; left out, the file goes to the \
-                       root of My Drive. `name` is what the file is called in Drive, and left \
+                       Drive folder, as drive_search reports it. `folder_path` names the folder \
+                       by its path from the root of My Drive instead, such as \
+                       topologia/notatki, and creates each folder on it that is missing; when \
+                       two folders on the way share a name, the call is refused with both ids \
+                       so you can pass the right one as `folder`. Give one of the two, or \
+                       neither to put the file in the root of My Drive. A folder this call \
+                       creates stays in Drive even when a later step fails, and the answer \
+                       names it. `name` is what the file is called in Drive, and left \
                        out it keeps the name it was uploaded under. An upload never replaces an \
                        existing file: if the folder already holds one of the same name, Drive \
                        holds both side by side. Shared drives are out of reach. A folder the \
                        person made in Drive may not take a file from this server; when it does \
                        not, nothing is uploaded anywhere, the upload stays staged, and leaving \
-                       `folder` out puts the file in the root of My Drive instead. Needs \
+                       the folder out puts the file in the root of My Drive instead. Needs \
                        confirmed=true: call once with confirmed=false, show the person the name, \
-                       the size and the folder, and write only after they say yes. The upload \
+                       the size and the folder, and for a path which folders are new and which \
+                       are reused. Write only after they say yes. The upload \
                        is spent once Drive has the file, so upload it again to store it twice."
     )]
     async fn drive_upload(
@@ -446,6 +458,20 @@ impl Gmcp {
         let client = &self.google()?.client;
         let upload_id = p.upload_id.trim().to_string();
         let user_id = call.principal.user().id;
+        let folder_id = p.folder.as_deref().map(str::trim).filter(|f| !f.is_empty());
+        let folder_path = p
+            .folder_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty());
+        if folder_id.is_some() && folder_path.is_some() {
+            return Err(bad(
+                "pass `folder` or `folder_path`, not both: one destination, named one way. \
+                 `folder` is the id of a folder and `folder_path` its path from the root of My \
+                 Drive",
+            ));
+        }
+        let segments = folder_path.map(path_segments).transpose()?;
         // Read without being spent: a preview and every refusal below leave
         // the upload_id good for the next attempt.
         let staged = self
@@ -467,15 +493,17 @@ impl Gmcp {
             .filter(|n| !n.is_empty())
             .unwrap_or(&staged.filename)
             .to_string();
-        let folder = match p.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
-            None => None,
-            Some(id) => Some(self.destination(&connection, id, Putting::File).await?),
+        let destination = match (folder_id, segments) {
+            (Some(id), _) => {
+                Destination::Folder(self.destination(&connection, id, Putting::File).await?)
+            }
+            (None, Some(segments)) => {
+                Destination::Path(self.plan_path(&connection, segments, &upload_id).await?)
+            }
+            (None, None) => Destination::Root,
         };
         let size = staged.bytes.len();
-        let into = match &folder {
-            Some(f) => format!("the folder {:?} ({})", f.name, f.id),
-            None => format!("the root of {MY_DRIVE}"),
-        };
+        let into = destination.describe();
         if !p.confirmed {
             let mut details = vec![
                 format!("the file is called {name:?} in Drive"),
@@ -486,6 +514,9 @@ impl Gmcp {
                 ),
                 format!("it goes into {into}"),
             ];
+            if let Destination::Path(plan) = &destination {
+                details.extend(plan.preview());
+            }
             if name != staged.filename {
                 details.push(format!("it was uploaded as {:?}", staged.filename));
             }
@@ -494,7 +525,7 @@ impl Gmcp {
                  Drive holds both"
                     .to_string(),
             );
-            if folder.is_some() {
+            if let Destination::Folder(_) = &destination {
                 details.push(
                     "if Drive refuses this folder to this server, nothing is uploaded anywhere \
                      and the upload stays staged"
@@ -509,6 +540,26 @@ impl Gmcp {
                 details,
             ))));
         }
+        let arg = match &destination {
+            Destination::Path(_) => "folder_path",
+            _ => "folder",
+        };
+        // A path's missing folders first, one at a time, each inside the one
+        // before. Whatever this creates stays, even when the upload fails.
+        let (place, created) = match destination {
+            Destination::Root => (None, Vec::new()),
+            Destination::Folder(f) => (
+                Some(Place {
+                    id: f.id,
+                    name: f.name,
+                }),
+                Vec::new(),
+            ),
+            Destination::Path(plan) => {
+                let (place, created) = self.make_path(&connection, plan, &upload_id).await?;
+                (Some(place), created)
+            }
+        };
         // One attempt, into the folder that was asked for and nowhere else. A
         // refusal is answered as one; it is never retried into the root.
         let stored = match drive::upload(
@@ -517,18 +568,31 @@ impl Gmcp {
             &name,
             &staged.mime_type,
             &staged.bytes,
-            folder.as_ref().map(|f| f.id.as_str()),
+            place.as_ref().map(|f| f.id.as_str()),
         )
         .await
         {
             Ok(stored) => stored,
             Err(e) => {
-                return Err(match &folder {
-                    Some(f) if folder_refused(&e) => {
-                        refuse(folder_refusal(f, &upload_id, &e.to_string()))
+                let refused = place.is_some() && folder_refused(&e);
+                let error = match &place {
+                    Some(f) if refused => {
+                        refuse(folder_refusal(f, arg, &upload_id, &e.to_string()))
                     }
                     _ => self.google_err_for(&connection, e),
-                });
+                };
+                if created.is_empty() {
+                    return Err(error);
+                }
+                let staged_note = if refused {
+                    String::new()
+                } else {
+                    format!("The upload `{upload_id}` is still staged. ")
+                };
+                return Err(with_note(
+                    error,
+                    &format!("{staged_note}{}", created_note(&created)),
+                ));
             }
         };
         // Drive has the file, so the upload is spent now and not before.
@@ -539,27 +603,42 @@ impl Gmcp {
         {
             tracing::warn!("spending the upload {upload_id} after Drive stored it: {e}");
         }
-        let folder_name = folder
+        let folder_name = place
             .map(|f| f.name)
             .unwrap_or_else(|| MY_DRIVE.to_string());
         let size = stored.size.unwrap_or(size as u64);
+        let mut written = format!(
+            "stored {:?} ({}) in {folder_name:?}",
+            stored.name,
+            uploads::megabytes(size as usize)
+        );
+        if !created.is_empty() {
+            written.push_str(&format!(
+                "; this call created {} {} on the way",
+                plural(created.len(), "the folder", "the folders"),
+                names(&created)
+            ));
+        }
         Ok(Json(Confirmable::Done(dto::DriveUploadOut {
             account: connection.label,
             url: stored
                 .web_view_link
                 .clone()
                 .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", stored.id)),
-            written: format!(
-                "stored {:?} ({}) in {folder_name:?}",
-                stored.name,
-                uploads::megabytes(size as usize)
-            ),
+            written,
             folder_id: stored.parents.first().cloned(),
             file_id: stored.id,
             name: stored.name,
             mime_type: stored.mime_type,
             size,
             folder: folder_name,
+            created_folders: created
+                .into_iter()
+                .map(|m| dto::CreatedFolderOut {
+                    folder_id: m.id,
+                    name: m.name,
+                })
+                .collect(),
         })))
     }
 
@@ -750,6 +829,327 @@ fn ids(found: &drive::NamedFolders) -> String {
     said.join(", ")
 }
 
+/// Where drive_upload puts a file, once the destination has been read and
+/// before anything is written.
+enum Destination {
+    Root,
+    /// A folder named by its id.
+    Folder(drive::Folder),
+    /// A folder named by its path from the root.
+    Path(PathPlan),
+}
+
+impl Destination {
+    fn describe(&self) -> String {
+        match self {
+            Destination::Root => format!("the root of {MY_DRIVE}"),
+            Destination::Folder(f) => format!("the folder {:?} ({})", f.name, f.id),
+            Destination::Path(plan) => format!(
+                "the folder {:?} at {}, from the root of {MY_DRIVE}",
+                plan.last(),
+                plan.path
+            ),
+        }
+    }
+}
+
+/// A `folder_path` resolved against Drive, before anything is created.
+struct PathPlan {
+    /// The path, its names joined with `/`.
+    path: String,
+    /// The folders already there, outermost first, each inside the one
+    /// before and the first in the root.
+    reused: Vec<drive::Folder>,
+    /// The names of the folders still missing, outermost first. Each goes
+    /// inside the one before, and the first inside the last reused folder.
+    /// Once one name is missing, every name below it is too.
+    missing: Vec<String>,
+}
+
+impl PathPlan {
+    /// The name of the folder the file goes into.
+    fn last(&self) -> &str {
+        self.missing
+            .last()
+            .map(String::as_str)
+            .or_else(|| self.reused.last().map(|f| f.name.as_str()))
+            .unwrap_or(MY_DRIVE)
+    }
+
+    /// What the preview says about the path, one line per folder on it.
+    fn preview(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut inside = format!("the root of {MY_DRIVE}");
+        for folder in &self.reused {
+            lines.push(format!(
+                "{:?} (reused): the folder already in {inside}, {}",
+                folder.name, folder.id
+            ));
+            inside = format!("the folder {:?}", folder.name);
+        }
+        for name in &self.missing {
+            lines.push(format!(
+                "{name:?} (new): this server creates it in {inside}"
+            ));
+            inside = format!("the folder {name:?}");
+        }
+        if let Some(last) = self.reused.last() {
+            let write = if self.missing.is_empty() {
+                "put the file into it"
+            } else {
+                "create a folder inside it"
+            };
+            lines.push(format!(
+                "{:?} is reused, so this call did not create it. If the person made it by hand, \
+                 Drive may not let this server {write}; then nothing more is created or \
+                 uploaded, and the upload stays staged",
+                last.name
+            ));
+        }
+        if !self.missing.is_empty() {
+            lines.push(
+                "the new folders are created one at a time. If a later step fails, the folders \
+                 already created stay in Drive, because this server deletes nothing there, and \
+                 the answer names each of them with its id"
+                    .to_string(),
+            );
+        }
+        lines
+    }
+}
+
+/// A folder a file is about to go into, by the two things a person and a
+/// retry need: its name and its id.
+struct Place {
+    id: String,
+    name: String,
+}
+
+/// A folder this call created on the way down a path, and where it put it.
+struct Made {
+    id: String,
+    name: String,
+    /// "the root of My Drive" or `the folder "topologia"`.
+    inside: String,
+}
+
+/// The folder names in a `folder_path`, outermost first. One leading `/` is
+/// allowed and changes nothing: a path always starts at the root of My Drive.
+fn path_segments(raw: &str) -> Result<Vec<String>, ErrorData> {
+    let path = raw.strip_prefix('/').unwrap_or(raw);
+    if path.trim().is_empty() {
+        return Err(bad(format!(
+            "folder_path {raw:?} names no folder; leave it out to put the file in the root of \
+             {MY_DRIVE}"
+        )));
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/').map(str::trim) {
+        if segment.is_empty() {
+            return Err(bad(format!(
+                "folder_path {raw:?} has an empty folder name in it; write one name between \
+                 each two `/`, as in topologia/notatki"
+            )));
+        }
+        if segment == "." || segment == ".." {
+            return Err(bad(format!(
+                "folder_path {raw:?} has {segment:?} in it, and Drive takes that as the name of \
+                 a folder, not as a step up; write the names of the folders from the root of \
+                 {MY_DRIVE} down"
+            )));
+        }
+        segments.push(segment.to_string());
+    }
+    Ok(segments)
+}
+
+impl Gmcp {
+    /// Find which folders of a path are already there. Each name is looked
+    /// up inside the folder before it, starting from the root of My Drive,
+    /// and the lookups stop at the first name that is missing. Two folders
+    /// of one name refuse the whole call before anything is created.
+    async fn plan_path(
+        &self,
+        connection: &Connection,
+        segments: Vec<String>,
+        upload_id: &str,
+    ) -> Result<PathPlan, ErrorData> {
+        let client = &self.google()?.client;
+        let path = segments.join("/");
+        let mut reused: Vec<drive::Folder> = Vec::new();
+        let mut names = segments.into_iter();
+        while let Some(name) = names.next() {
+            let parent = reused.last().map(|f| f.id.as_str());
+            let found = drive::folders_named(client, connection.id, parent, &name)
+                .await
+                .map_err(|e| self.google_err_for(connection, e))?;
+            if found.more || found.folders.len() > 1 {
+                return Err(refuse(ambiguous(&name, reused.last(), &found, upload_id)));
+            }
+            match found.folders.into_iter().next() {
+                Some(folder) => reused.push(folder),
+                None => {
+                    let mut missing = vec![name];
+                    missing.extend(names);
+                    return Ok(PathPlan {
+                        path,
+                        reused,
+                        missing,
+                    });
+                }
+            }
+        }
+        Ok(PathPlan {
+            path,
+            reused,
+            missing: Vec::new(),
+        })
+    }
+
+    /// Create the folders a path is missing, one at a time, each inside the
+    /// one before. Answers the folder the file goes into and the folders this
+    /// call created. A failure names every folder already created, with its
+    /// id: they stay, because this server deletes nothing in Drive.
+    async fn make_path(
+        &self,
+        connection: &Connection,
+        plan: PathPlan,
+        upload_id: &str,
+    ) -> Result<(Place, Vec<Made>), ErrorData> {
+        let client = &self.google()?.client;
+        let mut parent = plan.reused.last().map(|f| Place {
+            id: f.id.clone(),
+            name: f.name.clone(),
+        });
+        let mut created: Vec<Made> = Vec::new();
+        for name in plan.missing {
+            let made = drive::create_folder(
+                client,
+                connection.id,
+                &name,
+                parent.as_ref().map(|f| f.id.as_str()),
+            )
+            .await;
+            let made = match made {
+                Ok(made) => made,
+                Err(e) => {
+                    let error = match &parent {
+                        Some(f) if folder_refused(&e) => {
+                            refuse(path_refusal(f, &name, upload_id, &e.to_string()))
+                        }
+                        _ => with_note(
+                            self.google_err_for(connection, e),
+                            &format!(
+                                "Nothing was uploaded, and the upload `{upload_id}` is still \
+                                 staged."
+                            ),
+                        ),
+                    };
+                    return Err(with_note(error, &created_note(&created)));
+                }
+            };
+            created.push(Made {
+                id: made.id.clone(),
+                name: made.name.clone(),
+                inside: match &parent {
+                    Some(f) => format!("the folder {:?}", f.name),
+                    None => format!("the root of {MY_DRIVE}"),
+                },
+            });
+            parent = Some(Place {
+                id: made.id,
+                name: made.name,
+            });
+        }
+        let place = parent.ok_or_else(|| {
+            ErrorData::internal_error("a folder_path resolved to no folder at all", None)
+        })?;
+        Ok((place, created))
+    }
+}
+
+/// What a caller is told when two folders on a path share a name. Nothing
+/// was created, and the ids let the caller name the one the person means.
+fn ambiguous(
+    name: &str,
+    parent: Option<&drive::Folder>,
+    found: &drive::NamedFolders,
+    upload_id: &str,
+) -> String {
+    let count = if found.more {
+        format!("more than {}", found.folders.len())
+    } else {
+        found.folders.len().to_string()
+    };
+    let place = match parent {
+        Some(f) => format!("inside the folder {:?} ({})", f.name, f.id),
+        None => format!("in the root of {MY_DRIVE}"),
+    };
+    format!(
+        "there are {count} folders called {name:?} {place}: {}. Drive allows any number of \
+         folders with one name in one place, and this server does not guess which one \
+         folder_path means. Nothing was created and nothing was uploaded; the upload \
+         `{upload_id}` is still staged. Ask the person which folder they mean, then pass its id \
+         as `folder` and leave `folder_path` out. To go deeper below it, create the rest with \
+         drive_create_folder first",
+        ids(found)
+    )
+}
+
+/// What a caller is told when Drive refused to create a folder of a path
+/// inside a folder that was already there.
+fn path_refusal(parent: &Place, name: &str, upload_id: &str, google: &str) -> String {
+    format!(
+        "Drive refused to create the folder {name:?} inside the folder {:?} ({}): that folder \
+         could not be written to with the access this server holds. Nothing was uploaded, and \
+         nothing was put anywhere else. The upload `{upload_id}` is still staged: make a folder \
+         this server can write into with drive_create_folder and pass its id as `folder`, or \
+         leave `folder_path` out to put the file in the root of {MY_DRIVE}. ({google})",
+        parent.name, parent.id
+    )
+}
+
+/// The sentence every failure on a path ends with: which folders this call
+/// created before it stopped, so a retry does not create them twice.
+fn created_note(created: &[Made]) -> String {
+    if created.is_empty() {
+        return "No folder was created.".to_string();
+    }
+    let list = created
+        .iter()
+        .map(|m| format!("{:?} ({}) in {}", m.name, m.id, m.inside))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = match created.len() {
+        1 => "one folder".to_string(),
+        n => format!("{n} folders"),
+    };
+    format!(
+        "This call created {count} before it stopped, and {} in Drive, because this server \
+         deletes nothing there: {list}. Call drive_upload again with the same folder_path and \
+         it finds and reuses {}, or pass `folder` with the id of the last folder once the whole \
+         path is there.",
+        plural(created.len(), "it stays", "they stay"),
+        plural(created.len(), "it", "them"),
+    )
+}
+
+/// The names of the folders a call created, quoted and in order.
+fn names(created: &[Made]) -> String {
+    created
+        .iter()
+        .map(|m| format!("{:?}", m.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A refusal with one more sentence after it.
+fn with_note(mut error: ErrorData, note: &str) -> ErrorData {
+    let said = error.message.trim_end().trim_end_matches('.').to_string();
+    error.message = format!("{said}. {note}").into();
+    error
+}
+
 /// What a caller is told when Drive refused to create a folder inside the
 /// parent it named. Nothing was created anywhere else.
 fn parent_refusal(parent: &drive::Folder, name: &str, google: &str) -> String {
@@ -782,13 +1182,14 @@ fn folder_refused(e: &GoogleFailure) -> bool {
 }
 
 /// What a caller is told when Drive refused the folder. The file was put
-/// nowhere else, and the caller's next step is in the message.
-fn folder_refusal(folder: &drive::Folder, upload_id: &str, google: &str) -> String {
+/// nowhere else, and the caller's next step is in the message. `arg` is the
+/// argument that named the folder, `folder` or `folder_path`.
+fn folder_refusal(folder: &Place, arg: &str, upload_id: &str, google: &str) -> String {
     format!(
         "Drive refused to put the file into the folder {:?} ({}): that folder could not be \
          written to with the access this server holds. Nothing was uploaded, and the file was \
          not put anywhere else. The upload `{upload_id}` is still staged: call drive_upload \
-         again with the same upload_id and leave `folder` out to put the file in the root of \
+         again with the same upload_id and leave `{arg}` out to put the file in the root of \
          {MY_DRIVE}, where the person can move it. ({google})",
         folder.name, folder.id
     )

@@ -106,7 +106,10 @@ to say about itself is here and in `README.md`.
   the same name. It makes one attempt, into the folder it was asked for. When
   Drive refuses that folder, the tool says so and never retries into the root.
   The upload is spent only once Drive has the file, so every refusal leaves it
-  staged.
+  staged. A folder comes from `drive_create_folder` or from `folder_path`, which
+  creates each missing folder of a path, refuses a name two folders share, and
+  names in every failure the folders it already created, because nothing in
+  Drive is deleted to roll back.
 - Every tool call, link mint and link hit is logged, with the arguments
   stripped of bodies and cut at 4 KB. Tool output is never logged.
 - **Tests must not need the network, a file on disk or an existing database.**
