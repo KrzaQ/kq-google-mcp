@@ -2,11 +2,12 @@
 // and each one is prodded where it does something the fixtures alone cannot
 // prove: the reconnect hand-over, the callback banner, the secret and its
 // snippets, the log's cursor.
-import { flushPromises, mount } from '@vue/test-utils'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import * as fixtures from '@/api/fixtures'
+import type { TokenDto } from '@/api/types'
 import { useSession } from '@/stores/session'
 import ActivityView from './ActivityView.vue'
 import ConnectionsView from './ConnectionsView.vue'
@@ -24,6 +25,8 @@ function json(data: unknown, status = 200) {
 
 const calls: string[] = []
 const bodies = new Map<string, unknown>()
+// What `GET /api/tokens` answers; a test that needs other tokens sets it.
+let tokenList: TokenDto[] = fixtures.tokens
 
 function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = String(input)
@@ -55,7 +58,7 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
     return Promise.resolve(json(fixtures.connections[0]))
   if (path.startsWith('/api/connections/') && method === 'DELETE')
     return Promise.resolve(new Response(null, { status: 204 }))
-  if (path === '/api/tokens' && method === 'GET') return Promise.resolve(json(fixtures.tokens))
+  if (path === '/api/tokens' && method === 'GET') return Promise.resolve(json(tokenList))
   if (path === '/api/tokens' && method === 'POST')
     return Promise.resolve(
       json({ ...fixtures.tokens[0], name: 'new', secret: 'gg_shown_once' }, 201),
@@ -73,6 +76,10 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
   )
 }
 
+// A dialog teleports into document.body; unmounting takes it away again, so
+// one test never clicks a button another test left open.
+enableAutoUnmount(afterEach)
+
 describe('views', () => {
   let errors: unknown[][]
   let assign: ReturnType<typeof vi.fn>
@@ -89,6 +96,7 @@ describe('views', () => {
     })
     calls.length = 0
     bodies.clear()
+    tokenList = fixtures.tokens
     errors = []
     vi.spyOn(console, 'error').mockImplementation((...args) => errors.push(args))
     vi.spyOn(console, 'warn').mockImplementation((...args) => errors.push(args))
@@ -243,6 +251,45 @@ describe('views', () => {
     expect(w.text()).toContain('gateway')
     expect(w.find('[data-testid="scope-gmail:draft"]').exists()).toBe(true)
     expect(w.find('[data-testid="scope-calendar:write"]').exists()).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView hides revoked tokens until asked, and says how many', async () => {
+    const w = await render(TokensView, '/tokens')
+    const names = () => w.findAll('[data-testid="token-row"]').map((r) => r.find('td').text())
+    expect(names()).toEqual(['claude-code', 'openwebui'])
+    const toggle = w.find('[data-testid="toggle-revoked"]')
+    expect(toggle.text()).toBe('Show 1 revoked')
+
+    await toggle.trigger('click')
+    expect(names()).toEqual(['claude-code', 'openwebui', 'laptop'])
+    expect(w.findAll('[data-testid="token-row"]')[2]!.classes()).toContain('line-through')
+    expect(toggle.text()).toBe('Hide revoked')
+
+    await toggle.trigger('click')
+    expect(names()).toEqual(['claude-code', 'openwebui'])
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView offers no toggle when nothing is revoked', async () => {
+    tokenList = fixtures.tokens.filter((t) => !t.revoked_at)
+    const w = await render(TokensView, '/tokens')
+    expect(w.findAll('[data-testid="token-row"]')).toHaveLength(2)
+    expect(w.find('[data-testid="toggle-revoked"]').exists()).toBe(false)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView does not call the list empty when only revoked tokens exist', async () => {
+    tokenList = fixtures.tokens.filter((t) => t.revoked_at)
+    const w = await render(TokensView, '/tokens')
+    expect(w.findAll('[data-testid="token-row"]')).toHaveLength(0)
+    expect(w.find('[data-testid="tokens-empty"]').text()).toBe('No active tokens.')
+    expect(w.find('[data-testid="toggle-revoked"]').text()).toBe('Show 1 revoked')
+
+    tokenList = []
+    const empty = await render(TokensView, '/tokens')
+    expect(empty.find('[data-testid="tokens-empty"]').text()).toBe('No tokens yet.')
+    expect(empty.find('[data-testid="toggle-revoked"]').exists()).toBe(false)
     expect(errors).toEqual([])
   })
 

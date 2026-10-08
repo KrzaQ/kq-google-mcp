@@ -29,6 +29,14 @@ const created = ref<TokenCreated | null>(null)
 const error = ref<string | null>(null)
 const revoking = ref<TokenDto | null>(null)
 const form = ref<TokenForm>(emptyForm())
+// A revoked token stays in the list for the record, but the person comes here
+// to work with the active ones. The choice lasts as long as the page does.
+const showRevoked = ref(false)
+
+const revokedCount = computed(() => tokens.value.filter((t) => t.revoked_at).length)
+const shownTokens = computed(() =>
+  showRevoked.value ? tokens.value : tokens.value.filter((t) => !t.revoked_at),
+)
 
 const pickerOff = computed(() => pickerDisabled(form.value.delegate))
 const blocked = computed(() => whyNotCreatable(form.value))
@@ -156,7 +164,7 @@ onMounted(load)
         </thead>
         <tbody>
           <tr
-            v-for="t in tokens"
+            v-for="t in shownTokens"
             :key="t.id"
             class="border-t border-edge align-top"
             :class="{ 'text-faint line-through': t.revoked_at }"
@@ -183,11 +191,18 @@ onMounted(load)
               </button>
             </td>
           </tr>
-          <tr v-if="tokens.length === 0">
-            <td colspan="7" class="px-3 py-6 text-center text-muted">No tokens yet.</td>
+          <tr v-if="shownTokens.length === 0">
+            <td colspan="7" class="px-3 py-6 text-center text-muted" data-testid="tokens-empty">
+              {{ tokens.length === 0 ? 'No tokens yet.' : 'No active tokens.' }}
+            </td>
           </tr>
         </tbody>
       </table>
+      <div v-if="revokedCount > 0" class="border-t border-edge px-3 py-2 text-xs">
+        <button class="link" data-testid="toggle-revoked" @click="showRevoked = !showRevoked">
+          {{ showRevoked ? 'Hide revoked' : `Show ${revokedCount} revoked` }}
+        </button>
+      </div>
     </div>
 
     <form

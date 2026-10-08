@@ -83,6 +83,21 @@ export const tokens: TokenDto[] = [
     last_used_at: null,
     revoked_at: null,
   },
+  {
+    // Revoked, and older than the registry: it holds a capability the server
+    // no longer knows and names a connection that has since been removed.
+    id: 9,
+    name: 'laptop',
+    scopes: ['gmail:read', 'tasks:read', 'docs:read', 'docs:write'],
+    client: 'opencode',
+    user_id: 1,
+    all_connections: false,
+    connection_ids: [1, 7],
+    delegate: false,
+    created_at: '2026-07-01T10:00:00Z',
+    last_used_at: '2026-07-30T10:00:00Z',
+    revoked_at: '2026-08-04T10:00:00Z',
+  },
 ]
 
 export const registry: ScopeRegistry = {
