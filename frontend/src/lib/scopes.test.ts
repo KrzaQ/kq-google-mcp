@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { registry } from '@/api/fixtures'
+import { connections, registry, tokens } from '@/api/fixtures'
+import type { TokenDto } from '@/api/types'
 import {
+  copyNotes,
   emptyForm,
+  formFromToken,
   pickerDisabled,
   setScope,
   tick,
@@ -123,5 +126,101 @@ describe('what stops a token being created', () => {
     const form = { ...emptyForm(), name: 'g', scopes: ['gmail:read'], delegate: true }
     form.allConnections = false
     expect(whyNotCreatable(form)).toBeNull()
+  })
+})
+
+describe('copying a token into the form', () => {
+  const personal: TokenDto = {
+    id: 20,
+    name: 'claude-code',
+    scopes: ['gmail:read', 'gmail:draft', 'docs:read', 'docs:write'],
+    client: 'claude-code',
+    user_id: 1,
+    all_connections: false,
+    connection_ids: [2, 1],
+    delegate: false,
+    created_at: '2026-08-05T10:00:00Z',
+    last_used_at: null,
+    revoked_at: null,
+  }
+
+  it('copies every field of a personal token with an allowlist', () => {
+    const copy = formFromToken(registry, personal, connections)
+    expect(copy.form).toEqual({
+      name: 'claude-code',
+      client: 'claude-code',
+      scopes: ['gmail:read', 'gmail:draft', 'docs:read', 'docs:write'],
+      delegate: false,
+      allConnections: false,
+      connectionIds: [2, 1],
+    })
+    expect(copyNotes(copy)).toEqual([])
+  })
+
+  it('copies a token for every connection without a list', () => {
+    const copy = formFromToken(registry, tokens[0]!, connections)
+    expect(copy.form.allConnections).toBe(true)
+    expect(copy.form.connectionIds).toEqual([])
+    expect(copy.form.scopes).toEqual(['gmail:read', 'gmail:draft', 'drive:read'])
+  })
+
+  it('copies a delegate token as a delegate, and keeps delegate out of the grid', () => {
+    const copy = formFromToken(registry, tokens[1]!, connections)
+    expect(copy.form).toEqual({
+      name: 'openwebui',
+      client: 'openwebui',
+      scopes: ['gmail:read', 'drive:read'],
+      delegate: true,
+      allConnections: true,
+      connectionIds: [],
+    })
+    expect(copy.droppedScopes).toEqual([])
+    expect(copyNotes(copy)).toEqual([])
+    // What the form posts is what the token held.
+    expect(tokenInput(registry, copy.form).scopes).toEqual(tokens[1]!.scopes)
+  })
+
+  it('ticks the read level along with a copied write level', () => {
+    const copy = formFromToken(registry, { ...personal, scopes: ['calendar:write'] }, connections)
+    expect(copy.form.scopes).toEqual(['calendar:read', 'calendar:write'])
+  })
+
+  it('drops a capability the registry no longer knows, and names it', () => {
+    const old = { ...personal, scopes: ['gmail:read', 'tasks:read', 'docs:write', 'gmail:send'] }
+    const copy = formFromToken(registry, old, connections)
+    expect(copy.form.scopes).toEqual(['gmail:read', 'docs:read', 'docs:write'])
+    expect(copy.droppedScopes).toEqual(['tasks:read', 'gmail:send'])
+    expect(copyNotes(copy)).toEqual([
+      'Not copied: tasks:read, gmail:send. This server no longer knows these capabilities.',
+    ])
+    expect(copyNotes({ ...copy, droppedScopes: ['tasks:read'] })).toEqual([
+      'Not copied: tasks:read. This server no longer knows that capability.',
+    ])
+  })
+
+  it('drops a connection that no longer exists, and names it', () => {
+    const copy = formFromToken(registry, { ...personal, connection_ids: [1, 7] }, connections)
+    expect(copy.form.allConnections).toBe(false)
+    expect(copy.form.connectionIds).toEqual([1])
+    expect(copy.droppedConnections).toEqual([7])
+    expect(copyNotes(copy)).toEqual(['Not copied: connection #7. It no longer exists.'])
+  })
+
+  it('leaves the picker empty when every listed connection is gone', () => {
+    const copy = formFromToken(registry, { ...personal, connection_ids: [7, 8] }, connections)
+    expect(copy.form.connectionIds).toEqual([])
+    expect(copyNotes(copy)).toEqual([
+      'Not copied: connection #7, connection #8. They no longer exist.',
+    ])
+    // The form says what is missing rather than posting an empty allowlist.
+    expect(whyNotCreatable(copy.form)).toBe('pick at least one connection')
+  })
+
+  it('falls back to the first client profile when the old one is gone', () => {
+    const copy = formFromToken(registry, { ...personal, client: 'emacs' }, connections)
+    expect(copy.form.client).toBe('generic')
+    expect(copyNotes(copy)).toEqual([
+      'Not copied: client profile emacs. This server no longer knows it, so the form uses generic.',
+    ])
   })
 })

@@ -10,7 +10,7 @@
 // Everything here is a pure function over the registry so the rule is tested
 // without a component.
 
-import type { ScopeDto, ScopeRegistry, TokenInput } from '@/api/types'
+import type { ScopeDto, ScopeRegistry, TokenDto, TokenInput } from '@/api/types'
 
 /** Every service scope the registry knows, in its canonical order. */
 export function allScopes(registry: ScopeRegistry): ScopeDto[] {
@@ -135,4 +135,80 @@ export function whyNotCreatable(form: TokenForm): string | null {
   if (!form.delegate && !form.allConnections && form.connectionIds.length === 0)
     return 'pick at least one connection'
   return null
+}
+
+/** A token copied into the form, and what the copy had to leave out. */
+export type CopiedForm = {
+  form: TokenForm
+  /** Capabilities the registry no longer knows. */
+  droppedScopes: string[]
+  /** Allowlisted connections that no longer exist. */
+  droppedConnections: number[]
+  /** A client profile the registry no longer knows, or null. */
+  droppedClient: string | null
+}
+
+/**
+ * Copy a token into the form, so the person can change one thing and create
+ * it again. The copy goes through the same rules as the checkboxes: every
+ * scope is ticked with `setScope`, so a write level brings its read level.
+ * The form never holds anything the server would refuse. A capability, a
+ * connection or a client profile that is gone is left out, and the result
+ * names it.
+ */
+export function formFromToken(
+  registry: ScopeRegistry,
+  token: TokenDto,
+  connections: readonly { id: number }[],
+): CopiedForm {
+  const known = new Set(allScopes(registry).map((s) => s.scope))
+  let scopes: string[] = []
+  const droppedScopes: string[] = []
+  for (const scope of token.scopes) {
+    // The delegate flag travels in the scope list; the form has its own box.
+    if (scope === registry.delegate.scope) continue
+    if (known.has(scope)) scopes = setScope(registry, scopes, scope, true)
+    else droppedScopes.push(scope)
+  }
+
+  const fallback = registry.clients[0] ?? 'generic'
+  const clientKnown = registry.clients.includes(token.client)
+
+  // A delegate token has no list of its own, and neither does a token for
+  // every connection. Only an allowlist is copied, and only what still exists.
+  const allowlist = !token.delegate && !token.all_connections
+  const exists = new Set(connections.map((c) => c.id))
+  const listed = allowlist ? token.connection_ids : []
+
+  return {
+    form: {
+      name: token.name,
+      client: clientKnown ? token.client : fallback,
+      scopes,
+      delegate: token.delegate,
+      allConnections: !allowlist,
+      connectionIds: listed.filter((id) => exists.has(id)),
+    },
+    droppedScopes,
+    droppedConnections: listed.filter((id) => !exists.has(id)),
+    droppedClient: clientKnown ? null : token.client,
+  }
+}
+
+/** One sentence per thing a copy left out; empty when it left out nothing. */
+export function copyNotes(copy: CopiedForm): string[] {
+  const notes: string[] = []
+  const scopes = copy.droppedScopes
+  if (scopes.length === 1)
+    notes.push(`Not copied: ${scopes[0]}. This server no longer knows that capability.`)
+  else if (scopes.length > 1)
+    notes.push(`Not copied: ${scopes.join(', ')}. This server no longer knows these capabilities.`)
+  const gone = copy.droppedConnections.map((id) => `connection #${id}`)
+  if (gone.length === 1) notes.push(`Not copied: ${gone[0]}. It no longer exists.`)
+  else if (gone.length > 1) notes.push(`Not copied: ${gone.join(', ')}. They no longer exist.`)
+  if (copy.droppedClient)
+    notes.push(
+      `Not copied: client profile ${copy.droppedClient}. This server no longer knows it, so the form uses ${copy.form.client}.`,
+    )
+  return notes
 }

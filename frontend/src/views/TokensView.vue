@@ -3,6 +3,9 @@
 // /api/scopes rather than from a copy of the matrix here, so adding a service
 // stays one change on the server; the ticking rules live in lib/scopes.ts.
 //
+// "Fill as new" copies a token into the form through the same rules the form
+// enforces, so replacing a token is one changed box and Create, not retyping.
+//
 // The secret exists for one render. Everything a person needs to paste it
 // somewhere is shown next to it, because there is no second chance.
 import { computed, onMounted, ref } from 'vue'
@@ -10,7 +13,9 @@ import { api } from '@/api/client'
 import type { ConnectionDto, ScopeRegistry, TokenCreated, TokenDto } from '@/api/types'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import {
+  copyNotes,
   emptyForm,
+  formFromToken,
   pickerDisabled,
   setScope,
   tokenInput,
@@ -29,6 +34,10 @@ const created = ref<TokenCreated | null>(null)
 const error = ref<string | null>(null)
 const revoking = ref<TokenDto | null>(null)
 const form = ref<TokenForm>(emptyForm())
+// What the last "Fill as new" had to leave out, one sentence each.
+const notes = ref<string[]>([])
+const formEl = ref<HTMLFormElement | null>(null)
+const nameEl = ref<HTMLInputElement | null>(null)
 // A revoked token stays in the list for the record, but the person comes here
 // to work with the active ones. The choice lasts as long as the page does.
 const showRevoked = ref(false)
@@ -69,12 +78,23 @@ function toggleConnection(id: number, on: boolean) {
   form.value.connectionIds = [...ids]
 }
 
+function fillFrom(t: TokenDto) {
+  if (!registry.value) return
+  const copy = formFromToken(registry.value, t, connections.value)
+  form.value = copy.form
+  notes.value = copyNotes(copy)
+  formEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  // The smooth scroll is already under way; focus must not jump past it.
+  nameEl.value?.focus({ preventScroll: true })
+}
+
 async function create() {
   if (!registry.value || blocked.value) return
   error.value = null
   try {
     created.value = await api.tokens.create(tokenInput(registry.value, form.value))
     form.value = emptyForm(registry.value.clients[0] ?? 'generic')
+    notes.value = []
     tokens.value = await api.tokens.list()
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -180,10 +200,13 @@ onMounted(load)
             <td class="px-3 py-2 text-xs whitespace-nowrap">
               {{ formatAgo(t.last_used_at, new Date(), session.zone) }}
             </td>
-            <td class="px-3 py-2 text-right">
+            <td class="px-3 py-2 text-right whitespace-nowrap">
+              <button class="link text-xs" data-testid="fill-as-new" @click="fillFrom(t)">
+                Fill as new
+              </button>
               <button
                 v-if="!t.revoked_at"
-                class="link text-xs text-danger"
+                class="ml-3 link text-xs text-danger"
                 data-testid="revoke"
                 @click="revoking = t"
               >
@@ -207,6 +230,7 @@ onMounted(load)
 
     <form
       v-if="registry"
+      ref="formEl"
       class="card space-y-4 p-4"
       data-testid="token-form"
       @submit.prevent="create"
@@ -217,6 +241,7 @@ onMounted(load)
         <label class="text-sm">
           Name<br />
           <input
+            ref="nameEl"
             v-model="form.name"
             required
             class="w-48"
@@ -230,6 +255,10 @@ onMounted(load)
             <option v-for="c in registry.clients" :key="c" :value="c">{{ c }}</option>
           </select>
         </label>
+      </div>
+
+      <div v-if="notes.length" class="note-warn space-y-1" data-testid="copy-notes">
+        <p v-for="n in notes" :key="n">{{ n }}</p>
       </div>
 
       <div class="overflow-x-auto">

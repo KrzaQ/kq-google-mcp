@@ -97,6 +97,8 @@ describe('views', () => {
     calls.length = 0
     bodies.clear()
     tokenList = fixtures.tokens
+    // jsdom lays nothing out and has no scrollIntoView; a view may still ask.
+    Element.prototype.scrollIntoView = vi.fn()
     errors = []
     vi.spyOn(console, 'error').mockImplementation((...args) => errors.push(args))
     vi.spyOn(console, 'warn').mockImplementation((...args) => errors.push(args))
@@ -108,14 +110,18 @@ describe('views', () => {
     vi.unstubAllGlobals()
   })
 
-  async function render(component: unknown, path = '/') {
+  // `attach` puts the view into the document, which focus needs.
+  async function render(component: unknown, path = '/', attach = false) {
     const router = createRouter({
       history: createMemoryHistory(),
       routes: [{ path: '/:pathMatch(.*)*', component: { template: '<div />' } }],
     })
     await router.push(path)
     await router.isReady()
-    const w = mount(component as never, { global: { plugins: [router] } })
+    const w = mount(component as never, {
+      global: { plugins: [router] },
+      ...(attach ? { attachTo: document.body } : {}),
+    })
     await flushPromises()
     await flushPromises()
     return w
@@ -290,6 +296,69 @@ describe('views', () => {
     const empty = await render(TokensView, '/tokens')
     expect(empty.find('[data-testid="tokens-empty"]').text()).toBe('No tokens yet.')
     expect(empty.find('[data-testid="toggle-revoked"]').exists()).toBe(false)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView fills the form from a token and puts the cursor in the name', async () => {
+    const w = await render(TokensView, '/tokens', true)
+    const checked = (id: string) =>
+      (w.find(`[data-testid="${id}"]`).element as HTMLInputElement).checked
+    const value = (id: string) =>
+      (w.find(`[data-testid="${id}"]`).element as HTMLInputElement).value
+
+    // The gateway token: a delegate, with no list of its own.
+    await w.findAll('[data-testid="fill-as-new"]')[1]!.trigger('click')
+    expect(value('token-name')).toBe('openwebui')
+    expect(value('token-client')).toBe('openwebui')
+    expect(checked('scope-gmail:read')).toBe(true)
+    expect(checked('scope-drive:read')).toBe(true)
+    expect(checked('scope-gmail:draft')).toBe(false)
+    expect(checked('token-delegate')).toBe(true)
+    expect(
+      (w.find('[data-testid="connection-picker"]').element as HTMLFieldSetElement).disabled,
+    ).toBe(true)
+    expect(w.find('[data-testid="copy-notes"]').exists()).toBe(false)
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled()
+    expect(document.activeElement).toBe(w.find('[data-testid="token-name"]').element)
+
+    // A personal token for every connection replaces it whole.
+    await w.findAll('[data-testid="fill-as-new"]')[0]!.trigger('click')
+    expect(value('token-name')).toBe('claude-code')
+    expect(value('token-client')).toBe('claude-code')
+    expect(checked('scope-gmail:draft')).toBe(true)
+    expect(checked('token-delegate')).toBe(false)
+    expect(checked('all-connections')).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  it('TokensView fills an allowlist from a revoked token and names what it left out', async () => {
+    const w = await render(TokensView, '/tokens')
+    const checked = (id: string) =>
+      (w.find(`[data-testid="${id}"]`).element as HTMLInputElement).checked
+    await w.find('[data-testid="toggle-revoked"]').trigger('click')
+    await w.findAll('[data-testid="fill-as-new"]')[2]!.trigger('click')
+
+    expect((w.find('[data-testid="token-client"]').element as HTMLSelectElement).value).toBe(
+      'opencode',
+    )
+    expect(checked('some-connections')).toBe(true)
+    expect(checked('connection-1')).toBe(true)
+    expect(checked('connection-2')).toBe(false)
+    const notes = w.find('[data-testid="copy-notes"]').text()
+    expect(notes).toContain('tasks:read')
+    expect(notes).toContain('connection #7')
+
+    // The form posts only what the server still knows.
+    await w.find('[data-testid="token-form"]').trigger('submit')
+    await flushPromises()
+    expect(bodies.get('POST /api/tokens')).toEqual({
+      name: 'laptop',
+      client: 'opencode',
+      scopes: ['gmail:read', 'docs:read', 'docs:write'],
+      all_connections: false,
+      connection_ids: [1],
+    })
+    expect(w.find('[data-testid="copy-notes"]').exists()).toBe(false)
     expect(errors).toEqual([])
   })
 
