@@ -222,7 +222,9 @@ async fn a_doc_is_made_out_of_markdown_in_one_multipart_upload() {
         "{body}"
     );
     assert!(body.contains("Content-Type: text/csv"), "{body}");
-    assert!(body.contains("\"parents\":[]"), "{body}");
+    // No folder means no `parents` at all, which is what puts a file in the
+    // root of My Drive.
+    assert!(!body.contains("\"parents\""), "{body}");
 }
 
 #[tokio::test]

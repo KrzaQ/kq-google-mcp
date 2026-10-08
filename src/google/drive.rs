@@ -354,11 +354,16 @@ async fn create(
     content: &[u8],
     folder_id: Option<&str>,
 ) -> Result<FileMeta> {
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "name": title,
         "mimeType": target_mime,
-        "parents": folder_id.map(|id| vec![id]).unwrap_or_default(),
     });
+    // Left out rather than sent empty: the reference promises the root of My
+    // Drive when `parents` is not specified, and says nothing about an empty
+    // list.
+    if let Some(id) = folder_id {
+        metadata["parents"] = serde_json::json!([id]);
+    }
     let boundary = multipart::boundary();
     let body = multipart::related(
         &boundary,
